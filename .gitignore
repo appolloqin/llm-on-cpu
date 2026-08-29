@@ -1,0 +1,13 @@
+build/
+bench/
+dist/
+models/
+*.lwc
+*.tmp
+.vs/
+.cache/
+__pycache__/
+*.zip
+*.log
+README.local.md
+docs/ABSORB_PRIORS.local.md

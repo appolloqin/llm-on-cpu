@@ -1,0 +1,31 @@
+# llm-on-cpu 引擎配置 (M4 llmoc_server 读取)
+
+model:
+  path: models/Qwen3.5-4B.lwc
+  dtype: bf16
+  # false：默认 greedy。MTP 在 CPU 上暂无净收益（见 docs/BENCH_BASELINE.md）
+  mtp: false
+  # tokenizer_dir: models/Qwen3.5-4B-hf   # 默认由 path 推 *-hf/
+
+mode: pure_cpu
+tiers:
+  dram_hot_gb: 16
+  kv_pool_gb: 2
+  prefetch_buf_gb: 1
+
+decode:
+  spec_k: 3
+  accept_min: 2.0
+  # 单次回复最多新生成 token（≠ 模型上下文窗口）
+  max_new_tokens: 2048
+
+io:
+  engine: auto
+  workers: 2
+
+rebalance:
+  interval_s: 5
+
+server:
+  port: 15085
+  api_key_env: LLMOC_API_KEY

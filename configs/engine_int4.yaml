@@ -1,0 +1,27 @@
+# INT4/QLWC 专用配置（不影响 configs/engine.yaml BF16 路径）
+model:
+  path: models/Qwen3.5-4B.int4.qlwc
+  dtype: int4
+  # false：当前默认。真 MTP 已接通且采纳率高，但 CPU 上草稿+verify 仍慢于 greedy（见 BENCH_BASELINE）
+  # auto/true：启用投机（调试用，勿当吞吐优化）
+  mtp: false
+  # tokenizer_dir 默认由 path 推: models/Qwen3.5-4B.int4-hf —— 请显式指定原 HF 旁路:
+  tokenizer_dir: models/Qwen3.5-4B-hf
+
+mode: pure_cpu
+tiers:
+  dram_hot_gb: 6
+  kv_pool_gb: 1
+  prefetch_buf_gb: 0.5
+
+decode:
+  spec_k: 3
+  # 单次回复最多新生成 token（≠ 模型 256K 上下文窗口）
+  max_new_tokens: 4096
+
+io:
+  workers: 2
+
+server:
+  port: 15085
+  api_key_env: LLMOC_API_KEY
