@@ -1,7 +1,10 @@
 build/
 bench/
 dist/
-models/
+# 忽略 models 下权重等大文件，但保留可提交的 recipe
+models/*
+!models/recipes/
+!models/recipes/**
 *.lwc
 *.tmp
 .vs/

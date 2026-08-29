@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string_view>
 
@@ -55,7 +56,7 @@ void emit(Level lv, const char* fmt, Args&&... args) {
 #if defined(_MSC_VER)
     _lock_file(stderr);
 #else
-    std::flockfile(stderr);
+    ::flockfile(stderr);
 #endif
     prefix(lv);
     if constexpr (sizeof...(Args) == 0) {
@@ -67,7 +68,7 @@ void emit(Level lv, const char* fmt, Args&&... args) {
 #if defined(_MSC_VER)
     _unlock_file(stderr);
 #else
-    std::funlockfile(stderr);
+    ::funlockfile(stderr);
 #endif
 }
 
