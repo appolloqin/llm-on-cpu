@@ -192,6 +192,17 @@ FileBw bench_file_seq_read(const fs::path& file, size_t file_bytes,
     auto dt = Clock::now() - t0;
     CloseHandle(h);
 #else
+#  if defined(__APPLE__)
+    // macOS 无 O_DIRECT；F_NOCACHE 近似绕过页缓存
+    *which_api = "read(F_NOCACHE)";
+    int fd = ::open(file.c_str(), O_RDONLY);
+    if (fd < 0) {
+        out.err = "open failed";
+        free_aligned(bufv);
+        return out;
+    }
+    (void)::fcntl(fd, F_NOCACHE, 1);
+#  else
     *which_api = "read(O_DIRECT)";
     int fd = ::open(file.c_str(), O_RDONLY | O_DIRECT);
     if (fd < 0) {
@@ -199,6 +210,7 @@ FileBw bench_file_seq_read(const fs::path& file, size_t file_bytes,
         free_aligned(bufv);
         return out;
     }
+#  endif
     uint64_t done = 0;
     auto t0 = Clock::now();
     while (done < file_bytes) {
