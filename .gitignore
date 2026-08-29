@@ -1,6 +1,6 @@
 build/
 bench/
-dist/
+/dist/
 # 忽略 models 下权重等大文件，但保留可提交的 recipe
 models/*
 !models/recipes/
