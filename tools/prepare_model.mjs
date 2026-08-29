@@ -60,6 +60,8 @@ function run(label, cmd, args) {
 
 function findLwcVerify() {
   const candidates = [
+    path.join(ROOT, "bin", "lwc_verify.exe"),
+    path.join(ROOT, "bin", "lwc_verify"),
     path.join(ROOT, "build", "msvc-x64", "bin", "lwc_verify.exe"),
     path.join(ROOT, "build", "release", "bin", "lwc_verify"),
     path.join(ROOT, "build", "release", "bin", "lwc_verify.exe"),

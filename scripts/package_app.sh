@@ -21,7 +21,7 @@ BIN_DIR="${BUILD_DIR}/bin"
 DIST="${ROOT}/dist"
 STAGE="${DIST}/llm-on-cpu-${VER}-${PLATFORM_ID}"
 
-mkdir -p "${STAGE}/bin" "${STAGE}/configs" "${STAGE}/docs"
+mkdir -p "${STAGE}/bin" "${STAGE}/configs" "${STAGE}/docs" "${STAGE}/tools" "${STAGE}/models"
 
 BINS=(
   llmoc_server
@@ -55,27 +55,51 @@ cp README.md "${STAGE}/"
 [[ -f docs/USAGE.md ]] && cp docs/USAGE.md "${STAGE}/docs/"
 [[ -f docs/PLATFORM.md ]] && cp docs/PLATFORM.md "${STAGE}/docs/"
 
+# 发布包一键脚本 + Node 工具链（下载/转换/量化；需本机 Node≥18）
+for t in download_model.mjs convert_lwc.mjs prepare_model.mjs quantize_int4.mjs; do
+  cp "tools/${t}" "${STAGE}/tools/"
+done
+cp scripts/dist/download_bf16.cmd scripts/dist/download_int4.cmd \
+   scripts/dist/start_bf16.cmd scripts/dist/start_int4.cmd "${STAGE}/"
+cp scripts/dist/download_bf16.sh scripts/dist/download_int4.sh \
+   scripts/dist/start_bf16.sh scripts/dist/start_int4.sh "${STAGE}/"
+chmod +x "${STAGE}/download_bf16.sh" "${STAGE}/download_int4.sh" \
+         "${STAGE}/start_bf16.sh" "${STAGE}/start_int4.sh" || true
+# 空 models 占位，避免用户找不到目录
+: > "${STAGE}/models/.gitkeep"
+
 cat > "${STAGE}/RUN.txt" <<EOF
 llm-on-cpu application package (${PLATFORM_ID})
 version: ${VER}
 
-1) Place model weights (see docs/USAGE.md), e.g. models/Qwen3.5-4B.lwc
-2) Edit configs/engine.yaml or configs/engine_int4.yaml if needed
-3) Start server:
+前置: 安装 Node.js >= 18，并保证 node 在 PATH 中。
 
-   Windows:  .\\bin\\llmoc_server.exe --config .\\configs\\engine.yaml
-             .\\bin\\llmoc_server_int4.exe --config .\\configs\\engine_int4.yaml
+下载脚本均包含：下载 HF → 转引擎格式 → 删除原模型大权重
+（保留 *-hf 里的 config/tokenizer 供服务加载；INT4 还会删掉中间 .lwc）
 
-   Linux/macOS:
-             ./bin/llmoc_server --config ./configs/engine.yaml
-             ./bin/llmoc_server_int4 --config ./configs/engine_int4.yaml
+—— INT4（推荐，省内存）——
+  Windows:     download_int4.cmd
+               start_int4.cmd
+  Linux/macOS: chmod +x download_int4.sh start_int4.sh
+               ./download_int4.sh
+               ./start_int4.sh
 
-4) Open http://127.0.0.1:15085/
+—— BF16（无量化）——
+  Windows:     download_bf16.cmd
+               start_bf16.cmd
+  Linux/macOS: chmod +x download_bf16.sh start_bf16.sh
+               ./download_bf16.sh
+               ./start_bf16.sh
+
+可选换模型: download_*.cmd --model org/name  （并改 configs 里 path）
+
+浏览器打开 http://127.0.0.1:15085/
 
 Notes:
-- Windows may need Visual C++ Redistributable (x64) for OpenMP runtime.
-- macOS package is for logic/API validation; production target is Linux (SPR).
-- Models are NOT included (download/convert separately).
+- 权重不打进压缩包；首次需跑对应 download_*（体积大、耗时长）。
+- Windows 可能需要 Visual C++ Redistributable (x64)（OpenMP）。
+- macOS 包偏逻辑/API 验证；生产目标为 Linux。
+- 详细说明见 docs/USAGE.md。
 EOF
 
 ZIP_PATH="${DIST}/llm-on-cpu-${VER}-${PLATFORM_ID}.zip"
