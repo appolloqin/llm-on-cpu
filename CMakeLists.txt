@@ -89,27 +89,35 @@ if(UNIX AND NOT APPLE)
 endif()
 
 include(CheckCXXCompilerFlag)
+include(CheckCXXSourceCompiles)
 set(LLMOC_IS_X86 FALSE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)")
   set(LLMOC_IS_X86 TRUE)
 endif()
+set(LLMOC_HAS_AMX FALSE)
 if(MSVC AND LLMOC_IS_X86)
-  check_cxx_compiler_flag("/arch:AMX" LLMOC_HAS_AMX)
+  set(CMAKE_REQUIRED_FLAGS "/arch:AMX")
+  check_cxx_source_compiles("
+    #include <immintrin.h>
+    int main() { _tile_zero(0); return 0; }
+  " LLMOC_HAS_AMX)
   set(LLMOC_AMX_FLAGS "/arch:AMX")
 elseif(NOT MSVC AND LLMOC_IS_X86)
-  check_cxx_compiler_flag("-mamx-tile -mamx-bf16" LLMOC_HAS_AMX)
+  set(CMAKE_REQUIRED_FLAGS "-mamx-tile -mamx-bf16")
+  check_cxx_source_compiles("
+    #include <immintrin.h>
+    int main() { _tile_zero(0); return 0; }
+  " LLMOC_HAS_AMX)
   set(LLMOC_AMX_FLAGS "-mamx-tile;-mamx-bf16")
-else()
-  # AppleClang 会“接受” -mamx-*，但 arm64 不能开 AMX
-  set(LLMOC_HAS_AMX FALSE)
 endif()
+unset(CMAKE_REQUIRED_FLAGS)
 if(LLMOC_HAS_AMX)
   set_source_files_properties(src/hal/amx_gemm.cpp
       PROPERTIES COMPILE_OPTIONS "${LLMOC_AMX_FLAGS}")
   target_compile_definitions(llmoc_weights PUBLIC LLMOC_AMX_ENABLED=1)
   message(STATUS "AMX microkernel: enabled (${LLMOC_AMX_FLAGS})")
 else()
-  message(STATUS "AMX microkernel: stub (x86_64 + AMX flags required)")
+  message(STATUS "AMX microkernel: stub (x86_64 + working AMX intrinsics required)")
 endif()
 
 # ---------- model + sched + server ----------

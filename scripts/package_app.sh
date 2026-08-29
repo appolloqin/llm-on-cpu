@@ -4,7 +4,14 @@
 #   BUILD_DIR=build/release PLATFORM_ID=linux-x64 ./scripts/package_app.sh
 #   BUILD_DIR=build/msvc-x64 PLATFORM_ID=windows-x64 ./scripts/package_app.sh
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Git Bash/MSYS 的 pwd 是 /d/...，原生 Windows Python 会当成 \\d\\... 失败；优先用 Windows 路径。
+if ROOT_WIN="$(cd "$(dirname "$0")/.." && pwd -W 2>/dev/null)"; then
+  ROOT="${ROOT_WIN}"
+else
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+# 统一为正斜杠，便于传给 Python pathlib
+ROOT="${ROOT//\\//}"
 cd "$ROOT"
 
 BUILD_DIR="${BUILD_DIR:-build}"

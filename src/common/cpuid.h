@@ -7,11 +7,9 @@
 #include <string>
 #if defined(_MSC_VER)
 #  include <intrin.h>
-#elif defined(__GNUC__) || defined(__clang__)
+#elif (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #  include <cpuid.h>
-#  if defined(__x86_64__)
-#    include <xsaveintr.h>
-#  endif
 #endif
 
 namespace llmoc::cpu {
@@ -20,25 +18,28 @@ struct Regs { uint32_t eax, ebx, ecx, edx; };
 
 inline Regs cpuid(uint32_t leaf, uint32_t subleaf = 0) {
     Regs r{};
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     int out[4];
     __cpuidex(out, static_cast<int>(leaf), static_cast<int>(subleaf));
     r.eax = static_cast<uint32_t>(out[0]);
     r.ebx = static_cast<uint32_t>(out[1]);
     r.ecx = static_cast<uint32_t>(out[2]);
     r.edx = static_cast<uint32_t>(out[3]);
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(__i386__)
     unsigned int a = leaf, b = 0, c = subleaf, d = 0;
     __get_cpuid_count(leaf, subleaf, &a, &b, &c, &d);
     r.eax = a; r.ebx = b; r.ecx = c; r.edx = d;
+#else
+    (void)leaf;
+    (void)subleaf;
 #endif
     return r;
 }
 
 inline uint64_t xcr0() {
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     return _xgetbv(0);
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(__i386__)
     uint32_t lo = 0, hi = 0;
     __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
     return (static_cast<uint64_t>(hi) << 32) | lo;
@@ -60,6 +61,9 @@ struct IsaFlags {
 
 inline IsaFlags detect_isa() {
     IsaFlags f;
+#if !(defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__))
+    return f;
+#else
     const Regs l0 = cpuid(0);
     if (l0.eax < 7) return f;  // legacy cpu, leave defaults
     const Regs l1 = cpuid(1);
@@ -79,15 +83,22 @@ inline IsaFlags detect_isa() {
     const uint64_t xc = xcr0();
     f.os_supports_amx = f.amx_tile && ((xc >> 17) & 1ULL) && ((xc >> 18) & 1ULL);
     return f;
+#endif
 }
 
 inline std::string brand_string() {
     char b[49]{};
-#if defined(_MSC_VER) || defined(__x86_64__)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     int regs[12];
     __cpuid(reinterpret_cast<int*>(regs), 0x80000002);
     __cpuid(reinterpret_cast<int*>(regs) + 4, 0x80000003);
     __cpuid(reinterpret_cast<int*>(regs) + 8, 0x80000004);
+    std::memcpy(b, regs, sizeof(regs));
+#elif defined(__x86_64__) || defined(__i386__)
+    unsigned int regs[12];
+    __get_cpuid(0x80000002, &regs[0], &regs[1], &regs[2], &regs[3]);
+    __get_cpuid(0x80000003, &regs[4], &regs[5], &regs[6], &regs[7]);
+    __get_cpuid(0x80000004, &regs[8], &regs[9], &regs[10], &regs[11]);
     std::memcpy(b, regs, sizeof(regs));
 #endif
     return std::string(b);
