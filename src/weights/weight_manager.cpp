@@ -63,7 +63,10 @@ void WeightManager::open(const io::Path& file, const Config& cfg) {
 }
 
 void WeightManager::close() {
-    if (engine_) engine_->drain();
+    if (engine_) {
+        engine_->drain();
+        engine_.reset();
+    }
     entries_.clear();
     order_.clear();
     expert_names_.clear();

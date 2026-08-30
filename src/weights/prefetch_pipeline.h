@@ -65,6 +65,11 @@ class ExpertPrefetcher {
 
     void open(const io::Path& file, const Config& cfg);
     void close();
+    ~ExpertPrefetcher() { close(); }
+
+    ExpertPrefetcher() = default;
+    ExpertPrefetcher(const ExpertPrefetcher&) = delete;
+    ExpertPrefetcher& operator=(const ExpertPrefetcher&) = delete;
 
     // gate 决策点: 记录下一层所需专家并立即发起磁盘预取(热专家除外)。
     // 同层重复 plan 抛错(状态机保护)。

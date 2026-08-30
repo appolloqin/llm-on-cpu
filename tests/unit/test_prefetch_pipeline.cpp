@@ -195,16 +195,20 @@ TINY_TEST(Pipe, DoublePlanThrows) {
     Fixture fx = make_fixture();
     Write(file, fx.header, fx.payloads);
 
-    ExpertPrefetcher pf;
-    pf.open(file, {/*slot=*/96u << 10, /*slots=*/2});
-    pf.plan_next_layer(1, {0});
-    bool threw = false;
-    try {
-        pf.plan_next_layer(1, {1});
-    } catch (const std::runtime_error&) {
-        threw = true;
+    {
+        ExpertPrefetcher pf;
+        pf.open(file, {/*slot=*/96u << 10, /*slots=*/2});
+        pf.plan_next_layer(1, {0});
+        bool threw = false;
+        try {
+            pf.plan_next_layer(1, {1});
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw);
+        // Drain/stop IO before unlinking the file (destructor also closes).
+        pf.close();
     }
-    EXPECT_TRUE(threw);
 
     std::error_code ec;
     fs::remove(file, ec);

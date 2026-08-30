@@ -44,7 +44,12 @@ void ExpertPrefetcher::open(const io::Path& file, const Config& cfg) {
 }
 
 void ExpertPrefetcher::close() {
-    if (engine_) engine_->drain();
+    // Drain then stop workers BEFORE freeing slot buffers — otherwise async
+    // reads can write into freed AlignedBuf (glibc: corrupted double-linked list).
+    if (engine_) {
+        engine_->drain();
+        engine_.reset();
+    }
     plans_.clear();
     slots_.clear();
     free_slots_.clear();

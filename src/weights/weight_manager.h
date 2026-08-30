@@ -39,6 +39,11 @@ class WeightManager {
 
     void open(const io::Path& file, const Config& cfg);
     void close();
+    ~WeightManager() { close(); }
+
+    WeightManager() = default;
+    WeightManager(const WeightManager&) = delete;
+    WeightManager& operator=(const WeightManager&) = delete;
 
     // 返回张量数据指针; 冷块自动拉取并进入 LRU。
     // 未知名字抛 std::runtime_error。
