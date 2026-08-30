@@ -92,12 +92,23 @@ function createOverallProgress(totalBytes) {
 async function downloadTo(url, dstPath, expectSize, onProgress) {
   if (fs.existsSync(dstPath)) {
     const sz = fs.statSync(dstPath).size;
-    if (expectSize == null || sz === expectSize) return "skip";
+    // Only skip when size is known AND matches. Partial / truncated files re-download.
+    if (expectSize != null && expectSize > 0 && sz === expectSize) return "skip";
+    if (expectSize != null && expectSize > 0 && sz !== expectSize) {
+      console.log(
+        `  incomplete ${path.basename(dstPath)}: ${formatBytes(sz)}/${formatBytes(expectSize)} — re-download`,
+      );
+      fs.unlinkSync(dstPath);
+    } else if ((expectSize == null || expectSize <= 0) && sz > 0) {
+      // No authoritative size: keep existing non-empty (small tokenizer/json).
+      return "skip";
+    }
   }
   const r = await fetch(url);
   if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
   const total = expectSize ?? (Number(r.headers.get("content-length")) || null);
   await fsp.mkdir(path.dirname(dstPath), { recursive: true });
+  const tmpPath = dstPath + ".partial";
   let downloaded = 0;
   const counter = new Transform({
     transform(chunk, _enc, cb) {
@@ -106,7 +117,22 @@ async function downloadTo(url, dstPath, expectSize, onProgress) {
       cb(null, chunk);
     },
   });
-  await pipeline(Readable.fromWeb(r.body), counter, fs.createWriteStream(dstPath));
+  try {
+    await pipeline(Readable.fromWeb(r.body), counter, fs.createWriteStream(tmpPath));
+    if (expectSize != null && expectSize > 0 && downloaded !== expectSize) {
+      throw new Error(
+        `size mismatch after download ${path.basename(dstPath)}: got ${downloaded}, want ${expectSize}`,
+      );
+    }
+    fs.renameSync(tmpPath, dstPath);
+  } catch (e) {
+    try {
+      if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
   return "downloaded";
 }
 
@@ -154,13 +180,53 @@ async function runSource(name, opt) {
     throw new Error("file list has no *.safetensors (wrong repo id?)");
   if (opt.tokenizerOnly && wanted.length === 0)
     throw new Error("tokenizer-only: no tokenizer/config files in repo");
-  const totalBytes = wanted.reduce((s, f) => s + f.size, 0);
+  const totalBytes = wanted.reduce((s, f) => s + (f.size || 0), 0);
+
+  // Drop leftover *.partial from interrupted runs (any depth)
+  const rmPartials = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, ent.name);
+      if (ent.isDirectory()) rmPartials(p);
+      else if (ent.name.endsWith(".partial")) {
+        fs.unlinkSync(p);
+        console.log(`  removed stale ${path.relative(opt.out, p)}`);
+      }
+    }
+  };
+  try {
+    rmPartials(opt.out);
+  } catch {
+    /* ignore */
+  }
+
+  // Resume check: count missing / size-mismatched files (do not treat "any shard" as done).
+  let missing = 0;
+  let badSize = 0;
+  for (const f of wanted) {
+    const dst = path.join(opt.out, ...f.path.split("/"));
+    if (!fs.existsSync(dst)) {
+      missing++;
+      continue;
+    }
+    const sz = fs.statSync(dst).size;
+    if (f.size != null && f.size > 0 && sz !== f.size) badSize++;
+  }
+  const alreadyOk = missing === 0 && badSize === 0;
+  console.log(
+    `  plan: ${wanted.length} files, ${formatBytes(totalBytes)}` +
+      (alreadyOk
+        ? " (local complete — will skip each file)"
+        : ` (local: missing=${missing}, size-mismatch=${badSize})`),
+  );
   if (opt.tokenizerOnly) {
     console.log(`  [tokenizer-only] ${wanted.length} files, ${formatBytes(totalBytes)}`);
   }
+
   const progress = createOverallProgress(totalBytes);
   let done = 0;
   let doneBytes = 0;
+  let downloadedN = 0;
   for (const f of wanted) {
     const dst = path.join(opt.out, ...f.path.split("/"));
     const fileIdx = done + 1;
@@ -172,12 +238,50 @@ async function runSource(name, opt) {
     };
     report(0, f.size || null);
     const how = await downloadTo(api.rawUrl(f.path), dst, f.size, report);
+    if (how === "downloaded") downloadedN++;
     done++;
-    doneBytes += f.size;
+    doneBytes += f.size || 0;
     progress.clear();
-    console.log(`  [${done}/${wanted.length}] ${how}  ${f.path} (${formatBytes(f.size)})`);
+    console.log(`  [${done}/${wanted.length}] ${how}  ${f.path} (${formatBytes(f.size || 0)})`);
   }
-  return { count: done, bytes: totalBytes };
+
+  // Final integrity gate: every wanted file must exist with matching size.
+  const bad = [];
+  for (const f of wanted) {
+    const dst = path.join(opt.out, ...f.path.split("/"));
+    if (!fs.existsSync(dst)) {
+      bad.push(`${f.path}: missing`);
+      continue;
+    }
+    const sz = fs.statSync(dst).size;
+    if (f.size != null && f.size > 0 && sz !== f.size) {
+      bad.push(`${f.path}: ${sz} != ${f.size}`);
+    }
+  }
+  if (bad.length) {
+    throw new Error(
+      `download incomplete (${bad.length} files):\n  - ${bad.slice(0, 8).join("\n  - ")}` +
+        (bad.length > 8 ? `\n  - ... +${bad.length - 8} more` : ""),
+    );
+  }
+
+  const marker = path.join(opt.out, ".llmoc_download_ok");
+  await fsp.writeFile(
+    marker,
+    JSON.stringify(
+      {
+        model: id,
+        source: name,
+        count: wanted.length,
+        bytes: totalBytes,
+        downloaded_this_run: downloadedN,
+        files: wanted.map((f) => ({ path: f.path, size: f.size })),
+      },
+      null,
+      2,
+    ),
+  );
+  return { count: done, bytes: totalBytes, downloadedN };
 }
 
 async function main() {

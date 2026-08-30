@@ -156,11 +156,16 @@ function main() {
   console.log(`== [GLM] quant=${o.quant} model=${o.model} source=${o.source}`);
 
   if (o.quant === "awq") {
-    const needBase =
-      !o.hardSkipDownload &&
-      (o.forceDownload || !hasHfWeights(o.outHf) || !hasTokenizer(o.outHf));
-    if (needBase) downloadModel(o.model, o.outHf, o);
-    else console.log(`skip download (${o.outHf} ok)`);
+    // Always run download unless --skip-download. Partial shards must resume
+    // (download_model.mjs checks remote sizes); "any .safetensors" is NOT complete.
+    if (!o.hardSkipDownload) downloadModel(o.model, o.outHf, o);
+    else console.log(`skip download (--skip-download)`);
+
+    if (!hasHfWeights(o.outHf) || !hasTokenizer(o.outHf)) {
+      throw new Error(
+        `download incomplete under ${o.outHf} (need safetensors + tokenizer/config)`,
+      );
+    }
 
     const needConvert =
       !o.hardSkipConvert && (o.forceConvert || !hasGoodGlmq(o.outBf16));
@@ -208,14 +213,12 @@ function main() {
   }
 
   // --- nvfp4: single model ID only ---
-  const needDl =
-    !o.hardSkipDownload && (o.forceDownload || !hasHfWeights(o.outHf));
-  if (needDl) downloadModel(o.model, o.outHf, o);
-  else console.log(`skip download (${o.outHf} ok)`);
+  if (!o.hardSkipDownload) downloadModel(o.model, o.outHf, o);
+  else console.log(`skip download (--skip-download)`);
 
-  if (!hasTokenizer(o.outHf)) {
+  if (!hasTokenizer(o.outHf) || !hasHfWeights(o.outHf)) {
     throw new Error(
-      `no tokenizer/config under ${o.outHf} after downloading ${o.model}`,
+      `download incomplete under ${o.outHf} after ${o.model} (need safetensors + tokenizer/config)`,
     );
   }
 

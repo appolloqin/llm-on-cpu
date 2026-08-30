@@ -230,6 +230,9 @@ function main() {
   const needShards = needLwc && !hasShards;
 
   // ---- download ----
+  // Never treat "some *.safetensors exist" as complete — interrupted runs leave
+  // partial shards. Always invoke download_model (per-file size resume) unless
+  // hard-skip or the final engine weights are already OK.
   let doDownload = false;
   if (opt.hardSkipDownload) {
     console.log("\n== [download] skipped (--skip-download)");
@@ -237,10 +240,14 @@ function main() {
     doDownload = true;
   } else if (goalOk && !opt.forceConvert) {
     console.log("\n== [download] skipped (target weights already OK)");
-  } else if (hasShards) {
-    console.log(`\n== [download] skipped (${shards.length} safetensors already in ${opt.outHf})`);
-  } else if (needShards) {
+  } else if (needLwc || needShards || hasShards) {
+    // hasShards but incomplete → still run; download_model resumes / re-gets bad sizes
     doDownload = true;
+    if (hasShards) {
+      console.log(
+        `\n== [download] resume/verify (${shards.length} local safetensors — will check sizes)`,
+      );
+    }
   } else {
     console.log("\n== [download] skipped (not needed for remaining steps)");
   }
