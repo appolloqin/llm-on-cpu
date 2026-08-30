@@ -39,19 +39,27 @@ void WeightManager::open(const io::Path& file, const Config& cfg) {
 
     // 常驻区就绪: 逐个加载并尽力锁页。冷启动 IO 是唯一大头, 引擎异步性在
     // M2 预热流水线(D2 prefill 路径)时启用, 当前为顺序拉齐保证语义先正确。
+    uint64_t resident_bytes = 0;
     for (auto& [name, e] : entries_) {
         if (e.tier == Tier::kResident && !e.resident_loaded) {
             load_now(e);
             e.resident_loaded = true;
+            resident_bytes += e.data.size();
             if (sys::lock_pages(e.data.data(), e.data.size()))
                 st_.locked_bytes += e.data.size();
         }
     }
+    const double resident_gib = static_cast<double>(resident_bytes) / (1024.0 * 1024.0 * 1024.0);
+    const double locked_mib = static_cast<double>(st_.locked_bytes) / (1024.0 * 1024.0);
     LOG_INFO("weight manager ready: %zu tensors (%zu resident, %zu experts), "
-             "locked=%.1f MiB",
+             "resident=%.1f GiB locked=%.1f MiB",
              entries_.size(), entries_.size() - expert_names_.size(),
-             expert_names_.size(),
-             static_cast<double>(st_.locked_bytes) / (1024.0 * 1024.0));
+             expert_names_.size(), resident_gib, locked_mib);
+    if (resident_bytes > (1ull << 30) && st_.locked_bytes * 20 < resident_bytes) {
+        LOG_WARN("page lock nearly failed (locked << resident). Ensure RAM >= model+OS "
+                 "(~64G for 27B BF16) and check Task Manager disk thrashing; enable "
+                 "\"Lock pages in memory\" if you need VirtualLock. Prefer INT4 for chat.");
+    }
 }
 
 void WeightManager::close() {

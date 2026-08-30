@@ -1,6 +1,6 @@
 #pragma once
 // llm-on-cpu :: sched/mode_controller.h
-// M4/M5 模式开关占位: pure_cpu | hybrid_gpu | pure_gpu
+// M5: pure_cpu | hybrid_gpu | pure_gpu | auto
 
 #include <string>
 
@@ -15,10 +15,19 @@ inline ExecMode parse_mode(const std::string& s) {
   return ExecMode::kPureCpu;
 }
 
-inline ExecMode resolve_mode(ExecMode m) {
-  // B/C 期仅交付 pure_cpu; auto → pure_cpu
-  if (m == ExecMode::kAuto) return ExecMode::kPureCpu;
-  return m;
+inline const char* mode_name(ExecMode m) {
+  switch (m) {
+    case ExecMode::kHybridGpu: return "hybrid_gpu";
+    case ExecMode::kPureGpu: return "pure_gpu";
+    case ExecMode::kAuto: return "auto";
+    default: return "pure_cpu";
+  }
 }
+
+// Resolve load-time mode. pure_gpu without CUDA → throws via out_error if provided.
+// hybrid_gpu without CUDA → degrade to pure_cpu and set *degraded=true.
+// auto → hybrid_gpu if CUDA else pure_cpu.
+ExecMode resolve_mode(ExecMode requested, bool cuda_ok, bool* degraded = nullptr,
+                      std::string* err = nullptr);
 
 }  // namespace llmoc::sched

@@ -1,0 +1,28 @@
+# GLM-5.3-Flash — NVFP4（独立；可指向 HF NVFP4 导入产物）
+model:
+  path: models/GLM-5.3-Flash.nvfp4.glmq
+  dtype: nvfp4
+  arch: glm53_flash
+  tokenizer_dir: models/GLM-5.3-Flash-hf
+
+# pure_cpu | hybrid_gpu | pure_gpu（含义同 engine_glm_int4.yaml / ARCHITECTURE §3.1）
+# 单卡 ~22G 推荐 hybrid_gpu；无 CUDA 构建时会回退，见日志
+mode: hybrid_gpu
+
+quant: nvfp4
+
+tiers:
+  dram_hot_gb: 40
+  gpu_vram_gb: 20   # hybrid_gpu / pure_gpu 显存预算（GB）
+  kv_pool_gb: 2
+  prefetch_buf_gb: 4
+
+decode:
+  max_new_tokens: 2048
+
+io:
+  workers: 4
+
+server:
+  port: 15087
+  api_key_env: LLMOC_API_KEY

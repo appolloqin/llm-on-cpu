@@ -219,7 +219,7 @@ DeviceHAL:
 - **M2** 热驻留 + 预取流水线 → 模式①单流冲 20+ tok/s
 - **M3** MTP verify 循环 → 模式①冲 30 tok/s 达标线（**主干验收点**）
 - **M4** batching / radix KV+语义锚点 / API 服务化 / 监控告警 / 降级开关
-- **M5** PlacementPlanner 落地，启用模式②hybrid-gpu 与 ③pure-gpu：CUDA 后端接入、PCIe 流水调优、D6 跨级调拨验证
+- **M5** PlacementPlanner 落地，启用模式②hybrid-gpu 与 ③pure-gpu：`hal/cuda_backend`（动态 cudart/cublas，仅 `enable()` 后生效；默认 pure_cpu 路径不变）、模式解析与专家 VRAM/DRAM 装袋规划。PCIe 流水 / D6 热调拨持续迭代
 
 ---
 

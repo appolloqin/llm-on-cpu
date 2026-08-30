@@ -13,6 +13,9 @@ if not exist "models\Qwen3.5-4B.lwc" (
 )
 echo Starting BF16 server on http://127.0.0.1:15085/
 echo Logs: logs\llmoc-YYYY-MM-DD.log  (LLMOC_LOG_DIR / LLMOC_LOG / LLMOC_PROFILE)
+REM Bandwidth-bound decode: too many HT threads often hurts. Override if needed.
+if not defined OMP_NUM_THREADS set "OMP_NUM_THREADS=32"
+echo OMP_NUM_THREADS=%OMP_NUM_THREADS%
 "bin\llmoc_server.exe" --config configs\engine.yaml
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" (

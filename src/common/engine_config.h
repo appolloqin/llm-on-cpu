@@ -14,6 +14,7 @@ struct EngineConfig {
   std::string tokenizer_dir;  // 默认由 model_path 推 *-hf/
   std::string mode = "pure_cpu";
   double dram_hot_gb = 16.0;
+  double gpu_vram_gb = 0.0;  // M5: hybrid/pure_gpu VRAM budget; 0 = unset
   double kv_pool_gb = 2.0;
   unsigned io_workers = 2;
   int spec_k = 3;

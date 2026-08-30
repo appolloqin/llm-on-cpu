@@ -1,4 +1,5 @@
 # INT4/QLWC 专用配置（不影响 configs/engine.yaml BF16 路径）
+# 执行模式说明同 configs/engine.yaml（pure_cpu | hybrid_gpu | pure_gpu）
 model:
   path: models/Qwen3.5-4B.int4.qlwc
   dtype: int4
@@ -8,11 +9,14 @@ model:
   # tokenizer_dir 默认由 path 推: models/Qwen3.5-4B.int4-hf —— 请显式指定原 HF 旁路:
   tokenizer_dir: models/Qwen3.5-4B-hf
 
+# pure_cpu（默认）| hybrid_gpu / pure_gpu / auto（M5；INT4 核仍 CPU，BF16 透传可走 cuBLAS）
+# 混合示例: mode: hybrid_gpu + tiers.gpu_vram_gb: 16
 mode: pure_cpu
 tiers:
   dram_hot_gb: 6
   kv_pool_gb: 1
   prefetch_buf_gb: 0.5
+  # gpu_vram_gb: 16
 
 decode:
   spec_k: 3

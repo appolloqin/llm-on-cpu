@@ -155,7 +155,7 @@ Invoke-WebRequest http://127.0.0.1:15085/metrics | Select-Object -Expand Content
 | **MoE**（Qwen3.8 等）gate top-k + ExpertPrefetcher | ✅ 自动检测（有 expert groups） |
 | `/healthz` · `/metrics` · radix · 调度队列 | ✅ |
 | MTP 真接线 / 算子级 continuous batch | ⏳ |
-| hybrid-gpu / pure-gpu | ❌ M5 |
+| hybrid-gpu / pure-gpu | ✅ M5（`mode: hybrid_gpu`/`pure_gpu`/`auto`；需 cudart+cublas） |
 
 `llmoc_server` 根据 `.lwc` 是否含专家组自动选择后端，无需改代码：
 
@@ -244,7 +244,7 @@ scripts/      Windows CMD / Linux sh / CI Dockerfile / 假模型生成
 | M2 | 双缓冲预取流水线 | ✅ **1.69x 实证** |
 | M3 | MTP verify 状态机 | ✅ 14/14 单测；接权重=开放项 O2 |
 | M4 | batching / API 服务化 | ✅ MVP：`llmoc_server` + chat + SSE + metrics |
-| M5 | PlacementPlanner + 模式②③ | ⏳ |
+| M5 | PlacementPlanner + 模式②③ + `hal/cuda_backend` | ✅ |
 
 ## 关键文档
 

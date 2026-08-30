@@ -26,6 +26,40 @@
 
 权重 LWC ≈ **52 GiB** + KV/工作区 → 建议主机 **≥64G** 常驻。
 
+### 2.1 速度预期（CPU，当前引擎）
+
+| 路径 | 常驻内存 | 单流 decode（经验） |
+|---|---|---|
+| BF16 `.lwc` | ~52 GiB | 常约 **0.3–2 tok/s**（带宽墙；无 SPR+AMX 时很难到 30） |
+| INT4 `.qlwc` | ~13–16 GiB | 通常明显快于 BF16，优先用于聊天 |
+| Qwen3.5-4B | 数 GiB | 交互体验最好 |
+
+日志里若出现：
+
+- `VirtualLock failed` / `locked=0.x MiB` 且 `resident≈50GiB`
+- 生成时任务管理器 **磁盘狂跳 / 硬错误**
+
+则多半在 **换页**，会远慢于上表。先保证物理内存够用，再谈优化。
+
+带宽受限时 `OpenMP=88`（超线程）往往无益，可试：
+
+```bat
+set OMP_NUM_THREADS=32
+start_bf16.cmd
+```
+
+（改为本机物理核数更佳。）
+
+### 2.2 推荐：聊天用 INT4
+
+```bat
+download_int4.cmd --model Qwen/Qwen3.8-27B
+REM 编辑 configs/engine_int4.yaml → path 指向 *.int4.qlwc，tokenizer_dir 指向 *-hf
+start_int4.cmd
+```
+
+`dram_hot_gb` 对稠密 27B 几乎不影响「是否整模常驻」；缺内存时换 INT4 / 更小模型，而不是只调这个旋钮。
+
 ## 3. 操作
 
 ```bash

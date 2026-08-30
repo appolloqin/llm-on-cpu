@@ -1,0 +1,21 @@
+@echo off
+REM Start GLM server (AWQ INT4 config by default). Modes: pure_cpu | hybrid_gpu | pure_gpu
+setlocal EnableExtensions
+cd /d "%~dp0"
+chcp 65001 >nul
+if not defined OMP_NUM_THREADS set "OMP_NUM_THREADS=32"
+if not exist "bin\llmoc_server_glm.exe" (
+  echo ERROR: bin\llmoc_server_glm.exe not found — build the project first
+  exit /b 1
+)
+set "CFG=%~1"
+if "%CFG%"=="" set "CFG=configs\engine_glm_int4.yaml"
+echo Starting GLM server with %CFG%
+echo OMP_NUM_THREADS=%OMP_NUM_THREADS%
+"bin\llmoc_server_glm.exe" --config "%CFG%"
+set "EC=%ERRORLEVEL%"
+if not "%EC%"=="0" (
+  echo Server exited with code %EC%
+  pause
+)
+exit /b %EC%

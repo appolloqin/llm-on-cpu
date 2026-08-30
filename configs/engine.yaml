@@ -1,4 +1,5 @@
-# llm-on-cpu 引擎配置 (M4 llmoc_server 读取)
+# llm-on-cpu 引擎配置 (M4/M5 llmoc_server 读取)
+# 完整模式设计见 docs/ARCHITECTURE.md §3.1 · 使用说明 docs/USAGE.md
 
 model:
   path: models/Qwen3.5-4B.lwc
@@ -7,16 +8,27 @@ model:
   mtp: false
   # tokenizer_dir: models/Qwen3.5-4B-hf   # 默认由 path 推 *-hf/
 
+# ---------------------------------------------------------------------------
+# 执行模式 mode（加载期确定）
+#
+#   pure_cpu     ① 纯 CPU（默认）。不初始化 CUDA；gemm 全走 CPU。
+#   hybrid_gpu   ② 需 CUDA。attn 等 BF16 Linear 可走 cuBLAS；专家仍 CPU/NVMe。
+#                无 CUDA 时降级 pure_cpu 并打日志。
+#   pure_gpu     ③ 需 CUDA；无卡则启动失败（不静默降级）。
+#   auto         有 CUDA → hybrid_gpu，否则 pure_cpu。
+# ---------------------------------------------------------------------------
 mode: pure_cpu
+
 tiers:
   dram_hot_gb: 16
   kv_pool_gb: 2
   prefetch_buf_gb: 1
+  # hybrid_gpu / pure_gpu 显存预算（GB）；未设时默认 8
+  # gpu_vram_gb: 8
 
 decode:
   spec_k: 3
   accept_min: 2.0
-  # 单次回复最多新生成 token（≠ 模型上下文窗口）
   max_new_tokens: 204800
 
 io:

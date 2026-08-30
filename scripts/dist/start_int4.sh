@@ -14,4 +14,6 @@ if [[ ! -f models/Qwen3.5-4B.int4.qlwc ]]; then
   echo "WARN: models/Qwen3.5-4B.int4.qlwc missing — run ./download_int4.sh first" >&2
 fi
 echo "Starting INT4 server on http://127.0.0.1:15085/"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-32}"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"
 exec "$BIN" --config configs/engine_int4.yaml

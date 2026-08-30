@@ -3,14 +3,17 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/engine_config.h"
 #include "common/log.h"
+#include "hal/cuda_backend.h"
 #include "model/generate.h"
 #include "model/moe_model.h"
 #include "model/qwen3_5_model.h"
 #include "model/tokenizer_hf.h"
 #include "sched/mode_controller.h"
+#include "sched/placement_planner.h"
 #include "sched/scheduler.h"
 #include "server/http_api.h"
 #include "weights/prefetch_pipeline.h"
@@ -26,6 +29,7 @@ int main(int argc, char** argv) {
     if (!std::strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
     else if (!std::strcmp(argv[i], "--help")) {
       std::printf("usage: llmoc_server --config configs/engine.yaml\n");
+      std::printf("  modes: pure_cpu | hybrid_gpu | pure_gpu | auto\n");
       return 0;
     }
   }
@@ -33,20 +37,79 @@ int main(int argc, char** argv) {
     llmoc::log::init(nullptr);
     auto cfg = llmoc::EngineConfig::load(cfg_path);
     const std::string tok_dir = cfg.resolve_tokenizer_dir();
-    (void)llmoc::sched::resolve_mode(llmoc::sched::parse_mode(cfg.mode));
+
+    const bool cuda_ok = llmoc::hal::cuda::probe_available();
+    bool degraded = false;
+    std::string mode_err;
+    const auto req = llmoc::sched::parse_mode(cfg.mode);
+    const auto mode = llmoc::sched::resolve_mode(req, cuda_ok, &degraded, &mode_err);
+    if (req == llmoc::sched::ExecMode::kPureGpu && !cuda_ok) {
+      throw std::runtime_error(mode_err.empty() ? "pure_gpu requires CUDA" : mode_err);
+    }
+    if (degraded) {
+      LOG_WARN("mode=hybrid_gpu requested but CUDA unavailable — degraded to pure_cpu (%s)",
+               llmoc::hal::cuda::status());
+    }
+
+    if (mode == llmoc::sched::ExecMode::kHybridGpu || mode == llmoc::sched::ExecMode::kPureGpu) {
+      double vram_gb = cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0;
+      const size_t budget = static_cast<size_t>(vram_gb * (1ull << 30));
+      if (!llmoc::hal::cuda::enable(budget)) {
+        throw std::runtime_error(std::string("CUDA enable failed: ") + llmoc::hal::cuda::status());
+      }
+      llmoc::hal::cuda::log_status();
+      llmoc::sched::PlacementPlanner::Config pcfg;
+      pcfg.vram_bytes = budget;
+      pcfg.dram_bytes = static_cast<uint64_t>(cfg.dram_hot_gb * (1ull << 30));
+      // Expert hints filled after wm.open when MoE; empty ok for dense.
+      auto plan = llmoc::sched::PlacementPlanner::solve(mode, pcfg, {});
+      LOG_INFO("placement: %s", plan.summary.c_str());
+    }
+
 #if defined(_OPENMP)
     LOG_INFO("OpenMP max_threads=%d", omp_get_max_threads());
+    if (omp_get_max_threads() > 64) {
+      LOG_WARN("OpenMP threads=%d is high for bandwidth-bound decode; try "
+               "set OMP_NUM_THREADS=<physical cores> (often ~half of logical)",
+               omp_get_max_threads());
+    }
 #else
     LOG_INFO("OpenMP: not compiled in");
 #endif
-    LOG_INFO("model=%s tokenizer=%s port=%d dram_hot=%.1fG", cfg.model_path.c_str(),
-             tok_dir.c_str(), cfg.server_port, cfg.dram_hot_gb);
+    LOG_INFO("mode=%s model=%s tokenizer=%s port=%d dram_hot=%.1fG gpu_vram=%.1fG",
+             llmoc::sched::mode_name(mode), cfg.model_path.c_str(), tok_dir.c_str(),
+             cfg.server_port, cfg.dram_hot_gb, cfg.gpu_vram_gb);
 
     llmoc::wt::WeightManager wm;
     llmoc::wt::WeightManager::Config wcfg;
     wcfg.lru_budget_bytes = static_cast<uint64_t>(cfg.dram_hot_gb * (1ull << 30));
     wcfg.io_workers = cfg.io_workers;
     wm.open(cfg.model_path, wcfg);
+
+    // MoE: re-solve placement with expert sizes from LWC groups (informational + log).
+    if ((mode == llmoc::sched::ExecMode::kHybridGpu || mode == llmoc::sched::ExecMode::kPureGpu) &&
+        !wm.header().groups.empty()) {
+      std::vector<llmoc::sched::ExpertHint> hints;
+      for (const auto& g : wm.header().groups) {
+        llmoc::sched::ExpertHint h;
+        h.layer = static_cast<int>(g.layer);
+        h.expert = static_cast<int>(g.expert_id);
+        h.freq = 1.0;
+        h.bytes = 0;
+        for (const auto& tn : g.tensor_names) {
+          try {
+            h.bytes += wm.get(tn).size();
+          } catch (...) {
+          }
+        }
+        hints.push_back(h);
+      }
+      llmoc::sched::PlacementPlanner::Config pcfg;
+      pcfg.vram_bytes = llmoc::hal::cuda::vram_budget();
+      pcfg.dram_bytes = wcfg.lru_budget_bytes;
+      auto plan = llmoc::sched::PlacementPlanner::solve(mode, pcfg, hints);
+      LOG_INFO("placement(moe): %s", plan.summary.c_str());
+    }
 
     llmoc::model::HfTokenizer tok;
     tok.load(tok_dir + "/tokenizer.json");

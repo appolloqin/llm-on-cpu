@@ -155,7 +155,7 @@ Optional auth: set `LLMOC_API_KEY`, send `Authorization: Bearer ...`. Config: [`
 | **MoE** (Qwen3.8 etc.) gate top-k + ExpertPrefetcher | ✅ Auto-detect (has expert groups) |
 | `/healthz` · `/metrics` · radix · schedule queue | ✅ |
 | Real MTP wiring / op-level continuous batch | ⏳ |
-| hybrid-gpu / pure-gpu | ❌ M5 |
+| hybrid-gpu / pure-gpu | ✅ M5 (`mode: hybrid_gpu`/`pure_gpu`/`auto`; needs cudart+cublas) |
 
 `llmoc_server` picks the backend from whether `.lwc` has expert groups — no code change:
 
@@ -244,7 +244,7 @@ scripts/      Windows CMD / Linux sh / CI Dockerfile / fake-model gen
 | M2 | Double-buffer prefetch pipeline | ✅ **1.69x measured** |
 | M3 | MTP verify state machine | ✅ 14/14 unit tests; weight wiring = open item O2 |
 | M4 | Batching / API service | ✅ MVP: `llmoc_server` + chat + SSE + metrics |
-| M5 | PlacementPlanner + modes ②③ | ⏳ |
+| M5 | PlacementPlanner + modes ②③ + `hal/cuda_backend` | ✅ |
 
 ## Related docs
 

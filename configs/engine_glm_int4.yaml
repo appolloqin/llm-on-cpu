@@ -1,0 +1,31 @@
+# GLM-5.3-Flash — AWQ INT4（独立于 engine_int4.yaml）
+model:
+  path: models/GLM-5.3-Flash.awq.glmq
+  dtype: awq_int4
+  arch: glm53_flash
+  tokenizer_dir: models/GLM-5.3-Flash-hf
+
+# pure_cpu | hybrid_gpu | pure_gpu
+#   pure_cpu    — 全 CPU（当前可跑）
+#   hybrid_gpu  — 热层/attn→GPU，冷专家→CPU/NVMe（单卡~22G 推荐；CUDA 实算 🚧）
+#   pure_gpu    — 尽量全 GPU（显存不够则失败；CUDA 实算 🚧）
+# 详见 docs/MODEL_GLM53_FLASH.md §2 · docs/ARCHITECTURE.md §3.1
+mode: pure_cpu
+
+quant: awq_int4
+
+tiers:
+  dram_hot_gb: 24
+  gpu_vram_gb: 20   # hybrid_gpu / pure_gpu 显存预算（GB）
+  kv_pool_gb: 2
+  prefetch_buf_gb: 4
+
+decode:
+  max_new_tokens: 2048
+
+io:
+  workers: 4
+
+server:
+  port: 15086
+  api_key_env: LLMOC_API_KEY

@@ -207,7 +207,7 @@ server: { port: 15085, api_key_env: LLMOC_API_KEY }
 | M2 | lru_hotset + planner(初版) + 双缓冲全链 | `bench_tps --target 20` |
 | M3 | mtp_head + verify_loop | `bench_tps --target 30` ✅主干验收 |
 | M4 | batcher/radix/anchors/server/metrics | `wrk -c8 ... &&Prometheus 采集核对` |
-| M5 | hal/cuda + PlacementPlanner 完整 + mode②③ | 三模式 bench 矩阵报告 |
+| M5 | hal/cuda + PlacementPlanner + mode②③（默认 pure_cpu 不变） | 单元测试已覆盖；三模式 bench 矩阵可选 |
 
 ## 10. 开放项（编码期间关闭）
 

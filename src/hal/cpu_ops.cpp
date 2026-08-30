@@ -1,5 +1,6 @@
 // llm-on-cpu :: hal/cpu_ops.cpp
 #include "hal/cpu_ops.h"
+#include "hal/cuda_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +55,8 @@ void f32_to_bf16_buf(const float* src, uint16_t* dst, size_t n) {
 }
 
 void gemm_bias_free(const float* x, const uint16_t* W, float* y, int M, int K, WDtype dt) {
+  // M5: optional CUDA path — inactive unless hal::cuda::enable(); pure_cpu identical.
+  if (cuda::try_gemm_w16(x, W, y, M, K, dt == WDtype::kF16)) return;
 #if defined(LLMOC_ENABLE_AVX2)
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (M >= 128)

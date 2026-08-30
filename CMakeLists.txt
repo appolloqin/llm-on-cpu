@@ -50,7 +50,10 @@ add_library(llmoc_weights STATIC
   src/common/log.cpp
   src/hal/amx_gemm.cpp
   src/hal/cpu_ops.cpp
+  src/hal/cuda_backend.cpp
   src/hal/int4_ops.cpp
+  src/sched/mode_controller.cpp
+  src/sched/placement_planner.cpp
 )
 target_include_directories(llmoc_weights PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -176,6 +179,7 @@ add_executable(llmoc_unit_tests
   tests/unit/test_int4_gemm.cpp
   tests/unit/test_kv_snapshot.cpp
   tests/unit/test_model_spec.cpp
+  tests/unit/test_m5_mode.cpp
 )
 target_link_libraries(llmoc_unit_tests PRIVATE llmoc_weights llmoc_model)
 
@@ -209,6 +213,42 @@ add_executable(nan_probe
   src/model/qwen3_5_int4_model.cpp
 )
 target_link_libraries(nan_probe PRIVATE llmoc_model llmoc_weights nlohmann_json::nlohmann_json)
+
+# ---------- GLM-5.3-Flash 独立模块（不修改上方 Qwen/DeepSeek target 源列表） ----------
+add_library(llmoc_glm STATIC
+  src/glm/glm_config.cpp
+  src/glm/glm_flash_model.cpp
+  src/glm/device/glm_device.cpp
+  src/glm/hal/glm_awq_int4_ops.cpp
+  src/glm/hal/glm_nvfp4_ops.cpp
+  src/glm/hal/glm_cuda_ops.cpp
+  src/glm/weights/glm_weight_store.cpp
+  src/glm/weights/glm_expert_prefetch.cpp
+  src/glm/ops/glm_ops.cpp
+)
+target_include_directories(llmoc_glm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(llmoc_glm PUBLIC llmoc_weights llmoc_model)
+# 可选: 强制编译期 CUDA 宏（运行时已动态加载 cudart/cublas，通常无需打开）
+option(LLMOC_GLM_CUDA "Define LLMOC_GLM_CUDA=1 (runtime CUDA is auto-detected)" OFF)
+if(LLMOC_GLM_CUDA)
+  target_compile_definitions(llmoc_glm PUBLIC LLMOC_GLM_CUDA=1)
+  message(STATUS "GLM CUDA: compile flag ON + runtime dynamic cudart/cublas")
+else()
+  message(STATUS "GLM CUDA: runtime dynamic cudart/cublas (no nvcc required)")
+endif()
+
+add_executable(llmoc_server_glm src/server/main_glm.cpp)
+target_link_libraries(llmoc_server_glm PRIVATE llmoc_glm llmoc_server_lib)
+
+add_executable(make_fake_glmq tools/glm/make_fake_glmq.cpp)
+target_link_libraries(make_fake_glmq PRIVATE llmoc_glm)
+
+# GLM 单测编入同一 unit 可执行文件，但源码独立；不改现有 test_*.cpp
+target_sources(llmoc_unit_tests PRIVATE
+  tests/unit/test_glm_mode.cpp
+  tests/unit/test_glm_forward.cpp
+)
+target_link_libraries(llmoc_unit_tests PRIVATE llmoc_glm)
 
 if(MSVC)
   target_compile_options(m0_isa PRIVATE /arch:AVX2)
