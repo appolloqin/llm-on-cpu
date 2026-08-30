@@ -38,13 +38,13 @@ llmoc::EngineConfig to_http_cfg(const llmoc::glm::GlmEngineConfig& g) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string cfg_path = "configs/engine_glm_int4.yaml";
+  std::string cfg_path = "configs/engine_glm_nvfp4.yaml";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
     else if (!std::strcmp(argv[i], "--help")) {
-      std::printf("usage: llmoc_server_glm --config configs/engine_glm_int4.yaml\n");
+      std::printf("usage: llmoc_server_glm --config configs/engine_glm_nvfp4.yaml\n");
       std::printf("  modes: pure_cpu | hybrid_gpu | pure_gpu\n");
-      std::printf("  quant: awq_int4 | nvfp4  (see configs/engine_glm_*.yaml)\n");
+      std::printf("  quant: nvfp4 (default) | awq_int4  (see configs/engine_glm_*.yaml)\n");
       return 0;
     }
   }

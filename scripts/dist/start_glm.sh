@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start GLM server (default: AWQ INT4 config). Modes: pure_cpu | hybrid_gpu | pure_gpu
+# Start GLM server (default: NVFP4 config). Modes: pure_cpu | hybrid_gpu | pure_gpu
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -10,7 +10,7 @@ if [[ ! -e "$BIN" ]]; then
   echo "ERROR: bin/llmoc_server_glm not found — build the project first" >&2
   exit 1
 fi
-CFG="${1:-configs/engine_glm_int4.yaml}"
+CFG="${1:-configs/engine_glm_nvfp4.yaml}"
 if [[ ! -f "$CFG" ]]; then
   echo "ERROR: config not found: $CFG" >&2
   exit 1

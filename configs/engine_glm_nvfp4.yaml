@@ -1,4 +1,5 @@
-# GLM-5.3-Flash — NVFP4（独立；可指向 HF NVFP4 导入产物）
+# GLM-5.3-Flash — NVFP4（默认路径；源: LibertAIDAI/GLM-5.3-Flash-NVFP4）
+# download_glm.cmd / prepare_glm.mjs --quant nvfp4 → models/GLM-5.3-Flash.nvfp4.glmq
 model:
   path: models/GLM-5.3-Flash.nvfp4.glmq
   dtype: nvfp4
@@ -24,5 +25,5 @@ io:
   workers: 4
 
 server:
-  port: 15087
+  port: 15085
   api_key_env: LLMOC_API_KEY

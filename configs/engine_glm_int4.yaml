@@ -27,5 +27,5 @@ io:
   workers: 4
 
 server:
-  port: 15086
+  port: 15085
   api_key_env: LLMOC_API_KEY

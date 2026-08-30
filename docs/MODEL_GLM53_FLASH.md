@@ -36,8 +36,8 @@ bin/llmoc_server_glm
 ## 4. 启动
 
 ```bat
+bin\llmoc_server_glm.exe --config configs\engine_glm_nvfp4.yaml   :: 默认
 bin\llmoc_server_glm.exe --config configs\engine_glm_int4.yaml
-bin\llmoc_server_glm.exe --config configs\engine_glm_nvfp4.yaml
 ```
 
 日志应出现 `arch=glm mode=... quant=...`。
@@ -63,6 +63,16 @@ bin\llmoc_server_glm.exe --config configs\engine_glm_nvfp4.yaml
 > **说明**: RTX 40 系为 SM89，官方 FlashMLA 面向 SM90。本引擎在消费级卡上使用与配置一致的 **KPool 压缩索引 + SDPA**，在 hybrid/pure_gpu 下用 **cuBLAS** 加速 BF16 GEMM。
 
 ### 权重流水线
+
+一键（推荐，与发布包 `download_glm.*` 相同；**默认 NVFP4**）：
+
+```bat
+download_glm.cmd              :: LibertAIDAI/GLM-5.3-Flash-NVFP4 → models/GLM-5.3-Flash.nvfp4.glmq
+download_glm.cmd --awq        :: zai-org/GLM-5.3-Flash → AWQ → models/GLM-5.3-Flash.awq.glmq
+:: 或: node tools\glm\prepare_glm.mjs --quant nvfp4 --prune-hf
+```
+
+分步：
 
 ```bat
 :: BF16 HF → GLMQ

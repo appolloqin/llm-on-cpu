@@ -1,5 +1,5 @@
 @echo off
-REM Start GLM server (AWQ INT4 config by default). Modes: pure_cpu | hybrid_gpu | pure_gpu
+REM Start GLM server (NVFP4 config by default). Modes: pure_cpu | hybrid_gpu | pure_gpu
 setlocal EnableExtensions
 cd /d "%~dp0"
 chcp 65001 >nul
@@ -9,7 +9,7 @@ if not exist "bin\llmoc_server_glm.exe" (
   exit /b 1
 )
 set "CFG=%~1"
-if "%CFG%"=="" set "CFG=configs\engine_glm_int4.yaml"
+if "%CFG%"=="" set "CFG=configs\engine_glm_nvfp4.yaml"
 echo Starting GLM server with %CFG%
 echo OMP_NUM_THREADS=%OMP_NUM_THREADS%
 "bin\llmoc_server_glm.exe" --config "%CFG%"
