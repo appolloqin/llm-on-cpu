@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Auto: download / import NVFP4 (default) or AWQ for GLM-5.3-Flash
+# Default: LibertAIDAI/GLM-5.3-Flash-NVFP4 (one model ID for all sources)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
@@ -20,7 +20,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "== [GLM] prepare quant=${QUANT} (default: LibertAIDAI/GLM-5.3-Flash-NVFP4)"
+echo "== [GLM] prepare quant=${QUANT}"
 node tools/glm/prepare_glm.mjs --quant "${QUANT}" --prune-hf "${EXTRA[@]}"
 echo
 if [[ "${QUANT}" == "awq" ]]; then

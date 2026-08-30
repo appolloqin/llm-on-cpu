@@ -18,12 +18,16 @@ const HF = "https://huggingface.co";
 const HF_MIRROR = "https://hf-mirror.com";
 const MS = "https://modelscope.cn";
 const KEEP = /(\.safetensors$|\.json$|^tokenizer|\.model$|\.jinja$)/; // 与 python 版一致, 跳过 *.bin
+const KEEP_TOKENIZER_ONLY = /(\.json$|^tokenizer|\.model$|\.jinja$|^vocab|^merges|^special_tokens)/;
 
 function parseArgs() {
   const a = process.argv.slice(2);
   const get = (k) => { const i = a.indexOf(k); return i >= 0 ? a[i + 1] : undefined; };
   if (!a.includes("--model")) {
-    console.error("usage: node download_model.mjs --model <id> [--source auto|modelscope|hf-mirror|hf] [--out DIR] [--ms-id] [--hf-id] [--all] [--revision R]");
+    console.error(
+      "usage: node download_model.mjs --model <id> [--source auto|modelscope|hf-mirror|hf]\n" +
+        "       [--out DIR] [--ms-id] [--hf-id] [--all] [--tokenizer-only] [--revision R]",
+    );
     process.exit(2);
   }
   const model = get("--model");
@@ -34,6 +38,7 @@ function parseArgs() {
     msId: get("--ms-id") ?? model,
     hfId: get("--hf-id") ?? model,
     all: a.includes("--all"),
+    tokenizerOnly: a.includes("--tokenizer-only"),
     revision: get("--revision"),
   };
 }
@@ -140,10 +145,19 @@ async function runSource(name, opt) {
   const id = name === "modelscope" ? opt.msId : opt.hfId;
   const api = await sources[name](id, opt.revision, opt);
   const files = await api.list();
-  const wanted = files.filter((f) => opt.all || KEEP.test(f.path));
-  if (!wanted.some((f) => f.path.endsWith(".safetensors")))
+  const keepRe = opt.tokenizerOnly ? KEEP_TOKENIZER_ONLY : KEEP;
+  const wanted = files.filter((f) => {
+    if (opt.all && !opt.tokenizerOnly) return true;
+    return keepRe.test(f.path.split("/").pop() || f.path);
+  });
+  if (!opt.tokenizerOnly && !wanted.some((f) => f.path.endsWith(".safetensors")))
     throw new Error("file list has no *.safetensors (wrong repo id?)");
+  if (opt.tokenizerOnly && wanted.length === 0)
+    throw new Error("tokenizer-only: no tokenizer/config files in repo");
   const totalBytes = wanted.reduce((s, f) => s + f.size, 0);
+  if (opt.tokenizerOnly) {
+    console.log(`  [tokenizer-only] ${wanted.length} files, ${formatBytes(totalBytes)}`);
+  }
   const progress = createOverallProgress(totalBytes);
   let done = 0;
   let doneBytes = 0;

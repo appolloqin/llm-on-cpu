@@ -1,5 +1,5 @@
 @echo off
-REM Auto: download / import NVFP4 (default) or AWQ for GLM-5.3-Flash
+REM Default: LibertAIDAI/GLM-5.3-Flash-NVFP4 (one model ID for all sources)
 setlocal EnableExtensions
 cd /d "%~dp0"
 chcp 65001 >nul
@@ -36,7 +36,7 @@ shift
 goto parse
 
 :run
-echo == [GLM] prepare quant=%QUANT%  ^(default: LibertAIDAI/GLM-5.3-Flash-NVFP4^)
+echo == [GLM] prepare quant=%QUANT%
 call node tools\glm\prepare_glm.mjs --quant %QUANT% --prune-hf %EXTRA%
 if errorlevel 1 (
   echo ERROR: prepare_glm failed. See log above.

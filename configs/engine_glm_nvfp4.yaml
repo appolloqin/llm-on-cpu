@@ -1,10 +1,10 @@
-# GLM-5.3-Flash — NVFP4（默认路径；源: LibertAIDAI/GLM-5.3-Flash-NVFP4）
-# download_glm.cmd / prepare_glm.mjs --quant nvfp4 → models/GLM-5.3-Flash.nvfp4.glmq
+# GLM-5.3-Flash — NVFP4（默认；模型 ID: LibertAIDAI/GLM-5.3-Flash-NVFP4）
+# download_glm.cmd → 只下该 ID（ModelScope / hf-mirror / hf 用同一 ID）
 model:
   path: models/GLM-5.3-Flash.nvfp4.glmq
   dtype: nvfp4
   arch: glm53_flash
-  tokenizer_dir: models/GLM-5.3-Flash-hf
+  tokenizer_dir: models/GLM-5.3-Flash-NVFP4
 
 # pure_cpu | hybrid_gpu | pure_gpu（含义同 engine_glm_int4.yaml / ARCHITECTURE §3.1）
 # 单卡 ~22G 推荐 hybrid_gpu；无 CUDA 构建时会回退，见日志

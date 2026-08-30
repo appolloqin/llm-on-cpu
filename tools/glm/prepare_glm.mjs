@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
  * tools/glm/prepare_glm.mjs
- * GLM-5.3-Flash 一键：下载 → GLMQ 转换/导入 → 可选 AWQ；与 Qwen prepare_model 隔离。
+ * GLM 一键：下载 → GLMQ 导入/量化。默认只认一个模型 ID，不做 zai-org 夹带。
  *
  * 用法:
  *   node tools/glm/prepare_glm.mjs --prune-hf
- *   node tools/glm/prepare_glm.mjs --quant awq --prune-hf
- *   node tools/glm/prepare_glm.mjs --quant nvfp4 --nvfp4-model LibertAIDAI/GLM-5.3-Flash-NVFP4 --force
+ *   node tools/glm/prepare_glm.mjs --model LibertAIDAI/GLM-5.3-Flash-NVFP4
+ *   node tools/glm/prepare_glm.mjs --quant awq --model ZhipuAI/GLM-5.3-Flash --prune-hf
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -15,6 +15,8 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const MIN_WEIGHT_BYTES = 1 << 20;
+const DEFAULT_NVFP4 = "LibertAIDAI/GLM-5.3-Flash-NVFP4";
+const DEFAULT_AWQ = "ZhipuAI/GLM-5.3-Flash"; // ModelScope 原生 ID（HF 上为 zai-org/...）
 
 function parseArgs() {
   const a = process.argv.slice(2);
@@ -24,16 +26,15 @@ function parseArgs() {
   };
   if (a.includes("-h") || a.includes("--help")) {
     console.error(
-      "usage: node tools/glm/prepare_glm.mjs [--quant awq|nvfp4]\n" +
-        "       [--model org/name] [--nvfp4-model org/name]\n" +
+      "usage: node tools/glm/prepare_glm.mjs [--quant nvfp4|awq] [--model org/name]\n" +
         "       [--source auto|modelscope|hf-mirror|hf]\n" +
-        "       [--out-hf DIR] [--out-nvfp4-hf DIR] [--out-bf16 FILE] [--out-awq FILE] [--out-nvfp4 FILE]\n" +
-        "       [--prune-hf] [--remove-hf] [--keep-bf16]\n" +
+        "       [--out-hf DIR] [--out-glmq FILE] [--prune-hf] [--remove-hf] [--keep-bf16]\n" +
         "       [--force] [--force-download] [--force-convert] [--force-quant]\n" +
         "       [--skip-download] [--skip-convert] [--skip-quant]\n" +
-        "       [--limit-experts N] [--limit-layers N] [--ms-id] [--hf-id]\n" +
-        "  default --quant nvfp4 → models/GLM-5.3-Flash.nvfp4.glmq (LibertAIDAI/GLM-5.3-Flash-NVFP4)\n" +
-        "  --quant awq       → models/GLM-5.3-Flash.awq.glmq (base HF → convert → AWQ)",
+        "       [--limit-experts N] [--limit-layers N]\n" +
+        `  default nvfp4: --model ${DEFAULT_NVFP4}\n` +
+        `  default awq:   --model ${DEFAULT_AWQ}\n` +
+        "  One model ID is used for ModelScope / hf-mirror / hf (no silent ID rewrite).",
     );
     process.exit(a.includes("-h") || a.includes("--help") ? 0 : 2);
   }
@@ -42,23 +43,23 @@ function parseArgs() {
     console.error(`ERROR: --quant must be awq|nvfp4, got ${quant}`);
     process.exit(2);
   }
-  const model = get("--model") ?? "zai-org/GLM-5.3-Flash";
-  const nvfp4Model = get("--nvfp4-model") ?? "LibertAIDAI/GLM-5.3-Flash-NVFP4";
-  const short = "GLM-5.3-Flash";
+  // --nvfp4-model kept as alias of --model for old scripts
+  const model =
+    get("--model") ?? get("--nvfp4-model") ?? (quant === "awq" ? DEFAULT_AWQ : DEFAULT_NVFP4);
+  const short = model.split("/").pop() || "GLM";
   const force = a.includes("--force");
   return {
     quant,
     model,
-    nvfp4Model,
     short,
     source: get("--source") ?? "auto",
-    outHf: get("--out-hf") ?? path.join("models", `${short}-hf`),
-    outNvfp4Hf: get("--out-nvfp4-hf") ?? path.join("models", `${short}-NVFP4`),
-    outBf16: get("--out-bf16") ?? path.join("models", `${short}.bf16.glmq`),
-    outAwq: get("--out-awq") ?? path.join("models", `${short}.awq.glmq`),
-    outNvfp4: get("--out-nvfp4") ?? path.join("models", `${short}.nvfp4.glmq`),
-    msId: get("--ms-id"),
-    hfId: get("--hf-id"),
+    outHf:
+      get("--out-hf") ??
+      path.join("models", quant === "nvfp4" ? `${short}` : `${short}-hf`),
+    outBf16: get("--out-bf16") ?? path.join("models", "GLM-5.3-Flash.bf16.glmq"),
+    outAwq: get("--out-awq") ?? get("--out-glmq") ?? path.join("models", "GLM-5.3-Flash.awq.glmq"),
+    outNvfp4:
+      get("--out-nvfp4") ?? get("--out-glmq") ?? path.join("models", "GLM-5.3-Flash.nvfp4.glmq"),
     hardSkipDownload: a.includes("--skip-download"),
     hardSkipConvert: a.includes("--skip-convert"),
     hardSkipQuant: a.includes("--skip-quant"),
@@ -119,6 +120,7 @@ function nodeBin() {
   return process.execPath;
 }
 
+/** Download exactly --model (same ID for every source). No ms/hf rewrite. */
 function downloadModel(modelId, outDir, opts) {
   const args = [
     path.join("tools", "download_model.mjs"),
@@ -129,8 +131,6 @@ function downloadModel(modelId, outDir, opts) {
     "--source",
     opts.source,
   ];
-  if (opts.msId) args.push("--ms-id", opts.msId);
-  if (opts.hfId) args.push("--hf-id", opts.hfId);
   run("download", nodeBin(), args);
 }
 
@@ -153,27 +153,19 @@ function removeDir(dir) {
 
 function main() {
   const o = parseArgs();
-  console.log(`== [GLM] quant=${o.quant} model=${o.model}`);
-
-  // --- tokenizer / base HF (always needed for configs' tokenizer_dir) ---
-  const needBaseHf =
-    !o.hardSkipDownload &&
-    (o.forceDownload || !hasTokenizer(o.outHf) || (o.quant === "awq" && !hasHfWeights(o.outHf)));
-  if (needBaseHf) {
-    if (o.quant === "awq" || !hasTokenizer(o.outHf)) {
-      downloadModel(o.model, o.outHf, o);
-    }
-  } else {
-    console.log(`skip download base HF (${o.outHf} ok)`);
-  }
+  console.log(`== [GLM] quant=${o.quant} model=${o.model} source=${o.source}`);
 
   if (o.quant === "awq") {
+    const needBase =
+      !o.hardSkipDownload &&
+      (o.forceDownload || !hasHfWeights(o.outHf) || !hasTokenizer(o.outHf));
+    if (needBase) downloadModel(o.model, o.outHf, o);
+    else console.log(`skip download (${o.outHf} ok)`);
+
     const needConvert =
       !o.hardSkipConvert && (o.forceConvert || !hasGoodGlmq(o.outBf16));
     if (needConvert) {
-      if (!hasHfWeights(o.outHf)) {
-        throw new Error(`missing safetensors under ${o.outHf}; download first`);
-      }
+      if (!hasHfWeights(o.outHf)) throw new Error(`missing safetensors under ${o.outHf}`);
       const args = [
         path.join("tools", "glm", "convert_glm_lwc.mjs"),
         "--src",
@@ -190,9 +182,7 @@ function main() {
 
     const needAwq = !o.hardSkipQuant && (o.forceQuant || !hasGoodGlmq(o.outAwq));
     if (needAwq) {
-      if (!hasGoodGlmq(o.outBf16)) {
-        throw new Error(`missing ${o.outBf16}; convert first`);
-      }
+      if (!hasGoodGlmq(o.outBf16)) throw new Error(`missing ${o.outBf16}`);
       run("quantize-awq", nodeBin(), [
         path.join("tools", "glm", "quantize_glm_awq.mjs"),
         "--src",
@@ -208,49 +198,35 @@ function main() {
       console.log(`skip awq (${o.outAwq} ${formatBytes(fileSize(o.outAwq))})`);
     }
 
-    if (o.pruneHf) {
-      const n = pruneSafetensors(o.outHf);
-      console.log(`prune-hf: removed ${n} *.safetensors under ${o.outHf}`);
-    }
+    if (o.pruneHf) console.log(`prune-hf: removed ${pruneSafetensors(o.outHf)} *.safetensors`);
     if (o.removeHf) removeDir(o.outHf);
 
     console.log(`\nOK. Engine weights: ${o.outAwq}`);
-    console.log(`    Tokenizer keep: ${o.outHf}/`);
-    console.log("Next: start_glm.cmd   or   ./start_glm.sh");
+    console.log(`    Tokenizer: ${o.outHf}/`);
+    console.log("Next: start_glm.cmd configs\\engine_glm_int4.yaml");
     return;
   }
 
-  // --- nvfp4 ---
-  const needNv =
-    !o.hardSkipDownload && (o.forceDownload || !hasHfWeights(o.outNvfp4Hf));
-  if (needNv) {
-    downloadModel(o.nvfp4Model, o.outNvfp4Hf, {
-      ...o,
-      msId: undefined,
-      hfId: undefined,
-    });
-  } else {
-    console.log(`skip download NVFP4 HF (${o.outNvfp4Hf} ok)`);
-  }
+  // --- nvfp4: single model ID only ---
+  const needDl =
+    !o.hardSkipDownload && (o.forceDownload || !hasHfWeights(o.outHf));
+  if (needDl) downloadModel(o.model, o.outHf, o);
+  else console.log(`skip download (${o.outHf} ok)`);
 
-  // Ensure tokenizer/config for engine_glm_nvfp4.yaml (tokenizer_dir = GLM-5.3-Flash-hf)
   if (!hasTokenizer(o.outHf)) {
-    if (o.hardSkipDownload) {
-      throw new Error(`missing tokenizer under ${o.outHf}; need base model for tokenizer_dir`);
-    }
-    downloadModel(o.model, o.outHf, o);
+    throw new Error(
+      `no tokenizer/config under ${o.outHf} after downloading ${o.model}`,
+    );
   }
 
   const needImport =
     !o.hardSkipConvert && (o.forceConvert || o.forceQuant || !hasGoodGlmq(o.outNvfp4));
   if (needImport) {
-    if (!hasHfWeights(o.outNvfp4Hf)) {
-      throw new Error(`missing safetensors under ${o.outNvfp4Hf}`);
-    }
+    if (!hasHfWeights(o.outHf)) throw new Error(`missing safetensors under ${o.outHf}`);
     const args = [
       path.join("tools", "glm", "import_glm_nvfp4.mjs"),
       "--src",
-      o.outNvfp4Hf,
+      o.outHf,
       "--out",
       o.outNvfp4,
     ];
@@ -261,18 +237,13 @@ function main() {
     console.log(`skip import (${o.outNvfp4} ${formatBytes(fileSize(o.outNvfp4))})`);
   }
 
-  if (o.pruneHf) {
-    const n1 = pruneSafetensors(o.outNvfp4Hf);
-    const n2 = pruneSafetensors(o.outHf);
-    console.log(`prune-hf: removed ${n1}+${n2} *.safetensors`);
-  }
-  if (o.removeHf) {
-    removeDir(o.outNvfp4Hf);
-  }
+  if (o.pruneHf) console.log(`prune-hf: removed ${pruneSafetensors(o.outHf)} *.safetensors`);
+  if (o.removeHf) removeDir(o.outHf);
 
   console.log(`\nOK. Engine weights: ${o.outNvfp4}`);
-  console.log(`    Tokenizer keep: ${o.outHf}/`);
-  console.log("Next: start_glm.cmd configs\\engine_glm_nvfp4.yaml");
+  console.log(`    HF checkout:   ${o.outHf}/  (${o.model})`);
+  console.log(`    Tokenizer:     ${o.outHf}/`);
+  console.log("Next: start_glm.cmd");
 }
 
 try {

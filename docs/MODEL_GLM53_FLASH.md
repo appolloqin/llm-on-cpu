@@ -67,8 +67,8 @@ bin\llmoc_server_glm.exe --config configs\engine_glm_int4.yaml
 一键（推荐，与发布包 `download_glm.*` 相同；**默认 NVFP4**）：
 
 ```bat
-download_glm.cmd              :: LibertAIDAI/GLM-5.3-Flash-NVFP4 → models/GLM-5.3-Flash.nvfp4.glmq
-download_glm.cmd --awq        :: zai-org/GLM-5.3-Flash → AWQ → models/GLM-5.3-Flash.awq.glmq
+download_glm.cmd              :: --model LibertAIDAI/GLM-5.3-Flash-NVFP4（同一 ID 走 ModelScope→镜像）
+download_glm.cmd --awq        :: --model ZhipuAI/GLM-5.3-Flash → AWQ
 :: 或: node tools\glm\prepare_glm.mjs --quant nvfp4 --prune-hf
 ```
 
