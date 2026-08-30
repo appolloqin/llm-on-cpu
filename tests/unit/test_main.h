@@ -45,13 +45,16 @@ inline int run_all_tests() {
         } catch (const std::exception& e) {
             ++tinytest::failures();
             std::fprintf(stderr, "[FAIL] %s.%s threw: %s\n", c.suite, c.name, e.what());
+            std::fflush(stderr);
         }
         if (tinytest::failures() == before) {
             ++pass;
             std::printf("[PASS] %s.%s\n", c.suite, c.name);
+            std::fflush(stdout);
         }
     }
     std::printf("%d/%d passed\n", pass, static_cast<int>(tinytest::registry().size()));
+    std::fflush(stdout);
     return tinytest::failures() == 0 ? 0 : 1;
 }
 

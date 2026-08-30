@@ -6,20 +6,34 @@
 #include <mutex>
 #include <string>
 
-#if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-#  define NOMINMAX
-#  include <windows.h>
-#endif
-
 namespace llmoc::log {
 namespace {
 
-std::mutex g_mu;
-FILE* g_fp = nullptr;
-std::string g_dir = "logs";
-int g_day = -1;  // YYYYMMDD
-bool g_inited = false;
+// Intentionally never destroyed: workers / atexit must not race CRT teardown.
+std::mutex& log_mu() {
+  static std::mutex* m = new std::mutex;
+  return *m;
+}
+
+FILE*& log_fp() {
+  static FILE* fp = nullptr;
+  return fp;
+}
+
+std::string& log_dir() {
+  static std::string* d = new std::string;  // empty = stderr only until init()
+  return *d;
+}
+
+int& log_day() {
+  static int day = -1;
+  return day;
+}
+
+bool& file_logging() {
+  static bool on = false;  // only true after init()
+  return on;
+}
 
 int today_yyyymmdd() {
   const std::time_t t = std::time(nullptr);
@@ -48,34 +62,37 @@ void format_stamp(char* out, size_t n) {
 }
 
 void open_today_locked() {
-  if (g_dir.empty()) {
-    if (g_fp) {
-      std::fclose(g_fp);
-      g_fp = nullptr;
+  if (!file_logging() || log_dir().empty()) {
+    if (log_fp()) {
+      std::fclose(log_fp());
+      log_fp() = nullptr;
     }
-    g_day = today_yyyymmdd();
+    log_day() = today_yyyymmdd();
     return;
   }
   const int day = today_yyyymmdd();
-  if (g_fp && day == g_day) return;
-  if (g_fp) {
-    std::fclose(g_fp);
-    g_fp = nullptr;
+  if (log_fp() && day == log_day()) return;
+  if (log_fp()) {
+    std::fclose(log_fp());
+    log_fp() = nullptr;
   }
   std::error_code ec;
-  std::filesystem::create_directories(g_dir, ec);
-  char path[512];
-  std::snprintf(path, sizeof(path), "%s/llmoc-%04d-%02d-%02d.log", g_dir.c_str(), day / 10000,
-                (day / 100) % 100, day % 100);
+  std::filesystem::create_directories(log_dir(), ec);
+  const int y = day / 10000;
+  const int mo = (day / 100) % 100;
+  const int d = day % 100;
+  char name[64];
+  std::snprintf(name, sizeof(name), "llmoc-%04d-%02d-%02d.log", y, mo, d);
+  const std::string path = (std::filesystem::path(log_dir()) / name).string();
 #if defined(_WIN32)
-  fopen_s(&g_fp, path, "a");
+  FILE* fp = nullptr;
+  if (fopen_s(&fp, path.c_str(), "a") != 0) fp = nullptr;
+  log_fp() = fp;
 #else
-  g_fp = std::fopen(path, "a");
+  log_fp() = std::fopen(path.c_str(), "a");
 #endif
-  g_day = day;
-  if (g_fp) {
-    std::setvbuf(g_fp, nullptr, _IOLBF, 0);  // line buffered
-  }
+  log_day() = day;
+  if (log_fp()) std::setvbuf(log_fp(), nullptr, _IOLBF, 0);
 }
 
 }  // namespace
@@ -101,69 +118,77 @@ bool profile_enabled() {
 }
 
 void init(const char* dir) {
-  std::lock_guard<std::mutex> lock(g_mu);
+  std::lock_guard<std::mutex> lock(log_mu());
   if (dir) {
-    g_dir = dir;
+    log_dir() = dir;
   } else if (const char* e = std::getenv("LLMOC_LOG_DIR")) {
-    g_dir = e;
+    log_dir() = e;
   } else {
-    g_dir = "logs";
+    log_dir() = "logs";
   }
+  file_logging() = !log_dir().empty();
   open_today_locked();
-  g_inited = true;
   char stamp[64];
   format_stamp(stamp, sizeof(stamp));
-  char line[256];
-  if (g_dir.empty()) {
-    std::snprintf(line, sizeof(line), "%s I [log] file logging disabled (LLMOC_LOG_DIR empty)",
-                  stamp);
+  char line[512];
+  if (!file_logging()) {
+    std::snprintf(line, sizeof(line), "%s I [log] file logging disabled", stamp);
   } else {
-    std::snprintf(line, sizeof(line), "%s I [log] writing to %s/llmoc-YYYY-MM-DD.log", stamp,
-                  g_dir.c_str());
+    std::snprintf(line, sizeof(line), "%s I [log] dir=%s file=llmoc-YYYY-MM-DD.log", stamp,
+                  log_dir().c_str());
   }
   std::fputs(line, stderr);
   std::fputc('\n', stderr);
-  if (g_fp) {
-    std::fputs(line, g_fp);
-    std::fputc('\n', g_fp);
-    std::fflush(g_fp);
+  if (log_fp()) {
+    std::fputs(line, log_fp());
+    std::fputc('\n', log_fp());
+    std::fflush(log_fp());
   }
 }
 
 void write_line(Level lv, const char* msg) {
   char stamp[64];
   format_stamp(stamp, sizeof(stamp));
-  char line[4200];
-  std::snprintf(line, sizeof(line), "%s %s %s", stamp, tag(lv), msg ? msg : "");
+  std::string line;
+  line.reserve(128 + (msg ? std::strlen(msg) : 0));
+  line.append(stamp);
+  line.push_back(' ');
+  line.append(tag(lv));
+  line.push_back(' ');
+  line.append(msg ? msg : "");
+  line.push_back('\n');
 
-  std::lock_guard<std::mutex> lock(g_mu);
-  if (!g_inited) {
-    // lazy init so early LOG_* still works
-    if (const char* e = std::getenv("LLMOC_LOG_DIR")) g_dir = e;
-    open_today_locked();
-    g_inited = true;
-  } else {
-    open_today_locked();
+  std::lock_guard<std::mutex> lock(log_mu());
+  if (file_logging()) open_today_locked();
+
+  std::fwrite(line.data(), 1, line.size(), stderr);
+  if (log_fp()) {
+    std::fwrite(line.data(), 1, line.size(), log_fp());
+    if (lv >= Level::kWarn) std::fflush(log_fp());
   }
+}
 
-#if defined(_MSC_VER)
-  _lock_file(stderr);
-#else
-  ::flockfile(stderr);
-#endif
-  std::fputs(line, stderr);
-  std::fputc('\n', stderr);
-#if defined(_MSC_VER)
-  _unlock_file(stderr);
-#else
-  ::funlockfile(stderr);
-#endif
-
-  if (g_fp) {
-    std::fputs(line, g_fp);
-    std::fputc('\n', g_fp);
-    if (lv >= Level::kWarn) std::fflush(g_fp);
+void emit_fmt(Level lv, const char* fmt, ...) {
+  if (!enabled(lv) || !fmt) return;
+  // Heap buffer: avoid large stack frame + /GS issues under deep call stacks.
+  std::string buf(2048, '\0');
+  va_list ap;
+  va_start(ap, fmt);
+  const int n = std::vsnprintf(buf.data(), buf.size(), fmt, ap);
+  va_end(ap);
+  if (n < 0) {
+    write_line(lv, "(log format error)");
+    return;
   }
+  if (static_cast<size_t>(n) >= buf.size()) {
+    buf.resize(static_cast<size_t>(n) + 1);
+    va_list ap2;
+    va_start(ap2, fmt);
+    std::vsnprintf(buf.data(), buf.size(), fmt, ap2);
+    va_end(ap2);
+  }
+  buf.resize(static_cast<size_t>(n));
+  write_line(lv, buf.c_str());
 }
 
 }  // namespace llmoc::log
