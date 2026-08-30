@@ -2,37 +2,31 @@
 #include "common/log.h"
 
 #include <ctime>
-#include <filesystem>
 #include <mutex>
 #include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 namespace llmoc::log {
 namespace {
 
-// Intentionally never destroyed: workers / atexit must not race CRT teardown.
-std::mutex& log_mu() {
-  static std::mutex* m = new std::mutex;
-  return *m;
-}
+// Leaked on purpose: avoid CRT teardown races with worker threads.
+struct State {
+  std::mutex mu;
+  FILE* fp = nullptr;
+  std::string dir;       // empty => stderr only
+  int day = -1;          // YYYYMMDD
+  bool allow_file = false;
+};
 
-FILE*& log_fp() {
-  static FILE* fp = nullptr;
-  return fp;
-}
-
-std::string& log_dir() {
-  static std::string* d = new std::string;  // empty = stderr only until init()
-  return *d;
-}
-
-int& log_day() {
-  static int day = -1;
-  return day;
-}
-
-bool& file_logging() {
-  static bool on = false;  // only true after init()
-  return on;
+State& state() {
+  static State* s = new State;
+  return *s;
 }
 
 int today_yyyymmdd() {
@@ -61,38 +55,72 @@ void format_stamp(char* out, size_t n) {
                 tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms));
 }
 
-void open_today_locked() {
-  if (!file_logging() || log_dir().empty()) {
-    if (log_fp()) {
-      std::fclose(log_fp());
-      log_fp() = nullptr;
+void ensure_dir(const std::string& dir) {
+  if (dir.empty()) return;
+#if defined(_WIN32)
+  // nested mkdir for "a/b/c"
+  std::string cur;
+  for (size_t i = 0; i <= dir.size(); ++i) {
+    if (i == dir.size() || dir[i] == '/' || dir[i] == '\\') {
+      if (!cur.empty()) _mkdir(cur.c_str());
+      if (i < dir.size()) cur.push_back('\\');
+    } else {
+      cur.push_back(dir[i]);
     }
-    log_day() = today_yyyymmdd();
+  }
+#else
+  std::string cur;
+  for (size_t i = 0; i <= dir.size(); ++i) {
+    if (i == dir.size() || dir[i] == '/') {
+      if (!cur.empty()) mkdir(cur.c_str(), 0755);
+      if (i < dir.size()) cur.push_back('/');
+    } else {
+      cur.push_back(dir[i]);
+    }
+  }
+#endif
+}
+
+void open_today_locked(State& st) {
+  if (!st.allow_file || st.dir.empty()) {
+    if (st.fp) {
+      std::fclose(st.fp);
+      st.fp = nullptr;
+    }
+    st.day = today_yyyymmdd();
     return;
   }
   const int day = today_yyyymmdd();
-  if (log_fp() && day == log_day()) return;
-  if (log_fp()) {
-    std::fclose(log_fp());
-    log_fp() = nullptr;
+  if (st.fp && day == st.day) return;
+  if (st.fp) {
+    std::fclose(st.fp);
+    st.fp = nullptr;
   }
-  std::error_code ec;
-  std::filesystem::create_directories(log_dir(), ec);
+  ensure_dir(st.dir);
   const int y = day / 10000;
   const int mo = (day / 100) % 100;
   const int d = day % 100;
-  char name[64];
-  std::snprintf(name, sizeof(name), "llmoc-%04d-%02d-%02d.log", y, mo, d);
-  const std::string path = (std::filesystem::path(log_dir()) / name).string();
+  char path[512];
+  std::snprintf(path, sizeof(path), "%s/llmoc-%04d-%02d-%02d.log", st.dir.c_str(), y, mo, d);
 #if defined(_WIN32)
   FILE* fp = nullptr;
-  if (fopen_s(&fp, path.c_str(), "a") != 0) fp = nullptr;
-  log_fp() = fp;
+  if (fopen_s(&fp, path, "a") != 0) fp = nullptr;
+  st.fp = fp;
 #else
-  log_fp() = std::fopen(path.c_str(), "a");
+  st.fp = std::fopen(path, "a");
 #endif
-  log_day() = day;
-  if (log_fp()) std::setvbuf(log_fp(), nullptr, _IOLBF, 0);
+  st.day = day;
+}
+
+void emit_raw(State& st, const char* line, size_t len, Level lv) {
+  if (len == 0) return;
+  (void)lv;
+  std::fwrite(line, 1, len, stderr);
+  std::fflush(stderr);
+  if (st.fp) {
+    std::fwrite(line, 1, len, st.fp);
+    std::fflush(st.fp);
+  }
 }
 
 }  // namespace
@@ -118,63 +146,56 @@ bool profile_enabled() {
 }
 
 void init(const char* dir) {
-  std::lock_guard<std::mutex> lock(log_mu());
+  State& st = state();
+  std::lock_guard<std::mutex> lock(st.mu);
   if (dir) {
-    log_dir() = dir;
+    st.dir = dir;
   } else if (const char* e = std::getenv("LLMOC_LOG_DIR")) {
-    log_dir() = e;
+    st.dir = e;
   } else {
-    log_dir() = "logs";
+    st.dir = "logs";
   }
-  file_logging() = !log_dir().empty();
-  open_today_locked();
+  st.allow_file = !st.dir.empty();
+  open_today_locked(st);
+
   char stamp[64];
   format_stamp(stamp, sizeof(stamp));
-  char line[512];
-  if (!file_logging()) {
-    std::snprintf(line, sizeof(line), "%s I [log] file logging disabled", stamp);
+  char line[640];
+  int n;
+  if (!st.allow_file) {
+    n = std::snprintf(line, sizeof(line), "%s I [log] file logging disabled\n", stamp);
   } else {
-    std::snprintf(line, sizeof(line), "%s I [log] dir=%s file=llmoc-YYYY-MM-DD.log", stamp,
-                  log_dir().c_str());
+    n = std::snprintf(line, sizeof(line), "%s I [log] dir=%s file=llmoc-YYYY-MM-DD.log\n", stamp,
+                      st.dir.c_str());
   }
-  std::fputs(line, stderr);
-  std::fputc('\n', stderr);
-  if (log_fp()) {
-    std::fputs(line, log_fp());
-    std::fputc('\n', log_fp());
-    std::fflush(log_fp());
-  }
+  if (n > 0) emit_raw(st, line, static_cast<size_t>(n), Level::kInfo);
 }
 
 void write_line(Level lv, const char* msg) {
   char stamp[64];
   format_stamp(stamp, sizeof(stamp));
-  std::string line;
-  line.reserve(128 + (msg ? std::strlen(msg) : 0));
-  line.append(stamp);
-  line.push_back(' ');
-  line.append(tag(lv));
-  line.push_back(' ');
-  line.append(msg ? msg : "");
-  line.push_back('\n');
 
-  std::lock_guard<std::mutex> lock(log_mu());
-  if (file_logging()) open_today_locked();
+  const char* body = msg ? msg : "";
+  const size_t body_len = std::strlen(body);
+  std::vector<char> line;
+  line.resize(64 + 4 + body_len + 2);
+  const int n =
+      std::snprintf(line.data(), line.size(), "%s %s %s\n", stamp, tag(lv), body);
+  if (n <= 0) return;
 
-  std::fwrite(line.data(), 1, line.size(), stderr);
-  if (log_fp()) {
-    std::fwrite(line.data(), 1, line.size(), log_fp());
-    if (lv >= Level::kWarn) std::fflush(log_fp());
-  }
+  State& st = state();
+  std::lock_guard<std::mutex> lock(st.mu);
+  if (st.allow_file) open_today_locked(st);
+  emit_raw(st, line.data(), static_cast<size_t>(n), lv);
 }
 
 void emit_fmt(Level lv, const char* fmt, ...) {
   if (!enabled(lv) || !fmt) return;
-  // Heap buffer: avoid large stack frame + /GS issues under deep call stacks.
-  std::string buf(2048, '\0');
+
+  std::vector<char> buf(1024);
   va_list ap;
   va_start(ap, fmt);
-  const int n = std::vsnprintf(buf.data(), buf.size(), fmt, ap);
+  int n = std::vsnprintf(buf.data(), buf.size(), fmt, ap);
   va_end(ap);
   if (n < 0) {
     write_line(lv, "(log format error)");
@@ -184,11 +205,14 @@ void emit_fmt(Level lv, const char* fmt, ...) {
     buf.resize(static_cast<size_t>(n) + 1);
     va_list ap2;
     va_start(ap2, fmt);
-    std::vsnprintf(buf.data(), buf.size(), fmt, ap2);
+    n = std::vsnprintf(buf.data(), buf.size(), fmt, ap2);
     va_end(ap2);
+    if (n < 0) {
+      write_line(lv, "(log format error)");
+      return;
+    }
   }
-  buf.resize(static_cast<size_t>(n));
-  write_line(lv, buf.c_str());
+  write_line(lv, buf.data());
 }
 
 }  // namespace llmoc::log
