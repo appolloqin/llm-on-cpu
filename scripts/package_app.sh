@@ -26,6 +26,8 @@ mkdir -p "${STAGE}/bin" "${STAGE}/configs" "${STAGE}/docs" "${STAGE}/tools" "${S
 BINS=(
   llmoc_server
   llmoc_server_int4
+  llmoc_server_glm
+  make_fake_glmq
   lwc_verify
   m0_bandwidth
   m0_isa
@@ -33,13 +35,16 @@ BINS=(
 )
 
 copied=0
+have_glm=0
 for b in "${BINS[@]}"; do
   if [[ -f "${BIN_DIR}/${b}.exe" ]]; then
     cp "${BIN_DIR}/${b}.exe" "${STAGE}/bin/"
     copied=$((copied + 1))
+    [[ "$b" == "llmoc_server_glm" ]] && have_glm=1
   elif [[ -f "${BIN_DIR}/${b}" ]]; then
     cp "${BIN_DIR}/${b}" "${STAGE}/bin/"
     copied=$((copied + 1))
+    [[ "$b" == "llmoc_server_glm" ]] && have_glm=1
   else
     echo "WARN: missing ${BIN_DIR}/${b}[.exe]" >&2
   fi
@@ -48,23 +53,40 @@ if [[ "$copied" -lt 2 ]]; then
   echo "ERROR: expected at least llmoc_server + llmoc_server_int4 under ${BIN_DIR}" >&2
   exit 1
 fi
+if [[ "$have_glm" -eq 0 ]]; then
+  echo "ERROR: llmoc_server_glm missing under ${BIN_DIR} (GLM must be in the app package)" >&2
+  exit 1
+fi
 
-cp configs/engine.yaml configs/engine_int4.yaml "${STAGE}/configs/"
+cp configs/engine.yaml configs/engine_int4.yaml \
+   configs/engine_glm_int4.yaml configs/engine_glm_nvfp4.yaml "${STAGE}/configs/"
 cp README.md "${STAGE}/"
 [[ -f README.en.md ]] && cp README.en.md "${STAGE}/"
 [[ -f docs/USAGE.md ]] && cp docs/USAGE.md "${STAGE}/docs/"
 [[ -f docs/PLATFORM.md ]] && cp docs/PLATFORM.md "${STAGE}/docs/"
+[[ -f docs/MODEL_GLM53_FLASH.md ]] && cp docs/MODEL_GLM53_FLASH.md "${STAGE}/docs/"
 
 # 发布包一键脚本 + Node 工具链（下载/转换/量化；需本机 Node≥18）
 for t in download_model.mjs convert_lwc.mjs prepare_model.mjs quantize_int4.mjs; do
   cp "tools/${t}" "${STAGE}/tools/"
 done
+mkdir -p "${STAGE}/tools/glm"
+for t in convert_glm_lwc.mjs quantize_glm_awq.mjs import_glm_nvfp4.mjs; do
+  cp "tools/glm/${t}" "${STAGE}/tools/glm/"
+done
+mkdir -p "${STAGE}/models/recipes"
+[[ -f models/recipes/glm53_flash.json ]] && cp models/recipes/glm53_flash.json "${STAGE}/models/recipes/"
+[[ -f models/recipes/qwen3_5.json ]] && cp models/recipes/qwen3_5.json "${STAGE}/models/recipes/"
+
 cp scripts/dist/download_bf16.cmd scripts/dist/download_int4.cmd \
-   scripts/dist/start_bf16.cmd scripts/dist/start_int4.cmd "${STAGE}/"
+   scripts/dist/start_bf16.cmd scripts/dist/start_int4.cmd \
+   scripts/dist/start_glm.cmd "${STAGE}/"
 cp scripts/dist/download_bf16.sh scripts/dist/download_int4.sh \
-   scripts/dist/start_bf16.sh scripts/dist/start_int4.sh "${STAGE}/"
+   scripts/dist/start_bf16.sh scripts/dist/start_int4.sh \
+   scripts/dist/start_glm.sh "${STAGE}/"
 chmod +x "${STAGE}/download_bf16.sh" "${STAGE}/download_int4.sh" \
-         "${STAGE}/start_bf16.sh" "${STAGE}/start_int4.sh" || true
+         "${STAGE}/start_bf16.sh" "${STAGE}/start_int4.sh" \
+         "${STAGE}/start_glm.sh" || true
 # 空 models 占位，避免用户找不到目录
 : > "${STAGE}/models/.gitkeep"
 
@@ -88,6 +110,14 @@ download_* = auto pipeline (skip steps already done):
   Windows:     download_bf16.cmd
                start_bf16.cmd
   Linux/macOS: ./download_bf16.sh && ./start_bf16.sh
+
+-- GLM-5.3-Flash (independent path) --
+  Prepare weights (see docs/MODEL_GLM53_FLASH.md), then:
+  Windows:     start_glm.cmd
+               start_glm.cmd configs\\engine_glm_nvfp4.yaml
+  Linux/macOS: ./start_glm.sh
+               ./start_glm.sh configs/engine_glm_nvfp4.yaml
+  Tools:       tools/glm/*.mjs   Configs: configs/engine_glm_*.yaml
 
 Optional: download_*.cmd --model org/name  (then edit configs)
 

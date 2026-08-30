@@ -62,7 +62,7 @@ Tags `v*` also create a GitHub Release with:
 
 | Package | Contents |
 |---|---|
-| `llm-on-cpu-<ver>-windows-x64.zip` | `llmoc_server[.exe]` / `llmoc_server_int4` + configs |
+| `llm-on-cpu-<ver>-windows-x64.zip` | `llmoc_server` / `_int4` / `_glm` + configs + tools |
 | `llm-on-cpu-<ver>-linux-x64.zip` | same (built with liburing) |
 | `llm-on-cpu-<ver>-macos-arm64.zip` | same (logic/API validation) |
 | `llm-on-cpu-<ver>-src.zip` | full source (no models/build) |

@@ -62,7 +62,7 @@ T_token = max( 计算时间, 总字节/DRAM带宽, 缺页字节/NVMe吞吐 )   �
 
 | 包 | 内容 |
 |---|---|
-| `llm-on-cpu-<ver>-windows-x64.zip` | `llmoc_server[.exe]` / `llmoc_server_int4` + configs |
+| `llm-on-cpu-<ver>-windows-x64.zip` | `llmoc_server` / `_int4` / `_glm` + configs + tools |
 | `llm-on-cpu-<ver>-linux-x64.zip` | 同上（含 liburing 构建） |
 | `llm-on-cpu-<ver>-macos-arm64.zip` | 同上（逻辑验证向） |
 | `llm-on-cpu-<ver>-src.zip` | 完整源码（不含 models/build） |
