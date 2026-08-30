@@ -13,5 +13,8 @@ __pycache__/
 *.zip
 *.log
 logs/
+# 本地跑测重定向输出，勿提交（勿用 *.txt，会误伤 CMakeLists.txt）
+/t[0-9]*.txt
+/test_*.txt
 README.local.md
 docs/ABSORB_PRIORS.local.md
