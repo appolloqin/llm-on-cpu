@@ -14,6 +14,10 @@
 #include "server/http_api.h"
 #include "weights/qlwc_store.h"
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 int main(int argc, char** argv) {
   std::string cfg_path = "configs/engine_int4.yaml";
   for (int i = 1; i < argc; ++i) {
@@ -24,8 +28,12 @@ int main(int argc, char** argv) {
     }
   }
   try {
+    llmoc::log::init(nullptr);
     auto cfg = llmoc::EngineConfig::load(cfg_path);
     const std::string tok_dir = cfg.resolve_tokenizer_dir();
+#if defined(_OPENMP)
+    LOG_INFO("OpenMP max_threads=%d", omp_get_max_threads());
+#endif
     LOG_INFO("[int4] model=%s tokenizer=%s port=%d", cfg.model_path.c_str(), tok_dir.c_str(),
              cfg.server_port);
 

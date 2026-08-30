@@ -8,8 +8,11 @@
 
 #include "hal/cpu_ops.h"
 #include <nlohmann/json.hpp>
+#include "common/log.h"
 #include "model/mtp_head.h"
 #include "weights/lwc_format.h"
+
+#include <chrono>
 
 namespace llmoc::model {
 namespace {
@@ -84,6 +87,43 @@ void Qwen35Model::load(wt::WeightManager* wm, const std::string& hf_config_json_
       cfg_.linear_num_k * cfg_.linear_dk * 2 + cfg_.linear_num_v * cfg_.linear_dv;
   meta_.is_moe = false;
   meta_.kind = "qwen3_5";
+
+  // untied lm_head（Qwen3.8-27B 等）；tied 时复用 embed
+  lm_head_name_.clear();
+  if (!cfg_.tie_embeddings) {
+    if (wm_->header().find(prefix_ + "lm_head.weight"))
+      lm_head_name_ = prefix_ + "lm_head.weight";
+    else if (wm_->header().find("lm_head.weight"))
+      lm_head_name_ = "lm_head.weight";
+    else
+      throw std::runtime_error(
+          "tie_word_embeddings=false but lm_head.weight missing in LWC");
+  }
+
+  // 启动自检：第一层 full attn 的 q_proj 字节数须匹配 config（防 4B 配置套 27B 权重）
+  {
+    const int elem = (wd_ == hal::WDtype::kF32) ? 4 : 2;
+    for (int i = 0; i < cfg_.layers; ++i) {
+      if (cfg_.layer_types[i] != "full_attention") continue;
+      const std::string name =
+          prefix_ + "layers." + std::to_string(i) + ".self_attn.q_proj.weight";
+      const auto* t = wm_->header().find(name);
+      if (!t) throw std::runtime_error("missing " + name);
+      const uint64_t expect =
+          static_cast<uint64_t>(2) * cfg_.n_heads * cfg_.head_dim * cfg_.hidden * elem;
+      if (t->nbytes != expect)
+        throw std::runtime_error(
+            "q_proj size mismatch: " + name + " got " + std::to_string(t->nbytes) +
+            " expect " + std::to_string(expect) +
+            " (config.json must match this checkpoint — Qwen3.8-27B: hidden=5120 heads=24)");
+      break;
+    }
+  }
+
+  LOG_INFO("Qwen35Model: layers=%d hidden=%d heads=%d/%d hd=%d inter=%d lin_v=%d tie=%d lm_head=%s",
+           cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.n_kv, cfg_.head_dim, cfg_.intermediate,
+           cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
+           lm_head_name_.empty() ? "(tied embed)" : lm_head_name_.c_str());
 }
 
 void Qwen35Model::init_cache(SessionCache& cache, int max_seq) const {
@@ -323,6 +363,9 @@ void Qwen35Model::forward_all_logits(const std::vector<int32_t>& tokens, Session
   const int n = static_cast<int>(tokens.size());
   const int H = cfg_.hidden;
   const int V = cfg_.vocab;
+  using Clock = std::chrono::steady_clock;
+  const auto t0 = Clock::now();
+  double ms_full = 0, ms_lin = 0;
   std::vector<float> x(static_cast<size_t>(n) * H);
   int pos_start = 0;
   if (!is_prefill) {
@@ -334,12 +377,23 @@ void Qwen35Model::forward_all_logits(const std::vector<int32_t>& tokens, Session
   }
   for (int t = 0; t < n; ++t) embed(tokens[t], x.data() + t * H);
 
-  for (int L = 0; L < cfg_.layers; ++L) layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
+  for (int L = 0; L < cfg_.layers; ++L) {
+    const auto tl = Clock::now();
+    layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
+    if (llmoc::log::profile_enabled()) {
+      const double ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - tl).count();
+      if (cfg_.layer_types[L] == "full_attention") ms_full += ms;
+      else ms_lin += ms;
+    }
+  }
 
+  const auto th0 = Clock::now();
   const uint16_t* fn = w(prefix_ + "norm.weight");
   const std::string emb_name =
       prefix_.empty() ? "embedding.weight" : prefix_ + "embed_tokens.weight";
   const uint16_t* emb = w(emb_name);
+  const uint16_t* lm = lm_head_name_.empty() ? emb : w(lm_head_name_);
   logits_all.assign(static_cast<size_t>(n) * V, 0.f);
   prefix_hiddens_.assign(static_cast<size_t>(n) * H, 0.f);
   std::vector<float> h(H);
@@ -349,11 +403,23 @@ void Qwen35Model::forward_all_logits(const std::vector<int32_t>& tokens, Session
     std::memcpy(prefix_hiddens_.data() + static_cast<size_t>(t) * H, h.data(),
                 sizeof(float) * H);
     float* dest = logits_all.data() + static_cast<size_t>(t) * V;
-    hal::gemm_bias_free(h.data(), emb, dest, V, H, wd_);
+    // HF Linear: y = x @ W^T，本仓库 gemm 约定 W 为 [out, in] row-major
+    hal::gemm_bias_free(h.data(), lm, dest, V, H, wd_);
     if (t == n - 1) last_hidden_ = h;
   }
   prefix_logits_ = logits_all;
   last_logits_.assign(logits_all.begin() + static_cast<size_t>(n - 1) * V, logits_all.end());
+
+  if (llmoc::log::profile_enabled()) {
+    const double ms_head =
+        std::chrono::duration<double, std::milli>(Clock::now() - th0).count();
+    const double ms_all =
+        std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    LOG_INFO(
+        "profile forward: n_tok=%d prefill=%d full_layers=%.1fms linear_layers=%.1fms lm_head=%.1fms "
+        "total=%.1fms",
+        n, is_prefill ? 1 : 0, ms_full, ms_lin, ms_head, ms_all);
+  }
 }
 
 void Qwen35Model::commit_prefix_state(int pos) {

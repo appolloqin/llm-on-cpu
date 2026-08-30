@@ -1,6 +1,7 @@
 // llm-on-cpu :: model/generate.cpp
 #include "model/generate.h"
 
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <random>
@@ -15,6 +16,8 @@
 
 namespace llmoc::model {
 namespace {
+
+using Clock = std::chrono::steady_clock;
 
 int32_t sample_token(const std::vector<float>& logits, float temperature) {
   if (logits.empty()) throw std::runtime_error("empty logits");
@@ -192,6 +195,7 @@ void Generator::init(ICausalLM* model, HfTokenizer* tok, int max_seq) {
 GenerateResult Generator::generate(const GenerateRequest& req,
                                    const std::function<void(const std::string& delta)>& on_token) {
   if (!model_ || !tok_) throw std::runtime_error("Generator not initialized");
+  const auto wall0 = Clock::now();
 
   std::vector<int32_t> ids;
   model_->clear_vision_embeds();
@@ -201,10 +205,15 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       throw std::runtime_error("images provided but vision encoder is unavailable");
     std::vector<float> all_embeds;
     std::vector<int> pad_counts;
+    const auto tv0 = Clock::now();
     if (!model_->encode_message_images(req.messages, all_embeds, pad_counts))
       throw std::runtime_error("failed to encode images");
+    const double vision_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - tv0).count();
     int total_pads = 0;
     for (int n : pad_counts) total_pads += n;
+    LOG_INFO("gen vision: images=%d pads=%d encode=%.1f ms", static_cast<int>(pad_counts.size()),
+             total_pads, vision_ms);
     model_->set_vision_embeds(std::move(all_embeds), total_pads);
     ids = build_prompt_ids(req, tok_, pad_counts, model_->vision_start_token_id(),
                            model_->image_pad_token_id(), model_->vision_end_token_id());
@@ -220,12 +229,28 @@ GenerateResult Generator::generate(const GenerateRequest& req,
   model_->init_cache(cache, max_seq_);
   (void)radix_.longest_prefix(ids);
 
+  const auto& meta = model_->meta();
+  LOG_INFO("gen start: prompt_tok=%d max_new=%d kind=%s layers=%d hidden=%d mtp=%s",
+           static_cast<int>(ids.size()), req.max_new_tokens, meta.kind.c_str(), meta.layers,
+           meta.hidden, req.mtp.c_str());
+
   std::vector<float> logits;
+  const auto tp0 = Clock::now();
   model_->forward(ids, cache, logits, true);
+  const double prefill_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - tp0).count();
   cache.tokens = ids;
 
   GenerateResult out;
   out.prompt_tokens = static_cast<int>(ids.size());
+  const double prefill_tps =
+      out.prompt_tokens > 0 ? (1000.0 * out.prompt_tokens / (prefill_ms > 0 ? prefill_ms : 1.0))
+                            : 0.0;
+  LOG_INFO("gen prefill: tok=%d time=%.1f ms (%.2f tok/s)", out.prompt_tokens, prefill_ms,
+           prefill_tps);
+  if (prefill_ms > 120000.0)
+    LOG_WARN("gen prefill very slow (>120s) — check RAM thrashing / wrong model path / disk IO");
+
   const int32_t eos = tok_->im_end_id() >= 0 ? tok_->im_end_id() : tok_->eos_id();
 
   const bool want_mtp = mtp_wanted(req.mtp) && req.spec_k > 0;
@@ -266,7 +291,11 @@ GenerateResult Generator::generate(const GenerateRequest& req,
     return static_cast<int>(out.token_ids.size()) < req.max_new_tokens;
   };
 
+  const auto td0 = Clock::now();
+  int decode_steps = 0;
+  double slowest_step_ms = 0;
   while (static_cast<int>(out.token_ids.size()) < req.max_new_tokens) {
+    const auto ts0 = Clock::now();
     if (use_mtp) {
       std::vector<int32_t> drafts;
       if (!model_->draft_propose(cache.tokens, req.spec_k, drafts) || drafts.empty()) {
@@ -274,6 +303,12 @@ GenerateResult Generator::generate(const GenerateRequest& req,
         if (!emit_one(next)) break;
         model_->forward({next}, cache, logits, false);
         cache.tokens.push_back(next);
+        ++decode_steps;
+        const double step_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - ts0).count();
+        if (step_ms > slowest_step_ms) slowest_step_ms = step_ms;
+        if (llmoc::log::profile_enabled())
+          LOG_INFO("gen step#%d greedy_fallback %.1f ms", decode_steps, step_ms);
         continue;
       }
 
@@ -284,6 +319,7 @@ GenerateResult Generator::generate(const GenerateRequest& req,
         if (!emit_one(next)) break;
         model_->forward({next}, cache, logits, false);
         cache.tokens.push_back(next);
+        ++decode_steps;
         continue;
       }
 
@@ -329,6 +365,12 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       if (!emit_one(next)) break;
       model_->forward({next}, cache, logits, false);
       cache.tokens.push_back(next);
+      ++decode_steps;
+      const double step_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - ts0).count();
+      if (step_ms > slowest_step_ms) slowest_step_ms = step_ms;
+      if (llmoc::log::profile_enabled())
+        LOG_INFO("gen step#%d mtp accept=%d/%.1f ms", decode_steps, accepted, step_ms);
       continue;
     }
 
@@ -337,7 +379,16 @@ GenerateResult Generator::generate(const GenerateRequest& req,
     if (!emit_one(next)) break;
     model_->forward({next}, cache, logits, false);
     cache.tokens.push_back(next);
+    ++decode_steps;
+    const double step_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - ts0).count();
+    if (step_ms > slowest_step_ms) slowest_step_ms = step_ms;
+    if (llmoc::log::profile_enabled() || (decode_steps <= 3) || (decode_steps % 16 == 0))
+      LOG_INFO("gen decode step#%d +1 tok in %.1f ms (%.2f tok/s)", decode_steps, step_ms,
+               step_ms > 0 ? 1000.0 / step_ms : 0.0);
   }
+  const double decode_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
 
   while (!out.token_ids.empty()) {
     const std::string p = tok_->decode({out.token_ids.back()}, true);
@@ -359,6 +410,26 @@ GenerateResult Generator::generate(const GenerateRequest& req,
   out.completion_tokens = static_cast<int>(out.token_ids.size());
   radix_.insert(cache.tokens, static_cast<int>(cache.tokens.size()));
   model_->clear_vision_embeds();
+
+  const double wall_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - wall0).count();
+  const double decode_tps =
+      out.completion_tokens > 0
+          ? (1000.0 * out.completion_tokens / (decode_ms > 0 ? decode_ms : 1.0))
+          : 0.0;
+  const double e2e_tps =
+      out.completion_tokens > 0
+          ? (1000.0 * out.completion_tokens / (wall_ms > 0 ? wall_ms : 1.0))
+          : 0.0;
+  LOG_INFO(
+      "gen done: prompt=%d new=%d steps=%d | prefill=%.1fms (%.2f t/s) decode=%.1fms (%.2f t/s) "
+      "slowest_step=%.1fms wall=%.1fms e2e=%.2f t/s | mtp_verify=%d mtp_accept=%d",
+      out.prompt_tokens, out.completion_tokens, decode_steps, prefill_ms, prefill_tps, decode_ms,
+      decode_tps, slowest_step_ms, wall_ms, e2e_tps, out.mtp_verify_steps, out.mtp_draft_accepted);
+  if (out.completion_tokens > 0 && decode_tps < 0.5)
+    LOG_WARN(
+        "gen decode <0.5 tok/s — for ~27B BF16 on CPU this can be expected; check OpenMP "
+        "(OMP_NUM_THREADS), RAM not swapping, Release build, and LLMOC_PROFILE=1 layer breakdown");
   return out;
 }
 

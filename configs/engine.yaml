@@ -17,7 +17,7 @@ decode:
   spec_k: 3
   accept_min: 2.0
   # 单次回复最多新生成 token（≠ 模型上下文窗口）
-  max_new_tokens: 2048
+  max_new_tokens: 204800
 
 io:
   engine: auto

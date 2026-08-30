@@ -47,6 +47,7 @@ add_library(llmoc_weights STATIC
   src/weights/prefetch_pipeline.cpp
   src/common/platform.cpp
   src/common/engine_config.cpp
+  src/common/log.cpp
   src/hal/amx_gemm.cpp
   src/hal/cpu_ops.cpp
   src/hal/int4_ops.cpp

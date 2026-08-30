@@ -229,7 +229,29 @@ void Qwen35Int4Model::build_layer_packs() {
   emb_is_int4_ = is_int4(emb_name);
   if (emb_is_int4_) emb_int4_ = store_->get_int4(emb_name);
   else emb_pass_ = pass(emb_name);
+
+  lm_is_int4_ = false;
+  lm_pass_ = nullptr;
+  lm_int4_ = {};
+  if (!cfg_.tie_embeddings) {
+    std::string lm_name;
+    if (store_->has(prefix_ + "lm_head.weight")) lm_name = prefix_ + "lm_head.weight";
+    else if (store_->has("lm_head.weight")) lm_name = "lm_head.weight";
+    else
+      throw std::runtime_error(
+          "tie_word_embeddings=false but lm_head.weight missing in QLWC");
+    lm_is_int4_ = is_int4(lm_name);
+    if (lm_is_int4_) lm_int4_ = store_->get_int4(lm_name);
+    else lm_pass_ = pass(lm_name);
+  } else {
+    lm_is_int4_ = emb_is_int4_;
+    lm_int4_ = emb_int4_;
+    lm_pass_ = emb_pass_;
+  }
+
   final_norm_ = pass(prefix_ + "norm.weight");
+  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d", cfg_.layers, cfg_.hidden,
+           cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0);
 }
 
 void Qwen35Int4Model::init_cache(SessionCache& cache, int max_seq) const {
@@ -655,19 +677,19 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
     if (!std::isfinite(v)) v = 0.f;
   last_hidden_ = h;
   logits.resize(static_cast<size_t>(V));
-  if (emb_is_int4_) {
+  if (lm_is_int4_) {
 #if defined(LLMOC_ENABLE_AVX2)
-    if (emb_int4_.qweight) {
-      const int rb = (emb_int4_.K + 1) / 2;
-      _mm_prefetch(reinterpret_cast<const char*>(emb_int4_.qweight), _MM_HINT_T0);
+    if (lm_int4_.qweight) {
+      const int rb = (lm_int4_.K + 1) / 2;
+      _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
       if (V > 4)
-        _mm_prefetch(reinterpret_cast<const char*>(emb_int4_.qweight + static_cast<size_t>(4) * rb),
+        _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight + static_cast<size_t>(4) * rb),
                      _MM_HINT_T0);
     }
 #endif
-    hal::gemm_int4(h.data(), emb_int4_, logits.data());
+    hal::gemm_int4(h.data(), lm_int4_, logits.data());
   } else {
-    hal::gemm_bias_free(h.data(), emb_pass_, logits.data(), V, H, pass_wd_);
+    hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
   }
   last_logits_ = logits;
 }
@@ -723,7 +745,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
   }
   std::vector<float> h(H);
   last_hidden_.assign(H, 0.f);
-  if (n > 1 && emb_is_int4_) {
+  if (n > 1 && lm_is_int4_) {
     auto& sc = scratch();
     Int4Scratch::fit(sc.last, static_cast<size_t>(n) * H);
     for (int t = 0; t < n; ++t) {
@@ -735,7 +757,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
         std::memcpy(prefix_hiddens_.data() + static_cast<size_t>(t) * H, ht, sizeof(float) * H);
     }
     last_hidden_.assign(sc.last.begin() + static_cast<size_t>(n - 1) * H, sc.last.end());
-    gemm_view_batch(sc.last.data(), n, emb_int4_, logits_all.data());
+    gemm_view_batch(sc.last.data(), n, lm_int4_, logits_all.data());
   } else {
     for (int t = 0; t < n; ++t) {
       hal::rmsnorm(x.data() + t * H, final_norm_, h.data(), H, cfg_.rms_eps, pass_wd_, true);
@@ -744,19 +766,19 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
       if (keep_prefix)
         std::memcpy(prefix_hiddens_.data() + static_cast<size_t>(t) * H, h.data(), sizeof(float) * H);
       float* dest = logits_all.data() + static_cast<size_t>(t) * V;
-      if (emb_is_int4_) {
+      if (lm_is_int4_) {
 #if defined(LLMOC_ENABLE_AVX2)
-        if (emb_int4_.qweight) {
-          const int rb = (emb_int4_.K + 1) / 2;
-          _mm_prefetch(reinterpret_cast<const char*>(emb_int4_.qweight), _MM_HINT_T0);
+        if (lm_int4_.qweight) {
+          const int rb = (lm_int4_.K + 1) / 2;
+          _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
           if (V > 4)
-            _mm_prefetch(reinterpret_cast<const char*>(emb_int4_.qweight + static_cast<size_t>(4) * rb),
+            _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight + static_cast<size_t>(4) * rb),
                          _MM_HINT_T0);
         }
 #endif
-        hal::gemm_int4(h.data(), emb_int4_, dest);
+        hal::gemm_int4(h.data(), lm_int4_, dest);
       } else {
-        hal::gemm_bias_free(h.data(), emb_pass_, dest, V, H, pass_wd_);
+        hal::gemm_bias_free(h.data(), lm_pass_, dest, V, H, pass_wd_);
       }
       if (t == n - 1) last_hidden_ = h;
     }

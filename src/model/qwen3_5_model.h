@@ -51,6 +51,7 @@ class Qwen35Model final : public ICausalLM {
   Qwen35Config cfg_;
   CausalLmMeta meta_;
   std::string prefix_ = "language_model.";
+  std::string lm_head_name_;  // empty => tied to embed
   hal::WDtype wd_ = hal::WDtype::kBF16;
 
   const uint16_t* w(const std::string& name);

@@ -104,6 +104,9 @@ class Qwen35Int4Model final : public ICausalLM {
   qlwc::Int4View emb_int4_{};
   bool emb_is_int4_ = false;
   const uint16_t* emb_pass_ = nullptr;
+  qlwc::Int4View lm_int4_{};
+  bool lm_is_int4_ = false;
+  const uint16_t* lm_pass_ = nullptr;
   const uint16_t* final_norm_ = nullptr;
 
   bool is_int4(const std::string& name) const;

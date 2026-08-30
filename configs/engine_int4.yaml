@@ -17,7 +17,7 @@ tiers:
 decode:
   spec_k: 3
   # 单次回复最多新生成 token（≠ 模型 256K 上下文窗口）
-  max_new_tokens: 4096
+  max_new_tokens: 204800
 
 io:
   workers: 2

@@ -155,14 +155,17 @@ int main(int argc, char** argv) {
                 dense_tensors, expert_tensors);
     std::printf("MoE         : layers=%u experts/layer>=%u (groups=%zu)\n", layers,
                 experts, h.groups.size());
-    std::printf("checksums   : %d/%zu filled\n",
+    std::printf("checksums   : %d/%zu filled (before update)\n",
                 static_cast<int>(h.tensors.size()) - zero_ck, h.tensors.size());
     if (info_only) return 0;
 
     // ---------- 全量校验(+可选回填) ----------
     int bad = 0, skipped = 0;
     std::vector<llmoc::lwc::TensorMeta> updated = h.tensors;
-    for (size_t i = 0; i < h.tensors.size(); ++i) {
+    const size_t nT = h.tensors.size();
+    for (size_t i = 0; i < nT; ++i) {
+        if (do_update && (i % 50 == 0 || i + 1 == nT))
+            std::fprintf(stderr, "\rupdate checksums %zu/%zu ...", i + 1, nT);
         try {
             auto buf = llmoc::lwc::ReadTensor(file, h, h.tensors[i].name);
             if (h.tensors[i].checksum == 0) {
@@ -171,16 +174,21 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             ++bad;
-            std::fprintf(stderr, "BAD: %s: %s\n", h.tensors[i].name.c_str(), e.what());
+            std::fprintf(stderr, "\nBAD: %s: %s\n", h.tensors[i].name.c_str(), e.what());
         }
     }
-    std::printf("verify      : %zu ok, %d bad, %d skipped(zero)\n",
+    if (do_update) std::fprintf(stderr, "\n");
+    std::printf("verify      : %zu ok, %d bad, %d zero-checksum\n",
                 h.tensors.size() - bad, bad, skipped);
 
     if (do_update && skipped > 0 && bad == 0) {
         h.tensors = updated;
         llmoc::lwc::RewriteCatalog(file, h);
         std::printf("update      : catalog rewritten with %d checksums\n", skipped);
+        std::printf("checksums   : %d/%zu filled (after update)\n",
+                    static_cast<int>(h.tensors.size()), h.tensors.size());
+    } else if (do_update && skipped == 0) {
+        std::printf("update      : nothing to do (all checksums already filled)\n");
     }
 
     // ---------- config.json 交叉核对(MODEL_*.md 校准清单自动化) ----------

@@ -95,6 +95,7 @@ Open http://127.0.0.1:15085/
 
 Notes:
 - Weights are NOT in the zip; run download_* once (large / slow).
+- Logs: logs/llmoc-YYYY-MM-DD.log (set LLMOC_LOG_DIR to change; LLMOC_PROFILE=1 for layer timing).
 - Windows may need VC++ Redistributable x64 (OpenMP).
 - Server uses plain HTTP only (no OpenSSL DLL required).
 - See docs/USAGE.md for details.
