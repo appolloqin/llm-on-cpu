@@ -72,34 +72,32 @@ cat > "${STAGE}/RUN.txt" <<EOF
 llm-on-cpu application package (${PLATFORM_ID})
 version: ${VER}
 
-前置: 安装 Node.js >= 18，并保证 node 在 PATH 中。
+Need: Node.js >= 18 on PATH.
 
-下载脚本均包含：下载 HF → 转引擎格式 → 删除原模型大权重
-（保留 *-hf 里的 config/tokenizer 供服务加载；INT4 还会删掉中间 .lwc）
+download_* = auto pipeline (skip steps already done):
+  detect HF shards / good LWC / good QLWC -> download -> convert -> verify -> prune
+  INT4 also quantizes and removes mid .lwc
+  Force redo: --force / --force-download / --force-convert / --force-int4
 
-—— INT4（推荐，省内存）——
+-- INT4 (recommended) --
   Windows:     download_int4.cmd
                start_int4.cmd
-  Linux/macOS: chmod +x download_int4.sh start_int4.sh
-               ./download_int4.sh
-               ./start_int4.sh
+  Linux/macOS: ./download_int4.sh && ./start_int4.sh
 
-—— BF16（无量化）——
+-- BF16 (unquantized) --
   Windows:     download_bf16.cmd
                start_bf16.cmd
-  Linux/macOS: chmod +x download_bf16.sh start_bf16.sh
-               ./download_bf16.sh
-               ./start_bf16.sh
+  Linux/macOS: ./download_bf16.sh && ./start_bf16.sh
 
-可选换模型: download_*.cmd --model org/name  （并改 configs 里 path）
+Optional: download_*.cmd --model org/name  (then edit configs)
 
-浏览器打开 http://127.0.0.1:15085/
+Open http://127.0.0.1:15085/
 
 Notes:
-- 权重不打进压缩包；首次需跑对应 download_*（体积大、耗时长）。
-- Windows 可能需要 Visual C++ Redistributable (x64)（OpenMP）。
-- macOS 包偏逻辑/API 验证；生产目标为 Linux。
-- 详细说明见 docs/USAGE.md。
+- Weights are NOT in the zip; run download_* once (large / slow).
+- Windows may need VC++ Redistributable x64 (OpenMP).
+- Server uses plain HTTP only (no OpenSSL DLL required).
+- See docs/USAGE.md for details.
 EOF
 
 ZIP_PATH="${DIST}/llm-on-cpu-${VER}-${PLATFORM_ID}.zip"

@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 // llm-on-cpu :: tools/prepare_model.mjs
-// 一键：下载 HF 权重 → 转 LWC → lwc_verify --update（可选 --config）→ 可选清理 HF 大文件。
-// 底层仍是独立工具；本脚本只负责串起来并解析默认路径。
+// 一键：下载 → 转 LWC → 校验 → 可选 prune / INT4。
+// 默认自动判断跳过已完成步骤；可用 --force* 强制重跑。
 //
 // 用法:
-//   node tools/prepare_model.mjs --model Qwen/Qwen3.5-4B
-//   node tools/prepare_model.mjs --model Qwen/Qwen3.8-27B --prune-hf   # 校验通过后删 *.safetensors
-//   node tools/prepare_model.mjs --model org/name --skip-download
-//   node tools/prepare_model.mjs --model org/name --out-hf DIR --out-lwc FILE
+//   node tools/prepare_model.mjs --model Qwen/Qwen3.5-4B --prune-hf
+//   node tools/prepare_model.mjs --model Qwen/Qwen3.8-27B --prune-hf --int4
+//   node tools/prepare_model.mjs --model org/name --force-convert
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const MIN_WEIGHT_BYTES = 1 << 20; // 1 MiB：小于此视为坏产物 / 仅目录头
 
 function parseArgs() {
   const a = process.argv.slice(2);
@@ -24,38 +24,55 @@ function parseArgs() {
   if (!a.includes("--model")) {
     console.error(
       "usage: node tools/prepare_model.mjs --model <id> [--source auto|modelscope|hf-mirror|hf]\n" +
-        "       [--out-hf DIR] [--out-lwc FILE] [--skip-download] [--skip-convert]\n" +
-        "       [--no-verify] [--prune-hf] [--remove-hf] [--limit-experts N]\n" +
-        "       [--ms-id] [--hf-id] [--all]\n" +
-        "  --prune-hf   校验通过后删除 *-hf 内 *.safetensors(+index)，保留 config/tokenizer\n" +
-        "  --remove-hf  校验通过后删除整个 *-hf 目录（更省盘，需重下才能再核对）"
+        "       [--out-hf DIR] [--out-lwc FILE] [--out-qlwc FILE]\n" +
+        "       [--prune-hf] [--remove-hf] [--int4] [--no-verify]\n" +
+        "       [--force] [--force-download] [--force-convert] [--force-int4]\n" +
+        "       [--skip-download] [--skip-convert]  (legacy hard-skip)\n" +
+        "       [--limit-experts N] [--ms-id] [--hf-id] [--all]\n" +
+        "  Auto-skip: existing HF shards / good LWC / good QLWC are detected.\n" +
+        "  --prune-hf   after OK LWC, delete *-hf *.safetensors (keep config/tokenizer)\n" +
+        "  --int4       also quantize to .int4.qlwc and remove mid .lwc"
     );
     process.exit(2);
   }
   const model = get("--model");
   const short = model.split("/").pop();
+  const force = a.includes("--force");
   return {
     model,
+    short,
     source: get("--source") ?? "auto",
     outHf: get("--out-hf") ?? path.join("models", `${short}-hf`),
     outLwc: get("--out-lwc") ?? path.join("models", `${short}.lwc`),
+    outQlwc:
+      get("--out-qlwc") ?? path.join("models", `${short}.int4.qlwc`),
     msId: get("--ms-id"),
     hfId: get("--hf-id"),
     all: a.includes("--all"),
-    skipDownload: a.includes("--skip-download"),
-    skipConvert: a.includes("--skip-convert"),
+    // legacy hard skip
+    hardSkipDownload: a.includes("--skip-download"),
+    hardSkipConvert: a.includes("--skip-convert"),
+    forceDownload: force || a.includes("--force-download"),
+    forceConvert: force || a.includes("--force-convert"),
+    forceInt4: force || a.includes("--force-int4"),
     noVerify: a.includes("--no-verify"),
     pruneHf: a.includes("--prune-hf"),
     removeHf: a.includes("--remove-hf"),
+    int4: a.includes("--int4"),
     limitExperts: get("--limit-experts"),
   };
 }
 
-function run(label, cmd, args) {
+function run(label, cmd, args, opts = {}) {
   console.log(`\n== [${label}] ${cmd} ${args.join(" ")}`);
-  const r = spawnSync(cmd, args, { cwd: ROOT, stdio: "inherit", shell: false });
+  const r = spawnSync(cmd, args, {
+    cwd: ROOT,
+    stdio: opts.stdio ?? "inherit",
+    shell: false,
+  });
   if (r.error) throw r.error;
   if (r.status !== 0) throw new Error(`${label} failed (exit ${r.status})`);
+  return r;
 }
 
 function findLwcVerify() {
@@ -86,22 +103,65 @@ function formatBytes(n) {
   return n + " B";
 }
 
-/** 删权重分片，保留 config/tokenizer 等小文件。返回释放字节数。 */
+function abs(p) {
+  return path.resolve(ROOT, p);
+}
+
+function fileSize(p) {
+  const a = abs(p);
+  if (!fs.existsSync(a)) return 0;
+  return fs.statSync(a).size;
+}
+
+function listSafetensors(hfDir) {
+  const a = abs(hfDir);
+  if (!fs.existsSync(a)) return [];
+  return fs.readdirSync(a).filter((f) => f.endsWith(".safetensors"));
+}
+
+function hfHasConfig(hfDir) {
+  return fs.existsSync(path.join(abs(hfDir), "config.json"));
+}
+
+function hfHasTokenizer(hfDir) {
+  const a = abs(hfDir);
+  return (
+    fs.existsSync(path.join(a, "tokenizer.json")) ||
+    fs.existsSync(path.join(a, "tokenizer_config.json"))
+  );
+}
+
+/** 体积达标的权重文件（LWC/QLWC） */
+function weightLooksOk(p) {
+  return fileSize(p) >= MIN_WEIGHT_BYTES;
+}
+
+/** lwc_verify 快速终检通过则认为可用 */
+function lwcVerifyOk(bin, lwc) {
+  if (!bin || !weightLooksOk(lwc)) return false;
+  const r = spawnSync(bin, [lwc], {
+    cwd: ROOT,
+    stdio: "pipe",
+    shell: false,
+    encoding: "utf8",
+  });
+  return r.status === 0;
+}
+
 function pruneHfWeights(hfDir) {
-  const abs = path.resolve(ROOT, hfDir);
-  if (!fs.existsSync(abs)) {
+  const a = abs(hfDir);
+  if (!fs.existsSync(a)) {
     console.log(`\n== [prune-hf] skip: ${hfDir} not found`);
     return 0;
   }
   let freed = 0;
-  const names = fs.readdirSync(abs);
-  for (const name of names) {
+  for (const name of fs.readdirSync(a)) {
     const drop =
       name.endsWith(".safetensors") ||
       name === "model.safetensors.index.json" ||
       name.endsWith(".bin");
     if (!drop) continue;
-    const p = path.join(abs, name);
+    const p = path.join(a, name);
     const st = fs.statSync(p);
     if (!st.isFile()) continue;
     fs.unlinkSync(p);
@@ -112,8 +172,8 @@ function pruneHfWeights(hfDir) {
 }
 
 function removeHfDir(hfDir) {
-  const abs = path.resolve(ROOT, hfDir);
-  if (!fs.existsSync(abs)) {
+  const a = abs(hfDir);
+  if (!fs.existsSync(a)) {
     console.log(`\n== [remove-hf] skip: ${hfDir} not found`);
     return 0;
   }
@@ -126,21 +186,66 @@ function removeHfDir(hfDir) {
       else freed += st.size;
     }
   };
-  walk(abs);
-  fs.rmSync(abs, { recursive: true, force: true });
+  walk(a);
+  fs.rmSync(a, { recursive: true, force: true });
   return freed;
 }
 
 function main() {
   const opt = parseArgs();
   const node = process.execPath;
+  const verifyBin = findLwcVerify();
 
   if ((opt.pruneHf || opt.removeHf) && opt.noVerify) {
-    console.error("[prepare] --prune-hf/--remove-hf 需要先通过校验，请去掉 --no-verify");
+    console.error("[prepare] --prune-hf/--remove-hf need verify; drop --no-verify");
     process.exit(2);
   }
 
-  if (!opt.skipDownload) {
+  const shards = listSafetensors(opt.outHf);
+  const hasShards = shards.length > 0;
+  const hasConfig = hfHasConfig(opt.outHf);
+  let lwcOk =
+    weightLooksOk(opt.outLwc) &&
+    (opt.noVerify || !verifyBin || lwcVerifyOk(verifyBin, opt.outLwc));
+  // 无 verify 时仅按体积判断，避免误杀
+  if (!verifyBin && weightLooksOk(opt.outLwc)) lwcOk = true;
+
+  const qlwcOk = weightLooksOk(opt.outQlwc);
+
+  console.log("\n== [plan] auto-detect");
+  console.log(`  hf dir:     ${opt.outHf}  config=${hasConfig} shards=${shards.length}`);
+  console.log(
+    `  lwc:        ${opt.outLwc}  ${lwcOk ? "OK" : weightLooksOk(opt.outLwc) ? "BAD/verify-fail" : "missing"} (${formatBytes(fileSize(opt.outLwc))})`
+  );
+  if (opt.int4) {
+    console.log(
+      `  qlwc:       ${opt.outQlwc}  ${qlwcOk ? "OK" : "missing/small"} (${formatBytes(fileSize(opt.outQlwc))})`
+    );
+  }
+
+  // 最终目标是否已就绪
+  const goalOk = opt.int4 ? qlwcOk : lwcOk;
+  // 转 LWC / 量化还缺不缺源
+  const needLwc = !lwcOk && !(opt.int4 && qlwcOk);
+  const needShards = needLwc && !hasShards;
+
+  // ---- download ----
+  let doDownload = false;
+  if (opt.hardSkipDownload) {
+    console.log("\n== [download] skipped (--skip-download)");
+  } else if (opt.forceDownload) {
+    doDownload = true;
+  } else if (goalOk && !opt.forceConvert) {
+    console.log("\n== [download] skipped (target weights already OK)");
+  } else if (hasShards) {
+    console.log(`\n== [download] skipped (${shards.length} safetensors already in ${opt.outHf})`);
+  } else if (needShards) {
+    doDownload = true;
+  } else {
+    console.log("\n== [download] skipped (not needed for remaining steps)");
+  }
+
+  if (doDownload) {
     const args = [
       path.join("tools", "download_model.mjs"),
       "--model",
@@ -154,11 +259,32 @@ function main() {
     if (opt.hfId) args.push("--hf-id", opt.hfId);
     if (opt.all) args.push("--all");
     run("download", node, args);
-  } else {
-    console.log(`\n== [download] skipped (--skip-download); expect ${opt.outHf}`);
   }
 
-  if (!opt.skipConvert) {
+  const shardsAfter = listSafetensors(opt.outHf);
+  const hasShardsAfter = shardsAfter.length > 0;
+
+  // ---- convert ----
+  let didConvert = false;
+  let doConvert = false;
+  if (opt.hardSkipConvert) {
+    console.log("\n== [convert] skipped (--skip-convert)");
+  } else if (opt.forceConvert) {
+    doConvert = true;
+  } else if (lwcOk) {
+    console.log("\n== [convert] skipped (LWC already OK)");
+  } else if (opt.int4 && qlwcOk) {
+    console.log("\n== [convert] skipped (QLWC already OK; LWC not needed)");
+  } else if (!hasShardsAfter) {
+    throw new Error(
+      `need *.safetensors under ${opt.outHf} to convert, but none found.\n` +
+        `  Re-run with --force-download, or place HF weights there.`
+    );
+  } else {
+    doConvert = true;
+  }
+
+  if (doConvert) {
     const args = [
       path.join("tools", "convert_lwc.mjs"),
       "--src",
@@ -168,51 +294,121 @@ function main() {
     ];
     if (opt.limitExperts) args.push("--limit-experts", opt.limitExperts);
     run("convert", node, args);
-  } else {
-    console.log(`\n== [convert] skipped (--skip-convert); expect ${opt.outLwc}`);
+    if (!weightLooksOk(opt.outLwc)) {
+      throw new Error(
+        `convert produced tiny/missing LWC (${formatBytes(fileSize(opt.outLwc))}): ${opt.outLwc}`
+      );
+    }
+    didConvert = true;
+    lwcOk = true;
   }
 
-  if (!opt.noVerify) {
-    const bin = findLwcVerify();
-    if (!bin) {
+  // ---- verify ----
+  const needLwcForInt4 = opt.int4 && !qlwcOk;
+  const needVerify =
+    !opt.noVerify &&
+    weightLooksOk(opt.outLwc) &&
+    (didConvert || needLwcForInt4 || opt.pruneHf || opt.removeHf || !opt.int4);
+
+  if (needVerify) {
+    if (!verifyBin) {
       console.error(
-        "\n[prepare] 找不到 lwc_verify。请先构建:\n" +
+        "\n[prepare] lwc_verify not found. Build first:\n" +
           "  Windows: cmd /c scripts\\configure_dev.cmd && cmd /c scripts\\build_dev.cmd\n" +
           "  Linux/macOS: ./scripts/build_linux.sh"
       );
       process.exit(1);
     }
-    // 先回填校验和(不带 --config); 再单独交叉核对, 避免核对失败时看不清 update 结果
-    run("verify-update", bin, [opt.outLwc, "--update"]);
-    const config = path.join(opt.outHf, "config.json");
-    if (fs.existsSync(config)) {
-      try {
-        run("verify-config", bin, [opt.outLwc, "--config", config]);
-      } catch (e) {
-        console.error(
-          "\n[prepare] config 交叉核对失败。常见原因:\n" +
-            "  · 旧 convert 缺 torch_dtype 时误标 F16(权重实为 BF16) → 重转或:\n" +
-            `    ${bin} ${opt.outLwc} --set-dtype BF16\n` +
-            "  · 然后再跑本命令(可加 --skip-download --skip-convert --prune-hf)"
-        );
-        throw e;
+    if (didConvert || opt.forceConvert) {
+      run("verify-update", verifyBin, [opt.outLwc, "--update"]);
+      const config = path.join(opt.outHf, "config.json");
+      if (fs.existsSync(config)) {
+        try {
+          run("verify-config", verifyBin, [opt.outLwc, "--config", config]);
+        } catch (e) {
+          console.error(
+            "\n[prepare] config cross-check failed. Try:\n" +
+              `  ${verifyBin} ${opt.outLwc} --set-dtype BF16\n` +
+              "  then re-run (auto-skip will resume)."
+          );
+          throw e;
+        }
       }
     }
-    run("verify-final", bin, [opt.outLwc]);
+    run("verify-final", verifyBin, [opt.outLwc]);
+    lwcOk = true;
+  } else if (opt.int4 && qlwcOk) {
+    console.log("\n== [verify] skipped (QLWC already OK)");
+  } else if (opt.noVerify) {
+    console.log("\n== [verify] skipped (--no-verify)");
+  } else if (!weightLooksOk(opt.outLwc) && !(opt.int4 && qlwcOk)) {
+    throw new Error(`no usable LWC at ${opt.outLwc}`);
+  } else {
+    console.log("\n== [verify] skipped (LWC already verified / unchanged)");
   }
 
+  // ---- prune / remove HF ----
   if (opt.removeHf) {
-    console.log(`\n== [remove-hf] ${opt.outHf}`);
-    const freed = removeHfDir(opt.outHf);
-    console.log(`  freed ${formatBytes(freed)}`);
+    if (!hfHasConfig(opt.outHf) && !hfHasTokenizer(opt.outHf) && !hasShardsAfter) {
+      console.log("\n== [remove-hf] skipped (already gone)");
+    } else {
+      console.log(`\n== [remove-hf] ${opt.outHf}`);
+      console.log(`  freed ${formatBytes(removeHfDir(opt.outHf))}`);
+    }
   } else if (opt.pruneHf) {
-    console.log(`\n== [prune-hf] drop weight shards in ${opt.outHf} (keep config/tokenizer)`);
-    const freed = pruneHfWeights(opt.outHf);
-    console.log(`  freed ${formatBytes(freed)}`);
+    const left = listSafetensors(opt.outHf);
+    if (left.length === 0) {
+      console.log("\n== [prune-hf] skipped (no weight shards left)");
+    } else if (!(lwcOk || (opt.int4 && qlwcOk))) {
+      throw new Error("[prune-hf] refused: no OK engine weights yet");
+    } else {
+      console.log(
+        `\n== [prune-hf] drop weight shards in ${opt.outHf} (keep config/tokenizer)`
+      );
+      console.log(`  freed ${formatBytes(pruneHfWeights(opt.outHf))}`);
+    }
   }
 
-  console.log(`\n=== prepare OK -> ${opt.outLwc} ===`);
+  // ---- INT4 ----
+  if (opt.int4) {
+    if (qlwcOk && !opt.forceInt4) {
+      console.log(`\n== [int4] skipped (already OK: ${opt.outQlwc})`);
+    } else {
+      if (!weightLooksOk(opt.outLwc)) {
+        throw new Error(`INT4 needs LWC first: missing/small ${opt.outLwc}`);
+      }
+      run("int4-quantize", node, [
+        path.join("tools", "quantize_int4.mjs"),
+        "--src",
+        opt.outLwc,
+        "--out",
+        opt.outQlwc,
+        "--method",
+        "gptq",
+      ]);
+      if (!weightLooksOk(opt.outQlwc)) {
+        throw new Error(`quantize produced tiny/missing QLWC: ${opt.outQlwc}`);
+      }
+    }
+    if (fs.existsSync(abs(opt.outLwc))) {
+      const sz = fileSize(opt.outLwc);
+      fs.unlinkSync(abs(opt.outLwc));
+      console.log(
+        `\n== [int4] removed intermediate LWC ${opt.outLwc} (${formatBytes(sz)})`
+      );
+    } else {
+      console.log("\n== [int4] intermediate LWC already absent");
+    }
+    console.log(`\n=== prepare OK -> ${opt.outQlwc} ===`);
+  } else {
+    console.log(`\n=== prepare OK -> ${opt.outLwc} ===`);
+  }
   return 0;
 }
 
-process.exit(main());
+try {
+  process.exit(main());
+} catch (e) {
+  console.error("\nERROR:", e.message || e);
+  process.exit(1);
+}

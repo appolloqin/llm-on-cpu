@@ -1,11 +1,12 @@
 @echo off
-REM 下载 → 转 LWC → 删除原 HF 大权重（保留 config/tokenizer）
+REM Auto: download / convert / prune as needed (BF16)
 setlocal EnableExtensions
 cd /d "%~dp0"
+chcp 65001 >nul
 
 where node >nul 2>&1
 if errorlevel 1 (
-  echo ERROR: 需要 Node.js ^>= 18，并加入 PATH。
+  echo ERROR: Node.js ^>= 18 required in PATH.
   exit /b 1
 )
 
@@ -26,12 +27,14 @@ goto parse
 
 :run
 for %%I in ("%MODEL%") do set "SHORT=%%~nxI"
-echo == [1/2] 下载 + 转 LWC + 删除原 safetensors  %MODEL%
+echo == [BF16] prepare %MODEL%  ^(auto-skip done steps^)
 call node tools\prepare_model.mjs --model %MODEL% --prune-hf %EXTRA%
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+  echo ERROR: prepare_model failed. See log above.
+  exit /b 1
+)
 echo.
-echo OK. 引擎权重: models\%SHORT%.lwc
-echo     旁路保留: models\%SHORT%-hf\ （仅 config/tokenizer，大权重已删）
-echo 若模型不是 Qwen3.5-4B，请改 configs\engine.yaml。
-echo 然后运行: start_bf16.cmd
+echo OK. Engine weights: models\%SHORT%.lwc
+echo     Tokenizer keep: models\%SHORT%-hf\
+echo Next: start_bf16.cmd
 exit /b 0

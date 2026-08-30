@@ -235,6 +235,15 @@ async function main() {
     return +pa[1] - +pb[1] || +pa[2] - +pb[2] || order[pa[3]] - order[pb[3]];
   });
   const ordered = [...dense, ...expl];
+  if (ordered.length === 0) {
+    throw new Error(
+      `no tensors found under ${src} (need *.safetensors). ` +
+        "Check download finished and --src points at the HF directory."
+    );
+  }
+  console.log(
+    `[convert] collected ${ordered.length} tensors from ${listSafetensors(src).length} shard(s); writing...`
+  );
 
   // ---- pass 2: 布局(目录长度与 offset 取值无关 → 两轮构建) ----
   // 目标字节数按 header dtype 计算; 源 dtype 与 header 不一致时会在 pass3 逐元素下转。
@@ -273,9 +282,12 @@ async function main() {
     for (let i = 0; i < ordered.length; ++i) {
       const e = ordered[i];
       const ci = convInfo[i];
+      if ((i + 1) % 50 === 0 || i === 0 || i + 1 === ordered.length) {
+        console.log(`[convert] writing tensor ${i + 1}/${ordered.length}: ${e.name}`);
+      }
       if (!srcHandles.has(e.file)) srcHandles.set(e.file, await fsp.open(e.file, "r"));
       const rh = srcHandles.get(e.file);
-      const dst = Number(tensorsMeta[i][2]);
+      let dst = Number(tensorsMeta[i][2]);
       if (ci.stDt && ci.stDt !== lwcDtype) {
         // 源 dtype 与 header 不一致: 整张量读入后逐元素下转再写出
         const srcBuf = Buffer.alloc(ci.srcBytes);
@@ -292,7 +304,9 @@ async function main() {
           const { bytesRead } = await rh.read(rbuf, 0, want, pos);
           if (bytesRead <= 0) throw new Error(`short read source: ${e.name}`);
           await w.write(rbuf, 0, bytesRead, dst);
-          pos += bytesRead; dst += bytesRead; remaining -= bytesRead;
+          pos += bytesRead;
+          dst += bytesRead;
+          remaining -= bytesRead;
         }
       }
     }

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 下载 → 转 LWC → 删除原 HF 大权重（保留 config/tokenizer）
+# Auto: download / convert / prune as needed (BF16)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "ERROR: 需要 Node.js >= 18，并加入 PATH。" >&2
+  echo "ERROR: Node.js >= 18 required in PATH." >&2
   exit 1
 fi
 
@@ -19,10 +19,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 SHORT="${MODEL##*/}"
-echo "== [1/2] 下载 + 转 LWC + 删除原 safetensors  ${MODEL}"
+echo "== [BF16] prepare ${MODEL} (auto-skip done steps)"
 node tools/prepare_model.mjs --model "${MODEL}" --prune-hf "${EXTRA[@]}"
 echo
-echo "OK. 引擎权重: models/${SHORT}.lwc"
-echo "    旁路保留: models/${SHORT}-hf/ （仅 config/tokenizer，大权重已删）"
-echo "若模型不是 Qwen3.5-4B，请改 configs/engine.yaml。"
-echo "然后运行: ./start_bf16.sh"
+echo "OK. Engine weights: models/${SHORT}.lwc"
+echo "    Tokenizer keep: models/${SHORT}-hf/"
+echo "Next: ./start_bf16.sh"
