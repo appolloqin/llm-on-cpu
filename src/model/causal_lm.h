@@ -48,6 +48,15 @@ class ICausalLM {
     }
   }
 
+  // Greedy decode 快路径：n=1、temperature≈0 时可跳过全词表 logits 写回。
+  virtual bool forward_decode_greedy(const std::vector<int32_t>& tokens, SessionCache& cache,
+                                     int32_t& out_token) {
+    (void)tokens;
+    (void)cache;
+    (void)out_token;
+    return false;
+  }
+
   // 批量 verify 截断后：把 last_hidden/last_logits 切到 forward_all 的第 pos 个位置
   virtual void commit_prefix_state(int /*pos*/) {}
 
@@ -55,7 +64,7 @@ class ICausalLM {
   virtual bool has_mtp() const { return false; }
   // 基于已提交 history 草拟至多 draft_k 个 token；失败返回 false
   virtual bool draft_propose(const std::vector<int32_t>& /*history*/, int /*draft_k*/,
-                             std::vector<int32_t>& /*out*/) {
+                             std::vector<int32_t>& /*out*/, int32_t /*pin_first*/ = -1) {
     return false;
   }
 

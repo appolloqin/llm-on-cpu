@@ -9,6 +9,7 @@
 
 #include "common/engine_config.h"
 #include "common/log.h"
+#include "common/omp_tune.h"
 #include "model/generate.h"
 #include "model/qwen3_5_int4_model.h"
 #include "model/qwen3_5_model.h"
@@ -30,6 +31,7 @@ int main(int argc, char** argv) {
   }
 
   auto cfg = llmoc::EngineConfig::load(cfg_path);
+  llmoc::tune_openmp_for_decode();
   const std::string tok_dir = cfg.resolve_tokenizer_dir();
   llmoc::model::HfTokenizer tok;
   tok.load(tok_dir + "/tokenizer.json");

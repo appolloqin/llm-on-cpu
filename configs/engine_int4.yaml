@@ -3,14 +3,15 @@
 model:
   path: models/Qwen3.5-4B.int4.qlwc
   dtype: int4
-  # false：当前默认。真 MTP 已接通且采纳率高，但 CPU 上草稿+verify 仍慢于 greedy（见 BENCH_BASELINE）
-  # auto/true：启用投机（调试用，勿当吞吐优化）
-  mtp: false
+  # auto：有 MTP 权重时 INT4/CPU 仍走 greedy（HX bench 更快）；强制开：true 或 LLMOC_MTP=1
+  mtp: auto
   # tokenizer_dir 默认由 path 推: models/Qwen3.5-4B.int4-hf —— 请显式指定原 HF 旁路:
   tokenizer_dir: models/Qwen3.5-4B-hf
 
-# pure_cpu（默认）| hybrid_gpu / pure_gpu / auto（M5；INT4 核仍 CPU，BF16 透传可走 cuBLAS）
-# 混合示例: mode: hybrid_gpu + tiers.gpu_vram_gb: 16
+# pure_cpu（默认）| hybrid_gpu / pure_gpu / auto
+# INT4 核始终在 CPU。HX 上 OMP=8/16 ≈10 tok/s；OMP=12/24 会掉到 ~5 tok/s（勿手动设 12）
+# 未设 OMP_NUM_THREADS 时 server 自动 cap 到 8；勿设 32（start_int4 已改为 8）
+# 笔记本长跑会因散热在 ~5 与 ~10 tok/s 间波动；验收用 bench_decode_tps --new 256 --warm 1
 mode: pure_cpu
 tiers:
   dram_hot_gb: 6

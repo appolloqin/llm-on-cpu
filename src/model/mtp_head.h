@@ -42,8 +42,9 @@ struct MtpWeightAccess {
 bool mtp_weights_present(const MtpWeightAccess& wa);
 
 // 基于主模型最终 hidden（lm_head 前）草拟 draft_k 个 token；失败返回 false。
+// pin_first≥0：首 token 固定为主模型 greedy（跳过 MTP 首步预测，只草拟后续 k-1 个）。
 bool mtp_draft_propose(const MtpWeightAccess& wa, const std::vector<float>& last_hidden,
                        const std::vector<int32_t>& history, int draft_k,
-                       std::vector<int32_t>& out);
+                       std::vector<int32_t>& out, int32_t pin_first = -1);
 
 }  // namespace llmoc::model

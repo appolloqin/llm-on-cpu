@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "contracts/exec_backend.h"
 #include "glm/device/glm_device.h"
 #include "glm/glm_config.h"
 #include "glm/weights/glm_expert_prefetch.h"
@@ -23,11 +24,14 @@ class GlmFlashModel final : public model::ICausalLM {
 
   ExecMode exec_mode() const { return mode_; }
   QuantKind quant() const { return quant_; }
+  contracts::IExecBackend* exec() const { return exec_.get(); }
 
  private:
   void apply_geometry_from_header();
   void load_meta_sidecar(const std::string& glmq_path);
   void warm_gpu_attn_weights();
+  void bind_expert_hosts();
+  void setup_exec_backend(const GlmEngineConfig& cfg);
   void layer_forward(int layer, float* x, model::SessionCache& cache, int pos);
   void attn_linear_kda(int layer, const float* normed, float* oproj, model::SessionCache& cache);
   void attn_sparse_mla_or_gqa(int layer, const float* normed, float* oproj,
@@ -42,6 +46,7 @@ class GlmFlashModel final : public model::ICausalLM {
   QuantKind quant_ = QuantKind::kBf16;
   model::CausalLmMeta meta_;
   std::unique_ptr<IGlmDevice> device_;
+  std::unique_ptr<contracts::IExecBackend> exec_;
   GlmWeightStore store_;
   GlmExpertPrefetch prefetch_;
   bool weights_ready_ = false;

@@ -10,10 +10,17 @@
 #include <vector>
 
 #include "common/log.h"
+#include "exec/factory.h"
+#include "exec/gpu/exec_gpu.h"
+#include "exec/nccl_probe.h"
+#include "families/family_packs.h"
 #include "glm/hal/glm_awq_int4_ops.h"
 #include "glm/hal/glm_cuda_ops.h"
 #include "glm/hal/glm_nvfp4_ops.h"
 #include "glm/ops/glm_ops.h"
+#include "hal/cuda_backend.h"
+#include "sched/mode_controller.h"
+#include "sched/placement_planner.h"
 
 namespace llmoc::glm {
 namespace {
@@ -159,8 +166,8 @@ void GlmFlashModel::warm_gpu_attn_weights() {
     const auto* t = store_.find(name);
     if (!t || t->dtype != static_cast<uint16_t>(GlmqDtype::kBF16)) return;
     if (t->ndim < 2 || t->shape[0] == 0 || t->shape[1] == 0) return;
-    // Skip huge expert matrices on hybrid; pure_gpu tries all BF16 2D
     const bool expert = name.find(".mlp.experts.") != std::string::npos;
+    // hybrid: attn/shared only; pure_gpu: experts also (active path on GPU)
     if (mode_ == ExecMode::kHybridGpu && expert) return;
     if (cuda.upload_bf16(name, store_.bf16(name), static_cast<int>(t->shape[0]),
                          static_cast<int>(t->shape[1])) >= 0)
@@ -179,9 +186,103 @@ void GlmFlashModel::warm_gpu_attn_weights() {
                           "self_attn.b_proj.weight", "mlp.gate.weight"}) {
       try_up(b + s);
     }
+    if (mode_ == ExecMode::kPureGpu && E_ > 0) {
+      for (int e = 0; e < E_; ++e) {
+        const std::string eb = b + "mlp.experts." + std::to_string(e) + ".";
+        try_up(eb + "gate_proj.weight");
+        try_up(eb + "up_proj.weight");
+        try_up(eb + "down_proj.weight");
+      }
+    }
   }
   LOG_INFO("glm: GPU warmed %d BF16 tensors (%s)", n_up, GlmEngineConfig::mode_name(mode_));
   hal::log_cuda_status();
+}
+
+void GlmFlashModel::bind_expert_hosts() {
+  if (!exec_ || !exec_->caps().experts_on_gpu) return;
+  auto* eg = dynamic_cast<exec::gpu::ExpertRuntimeGpu*>(exec_->experts());
+  if (!eg) return;
+  int n_bound = 0;
+  for (int L = 0; L < L_; ++L) {
+    for (int e = 0; e < E_; ++e) {
+      if (!eg->owns({L, e})) continue;
+      const std::string base =
+          "layers." + std::to_string(L) + ".mlp.experts." + std::to_string(e) + ".gate_proj.weight";
+      const auto* t = store_.find(base);
+      if (!t) continue;
+      // Bind packed host bytes for slot H2D (BF16 raw or quantized blob).
+      const void* host = nullptr;
+      size_t nbytes = 0;
+      if (t->dtype == static_cast<uint16_t>(GlmqDtype::kBF16)) {
+        host = store_.bf16(base);
+        nbytes = sizeof(uint16_t) * t->shape[0] * t->shape[1];
+      } else {
+        // Quantized: bind tensor storage if contiguous view available via find payload
+        continue;
+      }
+      if (host && nbytes) {
+        eg->bind_host({L, e}, host, nbytes);
+        ++n_bound;
+      }
+    }
+  }
+  LOG_INFO("glm: bound %d expert host blobs for GPU residency", n_bound);
+}
+
+void GlmFlashModel::setup_exec_backend(const GlmEngineConfig& cfg) {
+  contracts::ExecMode em = contracts::ExecMode::kPureCpu;
+  if (mode_ == ExecMode::kHybridGpu) em = contracts::ExecMode::kHybridGpu;
+  else if (mode_ == ExecMode::kPureGpu) em = contracts::ExecMode::kPureGpu;
+
+  contracts::DeviceMeshSpec spec;
+  spec.ids = {0};
+  spec.strategy = contracts::MeshStrategy::kAuto;
+  spec.require_nccl = true;
+  spec.has_moe = true;
+
+  contracts::DeviceMesh mesh;
+  std::string mesh_err;
+  const int ngpu = llmoc::hal::cuda::device_count();
+  if (!sched::resolve_mesh_for_mode(em, spec, ngpu > 0 ? ngpu : 0, exec::nccl_available(), true,
+                                    &mesh, &mesh_err)) {
+    if (em == contracts::ExecMode::kPureCpu) {
+      mesh.ids = {0};
+      mesh.world_size = mesh.ep_size = mesh.tp_size = 1;
+    } else {
+      throw std::runtime_error(mesh_err.empty() ? "glm mesh resolve failed" : mesh_err);
+    }
+  }
+
+  exec::MakeExecOptions opt;
+  opt.mesh = mesh;
+  opt.n_experts_hint = E_;
+  opt.vram_budget_per_rank = static_cast<size_t>(cfg.gpu_vram_gb * (1ull << 30));
+  std::string err;
+  exec_ = exec::make_exec(em, opt, &err);
+  if (!exec_) throw std::runtime_error(err.empty() ? "glm make_exec failed" : err);
+
+  families::Glm53Pack pack;
+  uint64_t expert_bytes = 64ull << 20;
+  if (E_ > 0 && I_ > 0 && H_ > 0) {
+    // gate+up+down BF16 estimate; NVFP4 ~1/4
+    expert_bytes = 3ull * static_cast<uint64_t>(I_) * H_ * 2;
+    if (quant_ == QuantKind::kNvfp4 || quant_ == QuantKind::kAwqInt4) expert_bytes /= 4;
+  }
+  pack.set_geometry(L_, E_, topk_, expert_bytes, 128ull << 20);
+
+  sched::PlacementPlanner::Config pcfg;
+  pcfg.vram_bytes = opt.vram_budget_per_rank;
+  pcfg.dram_bytes = static_cast<uint64_t>(cfg.dram_hot_gb * (1ull << 30));
+  pcfg.strict_vram = (em == contracts::ExecMode::kPureGpu);
+  auto plan = sched::PlacementPlanner::solve_active(em, pcfg, mesh, pack.active_profile());
+  if (!plan.ok && em == contracts::ExecMode::kPureGpu) {
+    throw std::runtime_error(plan.error);
+  }
+  exec_->configure(plan);
+  LOG_INFO("glm exec: %s caps experts_gpu=%d attn_gpu=%d | %s", mesh.summary().c_str(),
+           exec_->caps().experts_on_gpu ? 1 : 0, exec_->caps().attn_on_gpu ? 1 : 0,
+           plan.summary.c_str());
 }
 
 void GlmFlashModel::load(const GlmEngineConfig& cfg) {
@@ -206,7 +307,9 @@ void GlmFlashModel::load(const GlmEngineConfig& cfg) {
     load_meta_sidecar(cfg.model_path);
     quant_ = store_.quant();
     weights_ready_ = true;
+    setup_exec_backend(cfg);
     warm_gpu_attn_weights();
+    bind_expert_hosts();
   } catch (const std::exception& e) {
     weights_ready_ = false;
     meta_.hidden = 4096;
@@ -216,6 +319,10 @@ void GlmFlashModel::load(const GlmEngineConfig& cfg) {
     meta_.head_dim = 256;
     LOG_WARN("glm: weights not loaded (%s) — server can start; chat will fail until .glmq ready",
              e.what());
+    try {
+      setup_exec_backend(cfg);
+    } catch (...) {
+    }
   }
 
   LOG_INFO("arch=glm mode=%s quant=%s device=%s gpu_gemm=%d H=%d L=%d V=%d E=%d weights=%s",
@@ -292,6 +399,15 @@ void GlmFlashModel::moe_ffn(int layer, float* x) {
   std::vector<int> ids(K);
   for (int i = 0; i < K; ++i) ids[i] = order[i];
   prefetch_.plan(layer, ids);
+
+  std::vector<contracts::ExpertId> eids(K);
+  std::vector<contracts::BlockHandle> handles(K);
+  for (int i = 0; i < K; ++i) eids[i] = {layer, order[i]};
+  if (exec_ && exec_->experts()) {
+    exec_->experts()->prefetch(layer, eids.data(), K);
+    exec_->experts()->pin(layer, eids.data(), K, handles.data());
+  }
+
   for (int i = 0; i < K; ++i) {
     const int e = order[i];
     const float ww = static_cast<float>(logits[e] / wsum);
@@ -310,6 +426,7 @@ void GlmFlashModel::moe_ffn(int layer, float* x) {
     gemm_linear(mid.data(), Lname(layer, "mlp.shared_experts.down_proj.weight"), down.data(), H, I);
     for (int d = 0; d < H; ++d) acc[d] += down[d];
   }
+  if (exec_ && exec_->experts()) exec_->experts()->release(handles.data(), K);
   prefetch_.release(layer);
   std::memcpy(x, acc.data(), sizeof(float) * H);
 }

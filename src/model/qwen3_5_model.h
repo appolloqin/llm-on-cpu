@@ -44,7 +44,7 @@ class Qwen35Model final : public ICausalLM {
   void commit_prefix_state(int pos) override;
   bool has_mtp() const override;
   bool draft_propose(const std::vector<int32_t>& history, int draft_k,
-                     std::vector<int32_t>& out) override;
+                     std::vector<int32_t>& out, int32_t pin_first = -1) override;
 
  private:
   wt::WeightManager* wm_ = nullptr;

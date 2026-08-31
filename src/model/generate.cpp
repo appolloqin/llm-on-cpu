@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <random>
 #include <sstream>
@@ -143,6 +144,26 @@ bool mtp_wanted(const std::string& mode) {
   return mode == "true" || mode == "auto" || mode == "1";
 }
 
+bool mtp_force_env() {
+  const char* e = std::getenv("LLMOC_MTP");
+  return e && e[0] != '0' && e[0] != '\0';
+}
+
+bool resolve_use_mtp(const ICausalLM* model, const GenerateRequest& req, bool* logged_auto_skip) {
+  if (!mtp_wanted(req.mtp) || req.spec_k <= 0 || req.temperature > 1e-5f) return false;
+  if (!model->has_mtp()) return false;
+  if (req.mtp == "true" || req.mtp == "1" || mtp_force_env()) return true;
+  // auto：HX/INT4 上 MTP 草稿+verify 仍慢于 greedy（2026-08-31）；SPR+AMX 再默认开
+  if (model->meta().kind == "qwen3_5_int4") {
+    if (logged_auto_skip && !*logged_auto_skip) {
+      LOG_INFO("mtp auto: INT4 CPU stays greedy (model.mtp=true or LLMOC_MTP=1 to force MTP)");
+      *logged_auto_skip = true;
+    }
+    return false;
+  }
+  return true;
+}
+
 bool messages_have_images(const std::vector<ChatMessage>& messages) {
   for (const auto& m : messages)
     if (!m.images.empty()) return true;
@@ -254,7 +275,8 @@ GenerateResult Generator::generate(const GenerateRequest& req,
   const int32_t eos = tok_->im_end_id() >= 0 ? tok_->im_end_id() : tok_->eos_id();
 
   const bool want_mtp = mtp_wanted(req.mtp) && req.spec_k > 0;
-  const bool use_mtp = want_mtp && model_->has_mtp();
+  bool logged_mtp_auto_skip = false;
+  const bool use_mtp = resolve_use_mtp(model_, req, &logged_mtp_auto_skip);
   if (want_mtp && !model_->has_mtp()) {
     LOG_INFO("mtp disabled: model has no MTP weights (mode=%s)", req.mtp.c_str());
   }
@@ -291,38 +313,35 @@ GenerateResult Generator::generate(const GenerateRequest& req,
     return static_cast<int>(out.token_ids.size()) < req.max_new_tokens;
   };
 
+  const bool greedy_fast = !use_mtp && req.temperature <= 1e-5f;
+  (void)greedy_fast;
+
   const auto td0 = Clock::now();
   int decode_steps = 0;
   double slowest_step_ms = 0;
   while (static_cast<int>(out.token_ids.size()) < req.max_new_tokens) {
     const auto ts0 = Clock::now();
     if (use_mtp) {
+      const float draft_temp = req.temperature <= 1e-5f ? 0.f : req.temperature;
+      const int32_t greedy0 = sample_token(logits, draft_temp);
       std::vector<int32_t> drafts;
-      if (!model_->draft_propose(cache.tokens, req.spec_k, drafts) || drafts.empty()) {
-        const int32_t next = sample_token(logits, req.temperature);
-        if (!emit_one(next)) break;
-        model_->forward({next}, cache, logits, false);
-        cache.tokens.push_back(next);
+      if (!model_->draft_propose(cache.tokens, req.spec_k, drafts, greedy0) || drafts.empty()) {
+        if (!emit_one(greedy0)) break;
+        cache.tokens.push_back(greedy0);
+        const auto tf0 = Clock::now();
+        model_->forward({greedy0}, cache, logits, false);
+        const double fwd_ms =
+            std::chrono::duration<double, std::milli>(Clock::now() - tf0).count();
         ++decode_steps;
         const double step_ms =
             std::chrono::duration<double, std::milli>(Clock::now() - ts0).count();
         if (step_ms > slowest_step_ms) slowest_step_ms = step_ms;
         if (llmoc::log::profile_enabled())
-          LOG_INFO("gen step#%d greedy_fallback %.1f ms", decode_steps, step_ms);
+          LOG_INFO("gen step#%d mtp_draft_fallback fwd %.1f ms", decode_steps, fwd_ms);
         continue;
       }
 
       ++out.mtp_verify_steps;
-      // 先用当前 logits 核对 drafts[0]；再一次性 forward 全部草稿做批量 verify
-      if (sample_token(logits, /*temperature=*/0.f) != drafts[0]) {
-        const int32_t next = sample_token(logits, req.temperature);
-        if (!emit_one(next)) break;
-        model_->forward({next}, cache, logits, false);
-        cache.tokens.push_back(next);
-        ++decode_steps;
-        continue;
-      }
-
       const auto snap = cache.snapshot();
       std::vector<float> all_logits;
       model_->forward_all_logits(drafts, cache, all_logits, false);
@@ -369,23 +388,26 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       const double step_ms =
           std::chrono::duration<double, std::milli>(Clock::now() - ts0).count();
       if (step_ms > slowest_step_ms) slowest_step_ms = step_ms;
-      if (llmoc::log::profile_enabled())
-        LOG_INFO("gen step#%d mtp accept=%d/%.1f ms", decode_steps, accepted, step_ms);
+      if (llmoc::log::profile_enabled() || (decode_steps <= 3) || (decode_steps % 8 == 0))
+        LOG_INFO("gen step#%d mtp accept=%d/%d %.1f ms", decode_steps, accepted, k, step_ms);
       continue;
     }
 
-    // Greedy / 普通采样逐步路径
+    // 先 emit 再 forward：prefill 后立即流出首 token；fwd_ms 仍只计 forward
     const int32_t next = sample_token(logits, req.temperature);
     if (!emit_one(next)) break;
-    model_->forward({next}, cache, logits, false);
     cache.tokens.push_back(next);
+    const auto tf0 = Clock::now();
+    model_->forward({next}, cache, logits, false);
+    const double fwd_ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - tf0).count();
     ++decode_steps;
     const double step_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - ts0).count();
     if (step_ms > slowest_step_ms) slowest_step_ms = step_ms;
     if (llmoc::log::profile_enabled() || (decode_steps <= 3) || (decode_steps % 16 == 0))
-      LOG_INFO("gen decode step#%d +1 tok in %.1f ms (%.2f tok/s)", decode_steps, step_ms,
-               step_ms > 0 ? 1000.0 / step_ms : 0.0);
+      LOG_INFO("gen decode step#%d +1 tok in %.1f ms (fwd %.1f ms, %.2f tok/s)", decode_steps,
+               step_ms, fwd_ms, step_ms > 0 ? 1000.0 / step_ms : 0.0);
   }
   const double decode_ms =
       std::chrono::duration<double, std::milli>(Clock::now() - td0).count();
@@ -421,11 +443,17 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       out.completion_tokens > 0
           ? (1000.0 * out.completion_tokens / (wall_ms > 0 ? wall_ms : 1.0))
           : 0.0;
+  const double mtp_accept_ratio =
+      out.mtp_verify_steps > 0 && req.spec_k > 0
+          ? static_cast<double>(out.mtp_draft_accepted) /
+                static_cast<double>(out.mtp_verify_steps * req.spec_k)
+          : 0.0;
   LOG_INFO(
       "gen done: prompt=%d new=%d steps=%d | prefill=%.1fms (%.2f t/s) decode=%.1fms (%.2f t/s) "
-      "slowest_step=%.1fms wall=%.1fms e2e=%.2f t/s | mtp_verify=%d mtp_accept=%d",
+      "slowest_step=%.1fms wall=%.1fms e2e=%.2f t/s | mtp_verify=%d mtp_accept=%d mtp_alpha=%.2f",
       out.prompt_tokens, out.completion_tokens, decode_steps, prefill_ms, prefill_tps, decode_ms,
-      decode_tps, slowest_step_ms, wall_ms, e2e_tps, out.mtp_verify_steps, out.mtp_draft_accepted);
+      decode_tps, slowest_step_ms, wall_ms, e2e_tps, out.mtp_verify_steps, out.mtp_draft_accepted,
+      mtp_accept_ratio);
   if (out.completion_tokens > 0 && decode_tps < 0.5)
     LOG_WARN(
         "gen decode <0.5 tok/s — for ~27B BF16 on CPU this can be expected; check OpenMP "

@@ -268,7 +268,8 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
                      float scale) {
   const int g = n_heads / n_kv_heads;
   const int stride = cache_cap > 0 ? cache_cap : seq_len;
-  std::vector<float> scores(seq_len);
+  thread_local std::vector<float> scores;
+  if (scores.size() < static_cast<size_t>(seq_len)) scores.resize(static_cast<size_t>(seq_len));
   for (int h = 0; h < n_heads; ++h) {
     const int hkv = h / g;
     const float* qh = q + h * head_dim;

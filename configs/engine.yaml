@@ -19,12 +19,22 @@ model:
 # ---------------------------------------------------------------------------
 mode: pure_cpu
 
+# 引擎内单机多卡（G8）。省略 = 单卡 [0]。多卡需 NCCL（见实现文档）。
+# devices:
+#   ids: [0, 1]
+#   strategy: auto   # MoE→ep，稠密→tp
+#   nccl: true
+
 tiers:
   dram_hot_gb: 16
   kv_pool_gb: 2
   prefetch_buf_gb: 1
-  # hybrid_gpu / pure_gpu 显存预算（GB）；未设时默认 8
+  # hybrid_gpu / pure_gpu 显存预算（GB，按每卡）；未设时默认 8
   # gpu_vram_gb: 8
+  # pure_gpu:
+  #   expert_slot_extra: 1
+  #   strict_vram: true
+  #   margin_mb: 512
 
 decode:
   spec_k: 3

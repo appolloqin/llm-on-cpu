@@ -6,8 +6,11 @@ model:
   arch: glm53_flash
   tokenizer_dir: models/GLM-5.3-Flash-NVFP4
 
-# pure_cpu | hybrid_gpu | pure_gpu（含义同 engine_glm_int4.yaml / ARCHITECTURE §3.1）
-# 单卡 ~22G 推荐 hybrid_gpu；无 CUDA 构建时会回退，见日志
+# pure_cpu | hybrid_gpu | pure_gpu（实现文档 2026-08-31：pure_gpu=激活路径 GPU + 专家槽）
+# 单卡 ~22G：NVFP4 可试 pure_gpu；多卡见 devices:
+# devices:
+#   ids: [0, 1]
+#   strategy: auto
 mode: hybrid_gpu
 
 quant: nvfp4

@@ -489,10 +489,10 @@ bool Qwen35Model::has_mtp() const {
 }
 
 bool Qwen35Model::draft_propose(const std::vector<int32_t>& history, int draft_k,
-                                std::vector<int32_t>& out) {
+                                std::vector<int32_t>& out, int32_t pin_first) {
   out.clear();
   if (last_hidden_.empty()) return false;
-  return mtp_draft_propose(mtp_access(), last_hidden_, history, draft_k, out);
+  return mtp_draft_propose(mtp_access(), last_hidden_, history, draft_k, out, pin_first);
 }
 
 }  // namespace llmoc::model

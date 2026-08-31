@@ -648,14 +648,22 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   }
 }
 
-void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& cache,
-                              std::vector<float>& logits, bool is_prefill) {
-  // 常规路径只需最后一 token 的 logits（避免 prefill 扫 n 次词表）
+void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache,
+                                        bool is_prefill, float* h_out, double* ms_lin,
+                                        double* ms_full) {
   if (!store_ || tokens.empty()) throw std::runtime_error("model not ready / empty tokens");
   const int n = static_cast<int>(tokens.size());
   const int H = cfg_.hidden;
-  const int V = cfg_.vocab;
-  std::vector<float> x(static_cast<size_t>(n) * H);
+  static const bool kProf = [] {
+    const char* e = std::getenv("LLMOC_PROFILE");
+    return e && e[0] == '1';
+  }();
+  using Clock = std::chrono::steady_clock;
+
+  auto& sc = scratch();
+  Int4Scratch::fit(sc.xbuf, static_cast<size_t>(n) * H);
+  float* x = sc.xbuf.data();
+
   int pos_start = 0;
   if (!is_prefill) {
     for (int i = 0; i < cfg_.layers; ++i)
@@ -665,17 +673,55 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
       }
   }
   if (is_prefill) vision_cursor_ = 0;
-  for (int t = 0; t < n; ++t) embed(tokens[t], x.data() + t * H);
+  for (int t = 0; t < n; ++t) embed(tokens[t], x + t * H);
   prepare_mrope_positions(tokens, is_prefill);
-  for (int L = 0; L < cfg_.layers; ++L) layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
+
+  double lin = 0, full = 0;
+  for (int L = 0; L < cfg_.layers; ++L) {
+    if (kProf && ms_lin && ms_full) {
+      const auto a = Clock::now();
+      layer_forward(L, x, cache, pos_start, n, is_prefill);
+      const auto b = Clock::now();
+      const double d = std::chrono::duration<double, std::milli>(b - a).count();
+      if (cfg_.layer_types[L] == "full_attention")
+        full += d;
+      else
+        lin += d;
+    } else {
+      layer_forward(L, x, cache, pos_start, n, is_prefill);
+    }
+  }
+  if (ms_lin) *ms_lin = lin;
+  if (ms_full) *ms_full = full;
+
+  hal::rmsnorm(x + (n - 1) * H, final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+  for (int i = 0; i < H; ++i)
+    if (!std::isfinite(h_out[i])) h_out[i] = 0.f;
+  last_hidden_.assign(h_out, h_out + H);
+}
+
+void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& cache,
+                              std::vector<float>& logits, bool is_prefill) {
+  const int n = static_cast<int>(tokens.size());
+  const int H = cfg_.hidden;
+  const int V = cfg_.vocab;
+  static const bool kProf = [] {
+    const char* e = std::getenv("LLMOC_PROFILE");
+    return e && e[0] == '1';
+  }();
+  using Clock = std::chrono::steady_clock;
+  const auto t0 = kProf && n == 1 && !is_prefill ? Clock::now() : Clock::time_point{};
+
+  std::vector<float> h(H);
+  double ms_lin = 0, ms_full = 0;
+  forward_to_hidden(tokens, cache, is_prefill, h.data(), kProf ? &ms_lin : nullptr,
+                    kProf ? &ms_full : nullptr);
+
+  Clock::time_point t_head0;
+  if (kProf && n == 1 && !is_prefill) t_head0 = Clock::now();
 
   prefix_hiddens_.clear();
   prefix_logits_.clear();
-  std::vector<float> h(H);
-  hal::rmsnorm(x.data() + (n - 1) * H, final_norm_, h.data(), H, cfg_.rms_eps, pass_wd_, true);
-  for (float& v : h)
-    if (!std::isfinite(v)) v = 0.f;
-  last_hidden_ = h;
   logits.resize(static_cast<size_t>(V));
   if (lm_is_int4_) {
 #if defined(LLMOC_ENABLE_AVX2)
@@ -692,6 +738,33 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
     hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
   }
   last_logits_ = logits;
+
+  if (kProf && n == 1 && !is_prefill) {
+    const auto t1 = Clock::now();
+    const double ms_head = std::chrono::duration<double, std::milli>(t1 - t_head0).count();
+    const double ms_tot = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    std::fprintf(stderr, "[profile] layers_linear=%.1f layers_full=%.1f lm_head=%.1f total=%.1f ms\n",
+                 ms_lin, ms_full, ms_head, ms_tot);
+  }
+}
+
+bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
+                                            SessionCache& cache, int32_t& out_token) {
+  if (tokens.size() != 1 || !lm_is_int4_) return false;
+  const int H = cfg_.hidden;
+  auto& sc = scratch();
+  Int4Scratch::fit(sc.last, static_cast<size_t>(H));
+  forward_to_hidden(tokens, cache, false, sc.last.data());
+#if defined(LLMOC_ENABLE_AVX2)
+  if (lm_int4_.qweight)
+    _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
+#endif
+  const auto ar = hal::gemm_int4_argmax(sc.last.data(), lm_int4_);
+  out_token = ar.index;
+  last_logits_.assign(1, ar.value);
+  prefix_hiddens_.clear();
+  prefix_logits_.clear();
+  return true;
 }
 
 void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, SessionCache& cache,
@@ -864,10 +937,10 @@ bool Qwen35Int4Model::has_mtp() const {
 }
 
 bool Qwen35Int4Model::draft_propose(const std::vector<int32_t>& history, int draft_k,
-                                    std::vector<int32_t>& out) {
+                                    std::vector<int32_t>& out, int32_t pin_first) {
   out.clear();
   if (last_hidden_.empty()) return false;
-  return mtp_draft_propose(mtp_access(), last_hidden_, history, draft_k, out);
+  return mtp_draft_propose(mtp_access(), last_hidden_, history, draft_k, out, pin_first);
 }
 
 }  // namespace llmoc::model

@@ -7,6 +7,9 @@
 
 #include "common/engine_config.h"
 #include "common/log.h"
+#include "common/omp_tune.h"
+#include "exec/factory.h"
+#include "exec/nccl_probe.h"
 #include "hal/cuda_backend.h"
 #include "model/generate.h"
 #include "model/moe_model.h"
@@ -18,11 +21,6 @@
 #include "server/http_api.h"
 #include "weights/prefetch_pipeline.h"
 #include "weights/weight_manager.h"
-
-#if defined(_OPENMP)
-#include <omp.h>
-#endif
-
 int main(int argc, char** argv) {
   std::string cfg_path = "configs/engine.yaml";
   for (int i = 1; i < argc; ++i) {
@@ -38,44 +36,78 @@ int main(int argc, char** argv) {
     auto cfg = llmoc::EngineConfig::load(cfg_path);
     const std::string tok_dir = cfg.resolve_tokenizer_dir();
 
-    const bool cuda_ok = llmoc::hal::cuda::probe_available();
+    const auto req = llmoc::sched::parse_mode(cfg.mode);
     bool degraded = false;
     std::string mode_err;
-    const auto req = llmoc::sched::parse_mode(cfg.mode);
-    const auto mode = llmoc::sched::resolve_mode(req, cuda_ok, &degraded, &mode_err);
-    if (req == llmoc::sched::ExecMode::kPureGpu && !cuda_ok) {
-      throw std::runtime_error(mode_err.empty() ? "pure_gpu requires CUDA" : mode_err);
-    }
-    if (degraded) {
-      LOG_WARN("mode=hybrid_gpu requested but CUDA unavailable — degraded to pure_cpu (%s)",
-               llmoc::hal::cuda::status());
-    }
+    llmoc::sched::ExecMode mode;
+    llmoc::contracts::DeviceMesh mesh;
+    std::unique_ptr<llmoc::contracts::IExecBackend> exec_backend;
 
-    if (mode == llmoc::sched::ExecMode::kHybridGpu || mode == llmoc::sched::ExecMode::kPureGpu) {
-      double vram_gb = cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0;
-      const size_t budget = static_cast<size_t>(vram_gb * (1ull << 30));
-      if (!llmoc::hal::cuda::enable(budget)) {
-        throw std::runtime_error(std::string("CUDA enable failed: ") + llmoc::hal::cuda::status());
+    if (req == llmoc::sched::ExecMode::kPureCpu) {
+      mode = llmoc::sched::ExecMode::kPureCpu;
+      mesh.ids = {0};
+      mesh.world_size = mesh.ep_size = mesh.tp_size = 1;
+      llmoc::exec::MakeExecOptions eopt;
+      eopt.mesh = mesh;
+      exec_backend = llmoc::exec::make_exec(mode, eopt);
+      LOG_INFO("exec caps: pure_cpu (CUDA/NCCL not probed)");
+    } else {
+      const bool cuda_ok = llmoc::hal::cuda::probe_available();
+      mode = llmoc::sched::resolve_mode(req, cuda_ok, &degraded, &mode_err);
+      if (req == llmoc::sched::ExecMode::kPureGpu && !cuda_ok) {
+        throw std::runtime_error(mode_err.empty() ? "pure_gpu requires CUDA" : mode_err);
       }
-      llmoc::hal::cuda::log_status();
-      llmoc::sched::PlacementPlanner::Config pcfg;
-      pcfg.vram_bytes = budget;
-      pcfg.dram_bytes = static_cast<uint64_t>(cfg.dram_hot_gb * (1ull << 30));
-      // Expert hints filled after wm.open when MoE; empty ok for dense.
-      auto plan = llmoc::sched::PlacementPlanner::solve(mode, pcfg, {});
-      LOG_INFO("placement: %s", plan.summary.c_str());
+      if (degraded) {
+        LOG_WARN("mode=hybrid_gpu requested but CUDA unavailable — degraded to pure_cpu (%s)",
+                 llmoc::hal::cuda::status());
+      }
+
+      std::string mesh_err;
+      if (!llmoc::sched::resolve_mesh_for_mode(mode, cfg.mesh_spec(),
+                                               cuda_ok ? llmoc::hal::cuda::device_count() : 0,
+                                               llmoc::exec::nccl_available(), cfg.has_moe_hint,
+                                               &mesh, &mesh_err)) {
+        throw std::runtime_error(mesh_err.empty() ? "device mesh resolve failed" : mesh_err);
+      }
+
+      std::string exec_err;
+      llmoc::exec::MakeExecOptions eopt;
+      eopt.mesh = mesh;
+      eopt.vram_budget_per_rank =
+          static_cast<size_t>((cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0) * (1ull << 30));
+      exec_backend = llmoc::exec::make_exec(mode, eopt, &exec_err);
+      if (!exec_backend) {
+        throw std::runtime_error(exec_err.empty() ? "make_exec failed" : exec_err);
+      }
+
+      if (mode == llmoc::sched::ExecMode::kHybridGpu || mode == llmoc::sched::ExecMode::kPureGpu) {
+        double vram_gb = cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0;
+        const size_t budget = static_cast<size_t>(vram_gb * (1ull << 30));
+        if (!llmoc::hal::cuda::enable(budget)) {
+          throw std::runtime_error(std::string("CUDA enable failed: ") + llmoc::hal::cuda::status());
+        }
+        llmoc::hal::cuda::log_status();
+        llmoc::sched::PlacementPlanner::Config pcfg;
+        pcfg.vram_bytes = budget;
+        pcfg.dram_bytes = static_cast<uint64_t>(cfg.dram_hot_gb * (1ull << 30));
+        pcfg.expert_slot_extra = cfg.expert_slot_extra;
+        pcfg.strict_vram = cfg.strict_vram;
+        pcfg.margin_bytes = static_cast<uint64_t>(cfg.margin_mb) << 20;
+        llmoc::contracts::ActiveSetProfile ap;
+        ap.has_moe = cfg.has_moe_hint;
+        auto plan = llmoc::sched::PlacementPlanner::solve_active(mode, pcfg, mesh, ap);
+        if (!plan.ok) throw std::runtime_error(plan.error);
+        exec_backend->configure(plan);
+        LOG_INFO("placement: %s", plan.summary.c_str());
+        LOG_INFO("exec caps: experts_on_gpu=%d attn_on_gpu=%d %s",
+                 exec_backend->caps().experts_on_gpu ? 1 : 0,
+                 exec_backend->caps().attn_on_gpu ? 1 : 0, mesh.summary().c_str());
+      } else {
+        LOG_INFO("exec caps: pure_cpu %s", mesh.summary().c_str());
+      }
     }
 
-#if defined(_OPENMP)
-    LOG_INFO("OpenMP max_threads=%d", omp_get_max_threads());
-    if (omp_get_max_threads() > 64) {
-      LOG_WARN("OpenMP threads=%d is high for bandwidth-bound decode; try "
-               "set OMP_NUM_THREADS=<physical cores> (often ~half of logical)",
-               omp_get_max_threads());
-    }
-#else
-    LOG_INFO("OpenMP: not compiled in");
-#endif
+    llmoc::tune_openmp_for_decode();
     LOG_INFO("mode=%s model=%s tokenizer=%s port=%d dram_hot=%.1fG gpu_vram=%.1fG",
              llmoc::sched::mode_name(mode), cfg.model_path.c_str(), tok_dir.c_str(),
              cfg.server_port, cfg.dram_hot_gb, cfg.gpu_vram_gb);

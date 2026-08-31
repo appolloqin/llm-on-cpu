@@ -44,12 +44,14 @@ class Qwen35Int4Model final : public ICausalLM {
   void init_cache(SessionCache& cache, int max_seq) const override;
   void forward(const std::vector<int32_t>& tokens, SessionCache& cache, std::vector<float>& logits,
                bool is_prefill) override;
+  bool forward_decode_greedy(const std::vector<int32_t>& tokens, SessionCache& cache,
+                             int32_t& out_token) override;
   void forward_all_logits(const std::vector<int32_t>& tokens, SessionCache& cache,
                           std::vector<float>& logits_all, bool is_prefill) override;
   void commit_prefix_state(int pos) override;
   bool has_mtp() const override;
   bool draft_propose(const std::vector<int32_t>& history, int draft_k,
-                     std::vector<int32_t>& out) override;
+                     std::vector<int32_t>& out, int32_t pin_first = -1) override;
 
   bool has_vision() const override { return vision_.ready(); }
   void set_vision_embeds(std::vector<float> embeds, int n_tok) override;
@@ -117,6 +119,8 @@ class Qwen35Int4Model final : public ICausalLM {
   void embed(int32_t token, float* out);
   void layer_forward(int layer, float* x, SessionCache& cache, int pos_start, int n_tok,
                      bool is_prefill);
+  void forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache, bool is_prefill,
+                         float* h_out, double* ms_lin = nullptr, double* ms_full = nullptr);
   void prepare_mrope_positions(const std::vector<int32_t>& tokens, bool is_prefill);
   void build_layer_packs();
   MtpWeightAccess mtp_access();

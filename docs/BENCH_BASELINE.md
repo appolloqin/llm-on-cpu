@@ -48,6 +48,35 @@
 
 MTP 保持 `false`。短聊再冲 e2e 需 SPR+AMX 或更强 GDN，不靠口径游戏。
 
+## 2026-08-31 提速（pure_cpu Qwen INT4，HX 开发机）
+
+| 项 | 说明 |
+|---|---|
+| OpenMP | 未设 `OMP_NUM_THREADS` 时 server/bench 默认 cap **24→8**（勿用 12） |
+| lm_head | greedy decode 走 `gemm_int4_argmax`，免写全词表 + 二次 argmax |
+| attn | `attn_decode_one` 复用 thread_local scores 缓冲 |
+|  profiling | `LLMOC_PROFILE=1` 在 `forward(n=1)` 打印 linear/full/lm_head ms |
+| 未实现缺口 | 见 [`IMPLEMENTATION_GAP_2026-08-31.md`](IMPLEMENTATION_GAP_2026-08-31.md) |
+
+**HX 笔记本现象（2026-08-31 实测）**：长跑 decode 会在 **~200ms（≈5 t/s）** 与 **~100ms（≈10 t/s）** 间交替，均速 **6–8 t/s**；主因散热/频率节流，不是 OMP 单独能解。验收仍用 **bench 暖机后 64–256 token 窗口** 看中位数。**勿用 `OMP_NUM_THREADS=32`**（`start_int4.cmd` 旧版曾默认 32）。
+
+### MTP（2026-08-31，Qwen3.5-4B INT4 @ HX）
+
+| 模式 | decode t/s | mtp_alpha | 结论 |
+|---|---|---|---|
+| greedy（`mtp:false`） | **~6.8–7.1** | — | **CPU 默认** |
+| MTP `spec_k=3`（`configs/engine_int4_mtp.yaml`） | **~4.9–7.5** | **~0.28**（29/105） | 草稿+verify 步 ~500ms，慢于 greedy |
+
+- 权重：`has_mtp=1`（qlwc 含 MTP 头）
+- 配置：`model.mtp: auto` → INT4 CPU **自动 greedy**；强制 MTP：`mtp: true` 或 `LLMOC_MTP=1`
+- 优化：`pin_first` 锚定 greedy 首 token，去掉 draft[0] 冗余校验
+- **≥30 tok/s** 仍依赖 SPR+AMX+MTP 热路径优化，非当前 HX INT4
+
+```powershell
+$env:OMP_NUM_THREADS='8'
+.\build\msvc-x64\bin\bench_decode_tps.exe --config configs\engine_int4_mtp.yaml --new 64 --warm 0
+```
+
 ## P0 验收对照
 
 | 项 | 状态 |

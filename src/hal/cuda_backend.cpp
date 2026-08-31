@@ -228,6 +228,42 @@ const char* status() { return g_status.c_str(); }
 size_t vram_used() { return g_used; }
 size_t vram_budget() { return g_budget; }
 
+int device_count() {
+  if (!probe_available()) return 0;
+  std::lock_guard<std::mutex> lock(g_mu);
+  int n = 0;
+  if (!g_api.cudaGetDeviceCount || g_api.cudaGetDeviceCount(&n) != kCudaSuccess) return 0;
+  return n;
+}
+
+void* device_alloc(size_t bytes) {
+  if (!g_enabled || bytes == 0) return nullptr;
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_budget > 0 && g_used + bytes > g_budget) return nullptr;
+  void* p = nullptr;
+  if (g_api.cudaMalloc(&p, bytes) != kCudaSuccess) return nullptr;
+  g_used += bytes;
+  return p;
+}
+
+void device_free(void* p) {
+  if (!p || !g_enabled) return;
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_api.cudaFree(p);
+}
+
+bool h2d(void* dst, const void* src, size_t bytes) {
+  if (!g_enabled || !dst || !src || bytes == 0) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(dst, src, bytes, kCudaMemcpyH2D) == kCudaSuccess;
+}
+
+bool d2h(void* dst, const void* src, size_t bytes) {
+  if (!g_enabled || !dst || !src || bytes == 0) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(dst, src, bytes, kCudaMemcpyD2H) == kCudaSuccess;
+}
+
 bool enable(size_t vram_budget_bytes) {
   std::lock_guard<std::mutex> lock(g_mu);
   g_budget = vram_budget_bytes;

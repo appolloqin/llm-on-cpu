@@ -22,7 +22,7 @@ bool mtp_weights_present(const MtpWeightAccess& wa) {
 
 bool mtp_draft_propose(const MtpWeightAccess& wa, const std::vector<float>& last_hidden,
                        const std::vector<int32_t>& history, int draft_k,
-                       std::vector<int32_t>& out) {
+                       std::vector<int32_t>& out, int32_t pin_first) {
   out.clear();
   if (draft_k <= 0 || history.empty()) return false;
   if (!mtp_weights_present(wa) || !wa.gemm || !wa.pass || !wa.embed) return false;
@@ -76,11 +76,10 @@ bool mtp_draft_propose(const MtpWeightAccess& wa, const std::vector<float>& last
     cand.resize(m);
   }
 
-  int32_t tok = history.back();
   const int S = static_cast<int>(history.size());
+  int32_t tok = history.back();
 
-  for (int step = 0; step < draft_k; ++step) {
-    const int pos = S - 1 + step;
+  auto propose_one = [&](int pos) -> int32_t {
     wa.embed(wa.ctx, tok, emb.data());
     hal::rmsnorm(emb.data(), n_emb, e_n.data(), H, wa.rms_eps, dt, wa.rms_one_plus);
     hal::rmsnorm(h.data(), n_hid, h_n.data(), H, wa.rms_eps, dt, wa.rms_one_plus);
@@ -155,6 +154,26 @@ bool mtp_draft_propose(const MtpWeightAccess& wa, const std::vector<float>& last
         }
       }
     }
+    return best;
+  };
+
+  if (pin_first >= 0) {
+    out.push_back(pin_first);
+    tok = pin_first;
+    if (draft_k == 1) return true;
+    (void)propose_one(S - 1);
+    for (int step = 1; step < draft_k; ++step) {
+      const int pos = S - 1 + step;
+      const int32_t best = propose_one(pos);
+      out.push_back(best);
+      tok = best;
+    }
+    return static_cast<int>(out.size()) == draft_k;
+  }
+
+  for (int step = 0; step < draft_k; ++step) {
+    const int pos = S - 1 + step;
+    const int32_t best = propose_one(pos);
     out.push_back(best);
     tok = best;
   }

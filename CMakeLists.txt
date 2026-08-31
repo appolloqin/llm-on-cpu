@@ -48,12 +48,22 @@ add_library(llmoc_weights STATIC
   src/common/platform.cpp
   src/common/engine_config.cpp
   src/common/log.cpp
+  src/common/omp_tune.cpp
   src/hal/amx_gemm.cpp
   src/hal/cpu_ops.cpp
   src/hal/cuda_backend.cpp
   src/hal/int4_ops.cpp
   src/sched/mode_controller.cpp
   src/sched/placement_planner.cpp
+  src/contracts/device_mesh.cpp
+  src/exec/factory.cpp
+  src/exec/nccl_probe.cpp
+  src/exec/mesh_nccl.cpp
+  src/exec/cpu/exec_cpu.cpp
+  src/exec/hybrid/exec_hybrid.cpp
+  src/exec/gpu/exec_gpu.cpp
+  src/exec/gpu/residency_gpu.cpp
+  src/families/family_packs.cpp
 )
 target_include_directories(llmoc_weights PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
@@ -180,6 +190,7 @@ add_executable(llmoc_unit_tests
   tests/unit/test_kv_snapshot.cpp
   tests/unit/test_model_spec.cpp
   tests/unit/test_m5_mode.cpp
+  tests/unit/test_exec_mesh.cpp
 )
 target_link_libraries(llmoc_unit_tests PRIVATE llmoc_weights llmoc_model)
 

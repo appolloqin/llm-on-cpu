@@ -64,12 +64,12 @@ bool GraphExecutor::has_mtp() const {
 }
 
 bool GraphExecutor::draft_propose(const std::vector<int32_t>& history, int draft_k,
-                                  std::vector<int32_t>& out) {
+                                  std::vector<int32_t>& out, int32_t pin_first) {
   if (!legacy_) {
     out.clear();
     return false;
   }
-  return legacy_->draft_propose(history, draft_k, out);
+  return legacy_->draft_propose(history, draft_k, out, pin_first);
 }
 
 }  // namespace llmoc::model::graph

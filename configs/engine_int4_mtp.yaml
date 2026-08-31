@@ -1,0 +1,19 @@
+# INT4 + MTP 验收配置（由 engine_int4.yaml 复制，仅开 mtp）
+model:
+  path: models/Qwen3.5-4B.int4.qlwc
+  dtype: int4
+  mtp: true
+  tokenizer_dir: models/Qwen3.5-4B-hf
+mode: pure_cpu
+tiers:
+  dram_hot_gb: 6
+  kv_pool_gb: 1
+  prefetch_buf_gb: 0.5
+decode:
+  spec_k: 3
+  max_new_tokens: 204800
+io:
+  workers: 2
+server:
+  port: 15086
+  api_key_env: LLMOC_API_KEY

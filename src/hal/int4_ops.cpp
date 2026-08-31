@@ -340,6 +340,81 @@ float gemm_row_scalar(const float* x, const uint8_t* qbase, int M, int K, int m,
   return static_cast<float>(acc);
 }
 
+Int4ArgmaxResult gemm_int4_argmax_impl(const float* x, const qlwc::Int4View& W) {
+  Int4ArgmaxResult best{};
+  const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
+  const int M = W.M, K = W.K, gs = W.group_size;
+  const int ng = (K + gs - 1) / gs;
+  const int rb = row_bytes(K);
+
+  const float* scf = W.scales_f32;
+  std::vector<float> scales_scratch;
+  if (awq && !scf) {
+    scales_scratch.resize(static_cast<size_t>(M) * ng);
+    for (int i = 0; i < M * ng; ++i)
+      scales_scratch[static_cast<size_t>(i)] = f16b_to_f32(W.scales[i]);
+    scf = scales_scratch.data();
+  }
+
+  auto row_acc = [&](int m) -> float {
+    float acc = 0.f;
+    if (awq) {
+      const uint8_t* qrow = W.qweight + static_cast<size_t>(m) * rb;
+#if defined(LLMOC_ENABLE_AVX2)
+      for (int g = 0; g < ng; ++g) {
+        const int k0 = g * gs;
+        const int k1 = std::min(K, k0 + gs);
+        acc += dot_awq_noscale(x, qrow, k0, k1) * scf[static_cast<size_t>(m) * ng + g];
+      }
+#else
+      acc = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, true);
+#endif
+    } else {
+      acc = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, false);
+    }
+    return std::isfinite(acc) ? acc : -1e30f;
+  };
+
+#if defined(_OPENMP)
+  if (M >= 4096) {
+    int32_t lb = 0;
+    float lv = -1e30f;
+#pragma omp parallel
+    {
+      int32_t tb = 0;
+      float tv = -1e30f;
+#pragma omp for schedule(static) nowait
+      for (int m = 0; m < M; ++m) {
+        const float v = row_acc(m);
+        if (v > tv) {
+          tv = v;
+          tb = m;
+        }
+      }
+#pragma omp critical
+      {
+        if (tv > lv) {
+          lv = tv;
+          lb = tb;
+        }
+      }
+    }
+    best.index = lb;
+    best.value = lv;
+    return best;
+  }
+#endif
+
+  for (int m = 0; m < M; ++m) {
+    const float v = row_acc(m);
+    if (v > best.value) {
+      best.value = v;
+      best.index = m;
+    }
+  }
+  return best;
+}
+
 }  // namespace
 
 void gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
@@ -362,6 +437,10 @@ void gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
     if (!std::isfinite(y[m])) y[m] = 0.f;
   }
 #endif
+}
+
+Int4ArgmaxResult gemm_int4_argmax(const float* x, const qlwc::Int4View& W) {
+  return gemm_int4_argmax_impl(x, W);
 }
 
 #if defined(LLMOC_ENABLE_AVX2)
