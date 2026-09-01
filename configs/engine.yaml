@@ -12,12 +12,20 @@ model:
 # 执行模式 mode（加载期确定）
 #
 #   pure_cpu     ① 纯 CPU（默认）。不初始化 CUDA；gemm 全走 CPU。
-#   hybrid_gpu   ② 需 CUDA。attn 等 BF16 Linear 可走 cuBLAS；专家仍 CPU/NVMe。
+#   hybrid_gpu   ② 需 CUDA。BF16 Linear 可走 cuBLAS；专家仍 CPU/NVMe。
 #                无 CUDA 时降级 pure_cpu 并打日志。
 #   pure_gpu     ③ 需 CUDA；无卡则启动失败（不静默降级）。
-#   auto         有 CUDA → hybrid_gpu，否则 pure_cpu。
+#   auto         有 CUDA → hybrid_gpu，否则 pure_cpu；
+#                若 layer_stream.auto 且权重 > dram_hot_gb → layer_stream。
+#   layer_stream 装不下整模时按层窗口加载（可运行优先）；见 DESIGN_LAYER_STREAM.md
 # ---------------------------------------------------------------------------
 mode: pure_cpu
+
+# layer_stream:
+#   window_layers: 2
+#   device: cpu
+#   max_window_mb: 0
+#   auto: true
 
 # 引擎内单机多卡（G8）。省略 = 单卡 [0]。多卡需 NCCL（见实现文档）。
 # devices:

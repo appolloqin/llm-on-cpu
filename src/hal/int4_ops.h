@@ -24,4 +24,7 @@ void gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
 // 解量化单行：out[K] ← W[row, :]（embedding 查表）
 void dequant_int4_row(const qlwc::Int4View& W, int row, float* out);
 
+// 解量化整矩阵：out[M*K] row-major，供 GPU FP32 缓存（与 cublas W[M,K] 约定一致）
+void dequant_int4_matrix(const qlwc::Int4View& W, float* out);
+
 }  // namespace llmoc::hal

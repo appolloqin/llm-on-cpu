@@ -30,9 +30,15 @@ void WeightManager::open(const io::Path& file, const Config& cfg) {
     for (const auto& t : hdr_.tensors) {
         Entry e;
         e.meta = t;
-        e.tier = (!expert_names_.count(t.name) || is_force_resident(t.name))
-                     ? Tier::kResident
-                     : Tier::kCold;
+        const bool is_expert = expert_names_.count(t.name) != 0;
+        const bool is_layer =
+            cfg_.stream_dense_layers && t.name.find("layers.") != std::string::npos;
+        if (is_force_resident(t.name))
+            e.tier = Tier::kResident;
+        else if (is_expert || is_layer)
+            e.tier = Tier::kCold;
+        else
+            e.tier = Tier::kResident;
         entries_.emplace(t.name, std::move(e));
         order_.push_back(t.name);
     }
@@ -138,6 +144,19 @@ const std::vector<uint8_t>& WeightManager::get(const std::string& tensor_name) {
             evict_until_budget();
             return e.data;
     }
+}
+
+void WeightManager::release_prefix(const std::string& prefix) {
+  for (auto& [name, e] : entries_) {
+    if (e.tier == Tier::kResident) continue;
+    if (name.find(prefix) == std::string::npos) continue;
+    if (e.data.empty()) continue;
+    if (e.tier == Tier::kHotLru && lru_used_ >= e.data.size()) lru_used_ -= e.data.size();
+    e.data.clear();
+    e.data.shrink_to_fit();
+    e.tier = Tier::kCold;
+    ++st_.evictions;
+  }
 }
 
 }  // namespace llmoc::wt

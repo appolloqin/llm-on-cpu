@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "hal/cuda_backend.h"
 #include "hal/int4_ops.h"
 #include "test_main.h"
 
@@ -106,4 +107,53 @@ TINY_TEST(Int4, GemmBatchMatchesSingle) {
     const float e = std::fabs(Yb[i] - Ys[i]);
     EXPECT_TRUE(e < 1e-4f * (1.f + std::fabs(Ys[i])));
   }
+}
+
+TINY_TEST(Int4, GpuGemmMatchesCpuIfCuda) {
+  if (!llmoc::hal::cuda::probe_available()) {
+    EXPECT_TRUE(true);  // no GPU — skip
+    return;
+  }
+  if (!llmoc::hal::cuda::enable(256ull << 20)) {
+    EXPECT_TRUE(true);
+    return;
+  }
+  const int M = 32, K = 128, gs = 128;
+  std::vector<uint8_t> q(static_cast<size_t>(M) * K);
+  for (int i = 0; i < M * K; ++i) q[i] = static_cast<uint8_t>((i * 3) % 16);
+  std::vector<uint8_t> packed;
+  pack_row(q, packed, M, K);
+  std::vector<uint16_t> scales(M);
+  for (int m = 0; m < M; ++m) scales[m] = f32_to_f16bits(0.01f + 0.001f * static_cast<float>(m));
+  std::vector<float> x(K), y_cpu(M), y_gpu(M);
+  for (int k = 0; k < K; ++k) x[k] = 0.02f * static_cast<float>((k % 7) - 3);
+
+  qlwc::Int4View W;
+  W.qweight = packed.data();
+  W.scales = scales.data();
+  W.zeros = nullptr;
+  W.M = M;
+  W.K = K;
+  W.group_size = gs;
+  W.scheme = qlwc::Scheme::kAwqSym;
+
+  llmoc::hal::gemm_int4(x.data(), W, y_cpu.data());
+  EXPECT_TRUE(llmoc::hal::cuda::prefetch_int4_weight(W));
+  EXPECT_TRUE(llmoc::hal::cuda::try_gemm_int4(x.data(), W, y_gpu.data()));
+  for (int m = 0; m < M; ++m) {
+    const float e = std::fabs(y_gpu[m] - y_cpu[m]);
+    EXPECT_TRUE(e < 1e-3f * (1.f + std::fabs(y_cpu[m])));
+  }
+
+  const int n = 5;
+  std::vector<float> X(static_cast<size_t>(n) * K), Yb(static_cast<size_t>(n) * M),
+      Ys(static_cast<size_t>(n) * M);
+  for (int i = 0; i < n * K; ++i) X[i] = 0.01f * static_cast<float>((i % 11) - 5);
+  for (int t = 0; t < n; ++t) llmoc::hal::gemm_int4(X.data() + t * K, W, Ys.data() + t * M);
+  EXPECT_TRUE(llmoc::hal::cuda::try_gemm_int4_batch(X.data(), n, W, Yb.data()));
+  for (int i = 0; i < n * M; ++i) {
+    const float e = std::fabs(Yb[i] - Ys[i]);
+    EXPECT_TRUE(e < 1e-3f * (1.f + std::fabs(Ys[i])));
+  }
+  llmoc::hal::cuda::disable();
 }

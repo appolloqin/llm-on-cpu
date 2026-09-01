@@ -1,6 +1,6 @@
 #pragma once
 // llm-on-cpu :: sched/mode_controller.h
-// Resolves pure_cpu | hybrid_gpu | pure_gpu | auto (+ device mesh G8)
+// Resolves pure_cpu | hybrid_gpu | pure_gpu | auto | layer_stream (+ device mesh G8)
 
 #include <string>
 

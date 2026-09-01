@@ -10,6 +10,7 @@
 #include "model/mtp_head.h"
 #include "model/tokenizer_hf.h"
 #include "model/vision/qwen_vision_encoder.h"
+#include "weights/layer_stream.h"
 #include "weights/qlwc_store.h"
 
 namespace llmoc::model {
@@ -40,6 +41,11 @@ struct Qwen35Int4Config {
 class Qwen35Int4Model final : public ICausalLM {
  public:
   void load(qlwc::QlwcStore* store, const std::string& hf_config_json_path);
+  // 层流式：store 须 lazy open；loader 负责 pin/prefetch/release
+  void enable_layer_stream(wt::ILayerStreamLoader* loader);
+  bool layer_stream_enabled() const { return streamer_ != nullptr; }
+  // hybrid/pure_gpu：将层投影 INT4 反量化上传 VRAM（跳过 embed/lm_head）
+  void warm_gpu_int4_weights();
   const CausalLmMeta& meta() const override { return meta_; }
   void init_cache(SessionCache& cache, int max_seq) const override;
   void forward(const std::vector<int32_t>& tokens, SessionCache& cache, std::vector<float>& logits,
@@ -123,6 +129,8 @@ class Qwen35Int4Model final : public ICausalLM {
                          float* h_out, double* ms_lin = nullptr, double* ms_full = nullptr);
   void prepare_mrope_positions(const std::vector<int32_t>& tokens, bool is_prefill);
   void build_layer_packs();
+  void fill_layer_pack(int L);
+  void build_global_packs();
   MtpWeightAccess mtp_access();
 
   static bool mtp_has_cb(void* ctx, const std::string& name);
@@ -131,6 +139,9 @@ class Qwen35Int4Model final : public ICausalLM {
   static const uint16_t* mtp_pass_cb(void* ctx, const std::string& name);
   static void mtp_embed_cb(void* ctx, int32_t token, float* out);
   static float mtp_embed_dot_cb(void* ctx, const float* h, int32_t token);
+
+  wt::ILayerStreamLoader* streamer_ = nullptr;
+  int stream_window_ = 2;
 
   std::vector<float> last_hidden_;
   std::vector<float> last_logits_;

@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "hal/cpu_ops.h"
+#include "hal/cuda_backend.h"
 #include <nlohmann/json.hpp>
 #include "common/log.h"
 #include "model/mtp_head.h"
@@ -124,6 +125,35 @@ void Qwen35Model::load(wt::WeightManager* wm, const std::string& hf_config_json_
            cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.n_kv, cfg_.head_dim, cfg_.intermediate,
            cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
            lm_head_name_.empty() ? "(tied embed)" : lm_head_name_.c_str());
+}
+
+void Qwen35Model::warm_gpu_bf16_weights() {
+  if (!hal::cuda::enabled() || !wm_) return;
+  const bool is_f16 = (wd_ == hal::WDtype::kF16);
+  int n_ok = 0, n_skip = 0;
+  for (const auto& t : wm_->header().tensors) {
+    if (t.shape.size() < 2) continue;
+    if (t.name.find("embed") != std::string::npos || t.name.find("lm_head") != std::string::npos)
+      continue;
+    const int M = static_cast<int>(t.shape[0]);
+    const int K = static_cast<int>(t.shape[1]);
+    if (M <= 0 || K <= 0 || M >= 65536) {
+      ++n_skip;
+      continue;
+    }
+    try {
+      const uint16_t* W = w(t.name);
+      if (hal::cuda::prefetch_w16(W, M, K, is_f16))
+        ++n_ok;
+      else
+        ++n_skip;
+    } catch (...) {
+      ++n_skip;
+    }
+  }
+  LOG_INFO("Qwen35: warm_gpu_bf16 ok=%d skip=%d used=%.2fGiB", n_ok, n_skip,
+           hal::cuda::vram_used() / double(1ull << 30));
+  hal::cuda::log_status();
 }
 
 void Qwen35Model::init_cache(SessionCache& cache, int max_seq) const {

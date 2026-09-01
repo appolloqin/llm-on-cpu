@@ -35,6 +35,8 @@ class WeightManager {
         std::vector<std::string> force_resident;
         uint64_t lru_budget_bytes = 256u << 20;  // 热专家区预算(D6 调拨器后接管)
         unsigned io_workers = 2;
+        // true：layers.* 作冷张量，按 get/LRU 窗口驻留（BF16 layer_stream）
+        bool stream_dense_layers = false;
     };
 
     void open(const io::Path& file, const Config& cfg);
@@ -48,6 +50,8 @@ class WeightManager {
     // 返回张量数据指针; 冷块自动拉取并进入 LRU。
     // 未知名字抛 std::runtime_error。
     const std::vector<uint8_t>& get(const std::string& tensor_name);
+    // 释放匹配前缀的已装非常驻张量（layer_stream 滑窗）
+    void release_prefix(const std::string& prefix);
 
     const lwc::Header& header() const { return hdr_; }
     WmStats stats() const { return st_; }

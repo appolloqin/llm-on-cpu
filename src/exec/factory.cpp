@@ -18,6 +18,10 @@ std::unique_ptr<contracts::IExecBackend> make_exec(contracts::ExecMode mode,
   if (mode == ExecMode::kPureCpu) {
     return std::make_unique<cpu::ExecCpu>();
   }
+  if (mode == ExecMode::kLayerStream) {
+    // S0: backend 与 pure_cpu 相同占位；真正层窗口在 WeightSource（S1），forward（S2）
+    return std::make_unique<cpu::ExecCpu>();
+  }
   if (mode == ExecMode::kHybridGpu) {
     if (opt.mesh.world_size > 1 && opt.mesh.nccl_ok == false && opt.mesh.ids.size() > 1) {
       // Mesh resolver should have failed already; belt-and-suspenders.

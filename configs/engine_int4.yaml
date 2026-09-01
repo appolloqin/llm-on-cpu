@@ -1,5 +1,6 @@
 # INT4/QLWC 专用配置（不影响 configs/engine.yaml BF16 路径）
-# 执行模式说明同 configs/engine.yaml（pure_cpu | hybrid_gpu | pure_gpu）
+# 执行模式说明同 configs/engine.yaml（pure_cpu | hybrid_gpu | pure_gpu | auto | layer_stream）
+# layer_stream：装不下整模时按层加载（可运行优先）；见 docs/DESIGN_LAYER_STREAM.md
 model:
   path: models/Qwen3.5-4B.int4.qlwc
   dtype: int4
@@ -8,16 +9,24 @@ model:
   # tokenizer_dir 默认由 path 推: models/Qwen3.5-4B.int4-hf —— 请显式指定原 HF 旁路:
   tokenizer_dir: models/Qwen3.5-4B-hf
 
-# pure_cpu（默认）| hybrid_gpu / pure_gpu / auto
-# INT4 核始终在 CPU。HX 上 OMP=8/16 ≈10 tok/s；OMP=12/24 会掉到 ~5 tok/s（勿手动设 12）
+# pure_cpu（默认）| hybrid_gpu / pure_gpu / auto | layer_stream
+# hybrid/pure_gpu：层投影 INT4→FP32 缓存 + cuBLAS（需 CUDA；设 gpu_vram_gb）；lm_head 仍 CPU INT4
+# layer_stream：按层窗口加载（可运行优先）；auto 且模型 > dram_hot_gb 时自动切 layer_stream
+# HX 上 pure_cpu OMP=8/16 ≈10 tok/s；OMP=12/24 会掉到 ~5 tok/s（勿手动设 12）
 # 未设 OMP_NUM_THREADS 时 server 自动 cap 到 8；勿设 32（start_int4 已改为 8）
 # 笔记本长跑会因散热在 ~5 与 ~10 tok/s 间波动；验收用 bench_decode_tps --new 256 --warm 1
 mode: pure_cpu
+
+layer_stream:
+  window_layers: 2
+  device: cpu          # cpu | cuda:0（可选 VRAM 镜像；计算仍以主机 INT4 为主）
+  max_window_mb: 0     # 0=不限制；可运行门禁可设例如 2048
+  auto: true           # mode=auto 时权重超 DRAM 热区 → layer_stream
 tiers:
   dram_hot_gb: 6
   kv_pool_gb: 1
   prefetch_buf_gb: 0.5
-  # gpu_vram_gb: 16
+  # gpu_vram_gb: 8   # hybrid/pure_gpu：FP32 投影缓存预算（4B 全层约需十余 GiB；不足则部分回落 CPU）
 
 decode:
   spec_k: 3

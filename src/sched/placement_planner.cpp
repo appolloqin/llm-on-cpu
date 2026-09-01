@@ -36,6 +36,16 @@ PlacementPlan PlacementPlanner::solve(ExecMode mode, const Config& cfg,
     return plan;
   }
 
+  if (mode == ExecMode::kLayerStream) {
+    plan.vram_attn_reserve = 0;
+    plan.vram_expert_budget = 0;
+    plan.dram_experts = experts;
+    plan.summary =
+        "layer_stream: pin window_layers only (run-first; see docs/DESIGN_LAYER_STREAM.md); "
+        "forward wiring = S1+";
+    return plan;
+  }
+
   double frac = cfg.attn_reserve_frac;
   if (frac < 0.1) frac = 0.1;
   if (frac > 0.9) frac = 0.9;
@@ -94,6 +104,12 @@ PlacementPlan PlacementPlanner::solve_active(ExecMode mode, const Config& cfg,
 
   if (mode == ExecMode::kPureCpu) {
     plan.summary = "pure_cpu active-set: DRAM/NVMe experts";
+    return plan;
+  }
+
+  if (mode == ExecMode::kLayerStream) {
+    plan.summary =
+        "layer_stream active-set: layer window only (DESIGN_LAYER_STREAM); not full residency";
     return plan;
   }
 

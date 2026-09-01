@@ -3,12 +3,15 @@
 
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "common/log.h"
+#include "hal/int4_ops.h"
+#include "hal/quant_views.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -72,7 +75,11 @@ void* g_dx = nullptr;
 void* g_dy = nullptr;
 int g_cap_k = 0;
 int g_cap_m = 0;
+int g_cap_n = 0;  // batch columns for X/Y
 std::unordered_map<const void*, CacheEntry> g_cache;
+
+// Skip lm_head / vocab-scale uploads (stay on CPU INT4).
+constexpr int kMaxGpuInt4Rows = 65536;
 
 #if defined(_WIN32)
 void* load_lib(const char* n) { return reinterpret_cast<void*>(LoadLibraryA(n)); }
@@ -172,32 +179,128 @@ bool load_apis(std::string& err) {
   return true;
 }
 
-bool ensure_xy(int M, int K) {
-  if (K > g_cap_k || !g_dx) {
+bool ensure_xy(int M, int K, int n = 1) {
+  if (n < 1) n = 1;
+  const int need_k = K * n;
+  const int need_m = M * n;
+  if (need_k > g_cap_k || !g_dx) {
     if (g_dx) g_api.cudaFree(g_dx);
-    if (g_api.cudaMalloc(&g_dx, sizeof(float) * static_cast<size_t>(K)) != kCudaSuccess) return false;
-    g_cap_k = K;
+    if (g_api.cudaMalloc(&g_dx, sizeof(float) * static_cast<size_t>(need_k)) != kCudaSuccess)
+      return false;
+    g_cap_k = need_k;
   }
-  if (M > g_cap_m || !g_dy) {
+  if (need_m > g_cap_m || !g_dy) {
     if (g_dy) g_api.cudaFree(g_dy);
-    if (g_api.cudaMalloc(&g_dy, sizeof(float) * static_cast<size_t>(M)) != kCudaSuccess) return false;
-    g_cap_m = M;
+    if (g_api.cudaMalloc(&g_dy, sizeof(float) * static_cast<size_t>(need_m)) != kCudaSuccess)
+      return false;
+    g_cap_m = need_m;
   }
+  g_cap_n = n;
   return true;
 }
 
 bool gemm_dev(const float* d_W, const float* x, float* y, int M, int K) {
-  if (!ensure_xy(M, K)) return false;
+  if (!ensure_xy(M, K, 1)) return false;
   if (g_api.cudaMemcpy(g_dx, x, sizeof(float) * static_cast<size_t>(K), kCudaMemcpyH2D) !=
       kCudaSuccess)
     return false;
   const float alpha = 1.f, beta = 0.f;
   if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, M, 1, K, &alpha, d_W, K,
-                        reinterpret_cast<float*>(g_dx), 1, &beta, reinterpret_cast<float*>(g_dy),
+                        reinterpret_cast<float*>(g_dx), K, &beta, reinterpret_cast<float*>(g_dy),
                         M) != kCublasSuccess)
     return false;
   return g_api.cudaMemcpy(y, g_dy, sizeof(float) * static_cast<size_t>(M), kCudaMemcpyD2H) ==
          kCudaSuccess;
+}
+
+// Y[n,M] row-major = W[M,K] @ X[n,K]^T per-row; X row-major ≡ col-major K×n
+bool gemm_dev_batch(const float* d_W, const float* X, int n, float* Y, int M, int K) {
+  if (n <= 1) return gemm_dev(d_W, X, Y, M, K);
+  if (!ensure_xy(M, K, n)) return false;
+  if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(n) * K, kCudaMemcpyH2D) !=
+      kCudaSuccess)
+    return false;
+  const float alpha = 1.f, beta = 0.f;
+  if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, M, n, K, &alpha, d_W, K,
+                        reinterpret_cast<float*>(g_dx), K, &beta, reinterpret_cast<float*>(g_dy),
+                        M) != kCublasSuccess)
+    return false;
+  return g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(n) * M, kCudaMemcpyD2H) ==
+         kCudaSuccess;
+}
+
+// Returns cached d_W or nullptr if cannot upload.
+const float* ensure_int4_device(const qlwc::Int4View& W) {
+  if (!g_enabled || !W.qweight || W.M <= 0 || W.K <= 0) return nullptr;
+  if (W.M >= kMaxGpuInt4Rows) return nullptr;
+  auto it = g_cache.find(W.qweight);
+  if (it != g_cache.end()) {
+    if (it->second.M != W.M || it->second.K != W.K) return nullptr;
+    return reinterpret_cast<const float*>(it->second.d_W);
+  }
+  const size_t nbytes = sizeof(float) * static_cast<size_t>(W.M) * W.K;
+  if (g_budget > 0 && g_used + nbytes > g_budget) return nullptr;
+  std::vector<float> host(static_cast<size_t>(W.M) * W.K);
+  try {
+    llmoc::hal::dequant_int4_matrix(W, host.data());
+  } catch (...) {
+    return nullptr;
+  }
+  void* dW = nullptr;
+  if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(dW);
+    return nullptr;
+  }
+  CacheEntry e;
+  e.d_W = dW;
+  e.M = W.M;
+  e.K = W.K;
+  e.bytes = nbytes;
+  g_cache[W.qweight] = e;
+  g_used += nbytes;
+  return reinterpret_cast<const float*>(dW);
+}
+
+const float* ensure_fp32_matrix(const void* key, int M, int K,
+                                const std::function<void(float*)>& fill) {
+  if (!g_enabled || !key || M <= 0 || K <= 0) return nullptr;
+  if (M >= kMaxGpuInt4Rows) return nullptr;
+  auto it = g_cache.find(key);
+  if (it != g_cache.end()) {
+    if (it->second.M != M || it->second.K != K) return nullptr;
+    return reinterpret_cast<const float*>(it->second.d_W);
+  }
+  const size_t nbytes = sizeof(float) * static_cast<size_t>(M) * K;
+  if (g_budget > 0 && g_used + nbytes > g_budget) return nullptr;
+  std::vector<float> host(static_cast<size_t>(M) * K);
+  try {
+    fill(host.data());
+  } catch (...) {
+    return nullptr;
+  }
+  void* dW = nullptr;
+  if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(dW);
+    return nullptr;
+  }
+  CacheEntry e;
+  e.d_W = dW;
+  e.M = M;
+  e.K = K;
+  e.bytes = nbytes;
+  g_cache[key] = e;
+  g_used += nbytes;
+  return reinterpret_cast<const float*>(dW);
+}
+
+const float* ensure_awq_device(const AwqView& W) {
+  return ensure_fp32_matrix(W.qweight, W.M, W.K, [&](float* out) { dequant_awq_matrix(W, out); });
+}
+
+const float* ensure_nvfp4_device(const Nvfp4View& W) {
+  return ensure_fp32_matrix(W.qweight, W.M, W.K, [&](float* out) { dequant_nvfp4_matrix(W, out); });
 }
 
 }  // namespace
@@ -302,7 +405,7 @@ void disable() {
   if (g_dx) g_api.cudaFree(g_dx);
   if (g_dy) g_api.cudaFree(g_dy);
   g_dx = g_dy = nullptr;
-  g_cap_k = g_cap_m = 0;
+  g_cap_k = g_cap_m = g_cap_n = 0;
   if (g_cublas && g_api.cublasDestroy) g_api.cublasDestroy(g_cublas);
   g_cublas = nullptr;
   g_used = 0;
@@ -317,6 +420,7 @@ bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, boo
   if (it == g_cache.end()) {
     const size_t nbytes = sizeof(float) * static_cast<size_t>(M) * K;
     if (g_budget > 0 && g_used + nbytes > g_budget) return false;
+    if (M >= kMaxGpuInt4Rows) return false;
     std::vector<float> host(static_cast<size_t>(M) * K);
     for (size_t i = 0; i < host.size(); ++i)
       host[i] = is_f16 ? f16_to_f32(W[i]) : bf16_to_f32(W[i]);
@@ -337,6 +441,63 @@ bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, boo
   }
   if (it->second.M != M || it->second.K != K) return false;
   return gemm_dev(reinterpret_cast<const float*>(it->second.d_W), x, y, M, K);
+}
+
+bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16) {
+  if (!g_enabled || !W || M <= 0 || K <= 0) return false;
+  std::vector<float> dummy(static_cast<size_t>(K), 0.f);
+  std::vector<float> out(static_cast<size_t>(M));
+  return try_gemm_w16(dummy.data(), W, out.data(), M, K, is_f16);
+}
+
+bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
+  if (!g_enabled || !x || !y) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  const float* dW = ensure_int4_device(W);
+  if (!dW) return false;
+  return gemm_dev(dW, x, y, W.M, W.K);
+}
+
+bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
+  if (!g_enabled || !X || !Y || n <= 0) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  const float* dW = ensure_int4_device(W);
+  if (!dW) return false;
+  return gemm_dev_batch(dW, X, n, Y, W.M, W.K);
+}
+
+bool prefetch_int4_weight(const qlwc::Int4View& W) {
+  if (!g_enabled) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return ensure_int4_device(W) != nullptr;
+}
+
+bool try_gemm_awq(const float* x, const AwqView& W, float* y) {
+  if (!g_enabled || !x || !y) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  const float* dW = ensure_awq_device(W);
+  if (!dW) return false;
+  return gemm_dev(dW, x, y, W.M, W.K);
+}
+
+bool prefetch_awq_weight(const AwqView& W) {
+  if (!g_enabled) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return ensure_awq_device(W) != nullptr;
+}
+
+bool try_gemm_nvfp4(const float* x, const Nvfp4View& W, float* y) {
+  if (!g_enabled || !x || !y) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  const float* dW = ensure_nvfp4_device(W);
+  if (!dW) return false;
+  return gemm_dev(dW, x, y, W.M, W.K);
+}
+
+bool prefetch_nvfp4_weight(const Nvfp4View& W) {
+  if (!g_enabled) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return ensure_nvfp4_device(W) != nullptr;
 }
 
 void log_status() {

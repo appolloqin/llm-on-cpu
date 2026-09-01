@@ -34,6 +34,8 @@ class Qwen35Model final : public ICausalLM {
  public:
   void load(wt::WeightManager* wm, const std::string& hf_config_json_path);
   const Qwen35Config& config() const { return cfg_; }
+  // hybrid/pure_gpu：投影 BF16 → VRAM FP32 缓存（跳过 vocab 级）
+  void warm_gpu_bf16_weights();
 
   const CausalLmMeta& meta() const override { return meta_; }
   void init_cache(SessionCache& cache, int max_seq) const override;

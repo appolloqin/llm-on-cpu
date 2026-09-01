@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "hal/cpu_ops.h"
+#include "hal/cuda_backend.h"
 #include "hal/int4_ops.h"
 #include "model/mtp_head.h"
 #include "model/tokenizer_hf.h"
@@ -182,50 +183,24 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
 
 void Qwen35Int4Model::build_layer_packs() {
   layers_.assign(cfg_.layers, {});
-  const int nk = cfg_.linear_num_k, nv = cfg_.linear_num_v;
-  const int dk = cfg_.linear_dk, dv = cfg_.linear_dv;
-  const int conv_dim = nk * dk * 2 + nv * dv;
-  for (int L = 0; L < cfg_.layers; ++L) {
-    auto& lp = layers_[L];
-    const std::string base = prefix_ + "layers." + std::to_string(L) + ".";
-    lp.is_full = (cfg_.layer_types[L] == "full_attention");
-    lp.ln1 = pass(base + "input_layernorm.weight");
-    lp.ln2 = pass(base + "post_attention_layernorm.weight");
-    lp.wgate = store_->get_int4(base + "mlp.gate_proj.weight");
-    lp.wup = store_->get_int4(base + "mlp.up_proj.weight");
-    lp.wdown = store_->get_int4(base + "mlp.down_proj.weight");
-    if (lp.is_full) {
-      lp.wq = store_->get_int4(base + "self_attn.q_proj.weight");
-      lp.wk = store_->get_int4(base + "self_attn.k_proj.weight");
-      lp.wv = store_->get_int4(base + "self_attn.v_proj.weight");
-      lp.wo = store_->get_int4(base + "self_attn.o_proj.weight");
-      lp.qn = pass(base + "self_attn.q_norm.weight");
-      lp.kn = pass(base + "self_attn.k_norm.weight");
-    } else {
-      lp.wqkv = store_->get_int4(base + "linear_attn.in_proj_qkv.weight");
-      lp.wz = store_->get_int4(base + "linear_attn.in_proj_z.weight");
-      lp.wb = store_->get_int4(base + "linear_attn.in_proj_b.weight");
-      lp.wa = store_->get_int4(base + "linear_attn.in_proj_a.weight");
-      lp.wout = store_->get_int4(base + "linear_attn.out_proj.weight");
-      lp.nrm = pass(base + "linear_attn.norm.weight");
-      const uint16_t* A_log = pass(base + "linear_attn.A_log");
-      const uint16_t* dt_bias = pass(base + "linear_attn.dt_bias");
-      const uint16_t* conv_w = pass(base + "linear_attn.conv1d.weight");
-      lp.A_log_f.resize(nv);
-      lp.dt_bias_f.resize(nv);
-      for (int h = 0; h < nv; ++h) {
-        lp.A_log_f[h] = hal::load_w(A_log + h, pass_wd_);
-        lp.dt_bias_f[h] = hal::load_w(dt_bias + h, pass_wd_);
-      }
-      lp.conv_w_f.resize(static_cast<size_t>(conv_dim) * cfg_.conv_k);
-      for (int c = 0; c < conv_dim; ++c)
-        for (int k = 0; k < cfg_.conv_k; ++k)
-          lp.conv_w_f[c * cfg_.conv_k + k] =
-              hal::load_w(conv_w + c * cfg_.conv_k + k, pass_wd_);
-    }
+  if (store_->lazy()) {
+    // 层窗口路径：仅装全局；各层在 pin 后 fill_layer_pack
+    build_global_packs();
+    LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d (layer_stream lazy)",
+             cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v,
+             cfg_.tie_embeddings ? 1 : 0);
+    return;
   }
+  for (int L = 0; L < cfg_.layers; ++L) fill_layer_pack(L);
+  build_global_packs();
+  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d", cfg_.layers, cfg_.hidden,
+           cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0);
+}
+
+void Qwen35Int4Model::build_global_packs() {
   const std::string emb_name =
       prefix_.empty() ? "embedding.weight" : prefix_ + "embed_tokens.weight";
+  if (store_->lazy()) store_->ensure(emb_name);
   emb_is_int4_ = is_int4(emb_name);
   if (emb_is_int4_) emb_int4_ = store_->get_int4(emb_name);
   else emb_pass_ = pass(emb_name);
@@ -240,6 +215,7 @@ void Qwen35Int4Model::build_layer_packs() {
     else
       throw std::runtime_error(
           "tie_word_embeddings=false but lm_head.weight missing in QLWC");
+    if (store_->lazy()) store_->ensure(lm_name);
     lm_is_int4_ = is_int4(lm_name);
     if (lm_is_int4_) lm_int4_ = store_->get_int4(lm_name);
     else lm_pass_ = pass(lm_name);
@@ -249,9 +225,63 @@ void Qwen35Int4Model::build_layer_packs() {
     lm_pass_ = emb_pass_;
   }
 
-  final_norm_ = pass(prefix_ + "norm.weight");
-  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d", cfg_.layers, cfg_.hidden,
-           cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0);
+  const std::string fn = prefix_ + "norm.weight";
+  if (store_->lazy()) store_->ensure(fn);
+  final_norm_ = pass(fn);
+}
+
+void Qwen35Int4Model::fill_layer_pack(int L) {
+  auto& lp = layers_[L];
+  const int nk = cfg_.linear_num_k, nv = cfg_.linear_num_v;
+  const int dk = cfg_.linear_dk, dv = cfg_.linear_dv;
+  const int conv_dim = nk * dk * 2 + nv * dv;
+  const std::string base = prefix_ + "layers." + std::to_string(L) + ".";
+  lp = {};
+  lp.is_full = (cfg_.layer_types[L] == "full_attention");
+  lp.ln1 = pass(base + "input_layernorm.weight");
+  lp.ln2 = pass(base + "post_attention_layernorm.weight");
+  lp.wgate = store_->get_int4(base + "mlp.gate_proj.weight");
+  lp.wup = store_->get_int4(base + "mlp.up_proj.weight");
+  lp.wdown = store_->get_int4(base + "mlp.down_proj.weight");
+  if (lp.is_full) {
+    lp.wq = store_->get_int4(base + "self_attn.q_proj.weight");
+    lp.wk = store_->get_int4(base + "self_attn.k_proj.weight");
+    lp.wv = store_->get_int4(base + "self_attn.v_proj.weight");
+    lp.wo = store_->get_int4(base + "self_attn.o_proj.weight");
+    lp.qn = pass(base + "self_attn.q_norm.weight");
+    lp.kn = pass(base + "self_attn.k_norm.weight");
+  } else {
+    lp.wqkv = store_->get_int4(base + "linear_attn.in_proj_qkv.weight");
+    lp.wz = store_->get_int4(base + "linear_attn.in_proj_z.weight");
+    lp.wb = store_->get_int4(base + "linear_attn.in_proj_b.weight");
+    lp.wa = store_->get_int4(base + "linear_attn.in_proj_a.weight");
+    lp.wout = store_->get_int4(base + "linear_attn.out_proj.weight");
+    lp.nrm = pass(base + "linear_attn.norm.weight");
+    const uint16_t* A_log = pass(base + "linear_attn.A_log");
+    const uint16_t* dt_bias = pass(base + "linear_attn.dt_bias");
+    const uint16_t* conv_w = pass(base + "linear_attn.conv1d.weight");
+    lp.A_log_f.resize(nv);
+    lp.dt_bias_f.resize(nv);
+    for (int h = 0; h < nv; ++h) {
+      lp.A_log_f[h] = hal::load_w(A_log + h, pass_wd_);
+      lp.dt_bias_f[h] = hal::load_w(dt_bias + h, pass_wd_);
+    }
+    lp.conv_w_f.resize(static_cast<size_t>(conv_dim) * cfg_.conv_k);
+    for (int c = 0; c < conv_dim; ++c)
+      for (int k = 0; k < cfg_.conv_k; ++k)
+        lp.conv_w_f[c * cfg_.conv_k + k] =
+            hal::load_w(conv_w + c * cfg_.conv_k + k, pass_wd_);
+  }
+}
+
+void Qwen35Int4Model::enable_layer_stream(wt::ILayerStreamLoader* loader) {
+  streamer_ = loader;
+  stream_window_ = 2;
+  if (streamer_) {
+    auto st = streamer_->stats();
+    (void)st;
+    LOG_INFO("Qwen35Int4: layer_stream enabled");
+  }
 }
 
 void Qwen35Int4Model::init_cache(SessionCache& cache, int max_seq) const {
@@ -264,12 +294,16 @@ bool Qwen35Int4Model::is_int4(const std::string& name) const {
 }
 
 const uint16_t* Qwen35Int4Model::pass(const std::string& name) {
+  if (store_->lazy()) store_->ensure(name);
   return store_->get_pass(name).data;
 }
 
 void Qwen35Int4Model::gemm_w(const float* x, const std::string& wname, float* y, int M, int K) {
   if (is_int4(wname)) {
-    hal::gemm_int4(x, store_->get_int4(wname), y);
+    if (store_->lazy()) store_->ensure(wname);
+    const qlwc::Int4View W = store_->get_int4(wname);
+    if (hal::cuda::enabled() && hal::cuda::try_gemm_int4(x, W, y)) return;
+    hal::gemm_int4(x, W, y);
   } else {
     (void)M;
     (void)K;
@@ -278,15 +312,51 @@ void Qwen35Int4Model::gemm_w(const float* x, const std::string& wname, float* y,
 }
 
 void Qwen35Int4Model::gemm_view(const float* x, const qlwc::Int4View& W, float* y) {
+  if (hal::cuda::enabled() && hal::cuda::try_gemm_int4(x, W, y)) return;
   hal::gemm_int4(x, W, y);
 }
 
 void Qwen35Int4Model::gemm_view_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
+  if (n <= 0) return;
+  if (hal::cuda::enabled() && hal::cuda::try_gemm_int4_batch(X, n, W, Y)) return;
   if (n <= 1) {
     if (n == 1) hal::gemm_int4(X, W, Y);
     return;
   }
   hal::gemm_int4_batch(X, n, W, Y);
+}
+
+void Qwen35Int4Model::warm_gpu_int4_weights() {
+  if (!hal::cuda::enabled()) return;
+  int n_ok = 0, n_fail = 0;
+  auto try_one = [&](const qlwc::Int4View& W) {
+    if (!W.qweight || W.M <= 0 || W.K <= 0) return;
+    if (hal::cuda::prefetch_int4_weight(W))
+      ++n_ok;
+    else
+      ++n_fail;
+  };
+  for (const auto& lp : layers_) {
+    if (lp.is_full) {
+      try_one(lp.wq);
+      try_one(lp.wk);
+      try_one(lp.wv);
+      try_one(lp.wo);
+    } else {
+      try_one(lp.wqkv);
+      try_one(lp.wz);
+      try_one(lp.wb);
+      try_one(lp.wa);
+      try_one(lp.wout);
+    }
+    try_one(lp.wgate);
+    try_one(lp.wup);
+    try_one(lp.wdown);
+  }
+  LOG_INFO("Qwen35Int4: warm_gpu_int4 ok=%d fail/budget=%d used=%.2fGiB / budget=%.2fGiB", n_ok,
+           n_fail, hal::cuda::vram_used() / double(1ull << 30),
+           hal::cuda::vram_budget() / double(1ull << 30));
+  hal::cuda::log_status();
 }
 
 void Qwen35Int4Model::embed(int32_t token, float* out) {
@@ -678,6 +748,11 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
 
   double lin = 0, full = 0;
   for (int L = 0; L < cfg_.layers; ++L) {
+    if (streamer_) {
+      if (L + 1 < cfg_.layers) streamer_->prefetch_layer(L + 1);
+      streamer_->pin_layer(L);
+      fill_layer_pack(L);
+    }
     if (kProf && ms_lin && ms_full) {
       const auto a = Clock::now();
       layer_forward(L, x, cache, pos_start, n, is_prefill);
@@ -690,6 +765,7 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
     } else {
       layer_forward(L, x, cache, pos_start, n, is_prefill);
     }
+    if (streamer_ && L + 1 >= stream_window_) streamer_->release_layer(L + 1 - stream_window_);
   }
   if (ms_lin) *ms_lin = lin;
   if (ms_full) *ms_full = full;
@@ -794,6 +870,11 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
   double ms_full = 0, ms_lin = 0;
   prepare_mrope_positions(tokens, is_prefill);
   for (int L = 0; L < cfg_.layers; ++L) {
+    if (streamer_) {
+      if (L + 1 < cfg_.layers) streamer_->prefetch_layer(L + 1);
+      streamer_->pin_layer(L);
+      fill_layer_pack(L);
+    }
     if (kProf) {
       const auto a = Clock::now();
       layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
@@ -804,6 +885,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
     } else {
       layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
     }
+    if (streamer_ && L + 1 >= stream_window_) streamer_->release_layer(L + 1 - stream_window_);
   }
 
   Clock::time_point t_head0;

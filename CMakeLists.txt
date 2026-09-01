@@ -45,6 +45,7 @@ add_library(llmoc_weights STATIC
   src/weights/io_engine.cpp
   src/weights/weight_manager.cpp
   src/weights/prefetch_pipeline.cpp
+  src/weights/layer_stream.cpp
   src/common/platform.cpp
   src/common/engine_config.cpp
   src/common/log.cpp
@@ -53,6 +54,7 @@ add_library(llmoc_weights STATIC
   src/hal/cpu_ops.cpp
   src/hal/cuda_backend.cpp
   src/hal/int4_ops.cpp
+  src/hal/quant_dequant.cpp
   src/sched/mode_controller.cpp
   src/sched/placement_planner.cpp
   src/contracts/device_mesh.cpp
@@ -182,6 +184,7 @@ add_executable(llmoc_unit_tests
   tests/unit/test_main.cpp
   tests/unit/test_lwc.cpp
   tests/unit/test_weight_manager.cpp
+  tests/unit/test_layer_stream.cpp
   tests/unit/test_prefetch_pipeline.cpp
   tests/unit/test_spec_decode.cpp
   tests/unit/test_tokenizer.cpp
@@ -191,6 +194,8 @@ add_executable(llmoc_unit_tests
   tests/unit/test_model_spec.cpp
   tests/unit/test_m5_mode.cpp
   tests/unit/test_exec_mesh.cpp
+  tests/unit/test_gpu_quant_gemm.cpp
+  tests/unit/test_ds_kimi_stub.cpp
 )
 target_link_libraries(llmoc_unit_tests PRIVATE llmoc_weights llmoc_model)
 
@@ -254,12 +259,32 @@ target_link_libraries(llmoc_server_glm PRIVATE llmoc_glm llmoc_server_lib)
 add_executable(make_fake_glmq tools/glm/make_fake_glmq.cpp)
 target_link_libraries(make_fake_glmq PRIVATE llmoc_glm)
 
+# ---------- DeepSeek / Kimi stubs ----------
+add_library(llmoc_family_stubs STATIC
+  src/families/deepseek_v4/ds_stub_model.cpp
+  src/families/kimi_k3/kimi_stub_model.cpp
+)
+target_include_directories(llmoc_family_stubs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(llmoc_family_stubs PUBLIC llmoc_weights llmoc_model llmoc_glm)
+
+add_executable(llmoc_server_ds src/server/main_ds.cpp)
+target_link_libraries(llmoc_server_ds PRIVATE llmoc_family_stubs llmoc_server_lib)
+
+add_executable(llmoc_server_kimi src/server/main_kimi.cpp)
+target_link_libraries(llmoc_server_kimi PRIVATE llmoc_family_stubs llmoc_server_lib)
+
+add_executable(make_fake_ds tools/make_fake_ds/main.cpp)
+target_link_libraries(make_fake_ds PRIVATE llmoc_family_stubs)
+
+add_executable(make_fake_kimi tools/make_fake_kimi/main.cpp)
+target_link_libraries(make_fake_kimi PRIVATE llmoc_family_stubs)
+
 # GLM 单测编入同一 unit 可执行文件，但源码独立；不改现有 test_*.cpp
 target_sources(llmoc_unit_tests PRIVATE
   tests/unit/test_glm_mode.cpp
   tests/unit/test_glm_forward.cpp
 )
-target_link_libraries(llmoc_unit_tests PRIVATE llmoc_glm)
+target_link_libraries(llmoc_unit_tests PRIVATE llmoc_glm llmoc_family_stubs)
 
 if(MSVC)
   target_compile_options(m0_isa PRIVATE /arch:AVX2)

@@ -42,4 +42,6 @@ echo.
 echo OK. Engine weights: models\%SHORT%.int4.qlwc
 echo     Tokenizer keep: models\%SHORT%-hf\
 echo Next: start_int4.cmd
+echo     Modes: edit configs\engine_int4.yaml ^(pure_cpu^|hybrid_gpu^|pure_gpu^|auto^|layer_stream^)
+echo     GPU: uncomment tiers.gpu_vram_gb；MTP: start_int4.cmd configs\engine_int4_mtp.yaml
 exit /b 0

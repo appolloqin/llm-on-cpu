@@ -28,12 +28,7 @@ size_t GlmCudaContext::vram_used() const { return llmoc::hal::cuda::vram_used();
 
 int GlmCudaContext::upload_bf16(const std::string& /*key*/, const uint16_t* W, int M, int K) {
   if (!ok_ || !W) return -1;
-  // Touch-cache via a dummy gemm path: try_gemm uploads on first use.
-  // Pre-upload: one zero-x gemm would allocate; skip — warm happens on first real gemm.
-  (void)M;
-  (void)K;
-  (void)W;
-  return llmoc::hal::cuda::enabled() ? 1 : -1;
+  return llmoc::hal::cuda::prefetch_w16(W, M, K, false) ? 1 : -1;
 }
 
 bool GlmCudaContext::gemm_bf16(const std::string& /*key*/, const float* x, const uint16_t* W_host,

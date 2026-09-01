@@ -148,6 +148,19 @@ Invoke-RestMethod http://127.0.0.1:15085/v1/chat/completions -Method Post -Conte
 - 配置里请显式设 `model.tokenizer_dir: models/Qwen3.5-4B-hf`（`.qlwc` 名无法从 path 推对 HF 旁路）。
 - 仅量化 2D 且 `K % group_size == 0` 的权重；norm / embedding 等透传原精度。
 - MoE INT4 尚未接线；当前面向 Qwen3.5 hybrid。
+- 模式：`configs/engine_int4.yaml` 的 `mode:` 支持 `pure_cpu|hybrid_gpu|pure_gpu|auto|layer_stream`；GPU 预算 `tiers.gpu_vram_gb`。发布包可用 `start_int4.cmd [config]`。
+
+### 4.1c DeepSeek / Kimi stub（冒烟，非真权重）
+
+```powershell
+.\build\msvc-x64\bin\make_fake_ds.exe models\fake_ds.dskq
+.\build\msvc-x64\bin\llmoc_server_ds.exe --config configs\engine_ds_nvfp4.yaml
+# 或发布包: download_ds.cmd && start_ds.cmd   （端口 15086）
+
+.\build\msvc-x64\bin\make_fake_kimi.exe models\fake_kimi.kimiq
+.\build\msvc-x64\bin\llmoc_server_kimi.exe --config configs\engine_kimi_hybrid.yaml
+# 单卡 pure_gpu 会自动降级 layer_stream；推荐 hybrid
+```
 
 ### 4.2 基准工具（权重/IO，非对话）
 

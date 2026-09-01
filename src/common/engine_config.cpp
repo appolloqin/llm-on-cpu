@@ -83,6 +83,12 @@ EngineConfig EngineConfig::load(const std::string& path) {
     else if (full == "model.mtp") cfg.mtp = val;
     else if (full == "model.tokenizer_dir") cfg.tokenizer_dir = val;
     else if (full == "mode") cfg.mode = val;
+    else if (full == "layer_stream.window_layers") cfg.layer_stream_window = std::stoi(val);
+    else if (full == "layer_stream.device") cfg.layer_stream_device = val;
+    else if (full == "layer_stream.max_window_mb")
+      cfg.layer_stream_max_window_mb = static_cast<uint64_t>(std::stoll(val));
+    else if (full == "layer_stream.auto")
+      cfg.auto_layer_stream = (val == "true" || val == "1" || val == "yes");
     else if (full == "tiers.dram_hot_gb") cfg.dram_hot_gb = std::stod(val);
     else if (full == "tiers.gpu_vram_gb") cfg.gpu_vram_gb = std::stod(val);
     else if (full == "tiers.kv_pool_gb") cfg.kv_pool_gb = std::stod(val);

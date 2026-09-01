@@ -1,0 +1,19 @@
+# DeepSeek-V4 stub (DS-STUB-v0) — latent MoE + NVFP4 experts
+model:
+  path: models/fake_ds.dskq
+  dtype: nvfp4
+  tokenizer_dir: models/Qwen3.5-4B-hf
+
+mode: hybrid_gpu
+
+tiers:
+  dram_hot_gb: 4
+  kv_pool_gb: 1
+  gpu_vram_gb: 8
+
+server:
+  port: 15086
+  api_key_env: LLMOC_API_KEY
+
+decode:
+  max_new_tokens: 256

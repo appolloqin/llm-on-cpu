@@ -15,6 +15,12 @@ struct EngineConfig {
   std::string mtp = "false";
   std::string tokenizer_dir;
   std::string mode = "pure_cpu";
+  // layer_stream 子配置
+  int layer_stream_window = 2;
+  std::string layer_stream_device = "cpu";
+  uint64_t layer_stream_max_window_mb = 0;  // 0 = 不限制
+  bool auto_layer_stream = true;           // mode=auto 且权重超 DRAM 预算 → layer_stream
+
   double dram_hot_gb = 16.0;
   double gpu_vram_gb = 0.0;
   double kv_pool_gb = 2.0;

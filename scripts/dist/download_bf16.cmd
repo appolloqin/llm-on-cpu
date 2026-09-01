@@ -37,4 +37,5 @@ echo.
 echo OK. Engine weights: models\%SHORT%.lwc
 echo     Tokenizer keep: models\%SHORT%-hf\
 echo Next: start_bf16.cmd
+echo     Modes: edit configs\engine.yaml ^(incl. layer_stream / hybrid_gpu + gpu_vram_gb^)
 exit /b 0

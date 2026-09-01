@@ -9,6 +9,8 @@ ExecMode resolve_mode(ExecMode requested, bool cuda_ok, bool* degraded, std::str
     return cuda_ok ? ExecMode::kHybridGpu : ExecMode::kPureCpu;
   }
   if (requested == ExecMode::kPureCpu) return ExecMode::kPureCpu;
+  // 层流式：不依赖 CUDA；算子设备由 LayerStreamConfig.device 决定（S1+）
+  if (requested == ExecMode::kLayerStream) return ExecMode::kLayerStream;
   if (requested == ExecMode::kPureGpu) {
     if (!cuda_ok) {
       if (err) *err = "mode=pure_gpu requires CUDA (cudart+cublas); refusing silent CPU fallback";
@@ -26,7 +28,7 @@ ExecMode resolve_mode(ExecMode requested, bool cuda_ok, bool* degraded, std::str
 bool resolve_mesh_for_mode(ExecMode mode, const contracts::DeviceMeshSpec& spec, int visible_gpus,
                            bool nccl_available, bool moe_family, contracts::DeviceMesh* out,
                            std::string* err) {
-  if (mode == ExecMode::kPureCpu) {
+  if (mode == ExecMode::kPureCpu || mode == ExecMode::kLayerStream) {
     if (!out) return false;
     out->ids = {0};
     out->world_size = 1;

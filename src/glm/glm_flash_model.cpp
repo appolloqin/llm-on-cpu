@@ -161,21 +161,31 @@ void GlmFlashModel::warm_gpu_attn_weights() {
   auto& cuda = hal::GlmCudaContext::instance();
   if (!cuda.available()) return;
   use_gpu_gemm_ = true;
-  int n_up = 0;
-  auto try_up = [&](const std::string& name) {
+  int n_up = 0, n_q = 0;
+  auto try_up_bf16 = [&](const std::string& name) {
     const auto* t = store_.find(name);
     if (!t || t->dtype != static_cast<uint16_t>(GlmqDtype::kBF16)) return;
     if (t->ndim < 2 || t->shape[0] == 0 || t->shape[1] == 0) return;
     const bool expert = name.find(".mlp.experts.") != std::string::npos;
-    // hybrid: attn/shared only; pure_gpu: experts also (active path on GPU)
     if (mode_ == ExecMode::kHybridGpu && expert) return;
-    if (cuda.upload_bf16(name, store_.bf16(name), static_cast<int>(t->shape[0]),
-                         static_cast<int>(t->shape[1])) >= 0)
-      ++n_up;
+    const int M = static_cast<int>(t->shape[0]), K = static_cast<int>(t->shape[1]);
+    if (llmoc::hal::cuda::prefetch_w16(store_.bf16(name), M, K, false)) ++n_up;
   };
-  try_up("embed_tokens.weight");
-  try_up("lm_head.weight");
-  try_up("norm.weight");
+  auto try_up_quant = [&](const std::string& name) {
+    if (mode_ != ExecMode::kPureGpu) return;
+    hal::AwqView awq;
+    if (store_.awq_view(name, awq)) {
+      if (llmoc::hal::cuda::prefetch_awq_weight(awq)) ++n_q;
+      return;
+    }
+    hal::Nvfp4View nv;
+    if (store_.nvfp4_view(name, nv)) {
+      if (llmoc::hal::cuda::prefetch_nvfp4_weight(nv)) ++n_q;
+    }
+  };
+  try_up_bf16("embed_tokens.weight");
+  try_up_bf16("lm_head.weight");
+  try_up_bf16("norm.weight");
   for (int L = 0; L < L_; ++L) {
     const std::string b = "layers." + std::to_string(L) + ".";
     for (const char* s : {"input_layernorm.weight", "post_attention_layernorm.weight",
@@ -183,19 +193,25 @@ void GlmFlashModel::warm_gpu_attn_weights() {
                           "self_attn.v_proj.weight", "self_attn.o_proj.weight",
                           "self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight",
                           "self_attn.kv_a_proj_with_mqa.weight", "self_attn.kv_b_proj.weight",
-                          "self_attn.b_proj.weight", "mlp.gate.weight"}) {
-      try_up(b + s);
+                          "self_attn.b_proj.weight", "mlp.gate.weight", "mlp.gate_proj.weight",
+                          "mlp.up_proj.weight", "mlp.down_proj.weight"}) {
+      try_up_bf16(b + s);
+      try_up_quant(b + s);
     }
     if (mode_ == ExecMode::kPureGpu && E_ > 0) {
       for (int e = 0; e < E_; ++e) {
         const std::string eb = b + "mlp.experts." + std::to_string(e) + ".";
-        try_up(eb + "gate_proj.weight");
-        try_up(eb + "up_proj.weight");
-        try_up(eb + "down_proj.weight");
+        try_up_bf16(eb + "gate_proj.weight");
+        try_up_bf16(eb + "up_proj.weight");
+        try_up_bf16(eb + "down_proj.weight");
+        try_up_quant(eb + "gate_proj.weight");
+        try_up_quant(eb + "up_proj.weight");
+        try_up_quant(eb + "down_proj.weight");
       }
     }
   }
-  LOG_INFO("glm: GPU warmed %d BF16 tensors (%s)", n_up, GlmEngineConfig::mode_name(mode_));
+  LOG_INFO("glm: GPU warmed %d BF16 + %d quant tensors (%s)", n_up, n_q,
+           GlmEngineConfig::mode_name(mode_));
   hal::log_cuda_status();
 }
 
@@ -354,15 +370,19 @@ void GlmFlashModel::gemm_bf16_named(const float* x, const std::string& wname, fl
 }
 
 void GlmFlashModel::gemm_linear(const float* x, const std::string& wname, float* y, int M, int K) {
+  const bool expert = wname.find(".mlp.experts.") != std::string::npos;
+  const bool allow_quant_gpu = use_gpu_gemm_ && !(mode_ == ExecMode::kHybridGpu && expert);
   hal::AwqView awq;
   if (store_.awq_view(wname, awq)) {
     if (awq.M != M || awq.K != K) throw std::runtime_error("glm: AWQ shape mismatch " + wname);
+    if (allow_quant_gpu && llmoc::hal::cuda::try_gemm_awq(x, awq, y)) return;
     hal::gemm_awq_int4(x, awq, y);
     return;
   }
   hal::Nvfp4View nv;
   if (store_.nvfp4_view(wname, nv)) {
     if (nv.M != M || nv.K != K) throw std::runtime_error("glm: NVFP4 shape mismatch " + wname);
+    if (allow_quant_gpu && llmoc::hal::cuda::try_gemm_nvfp4(x, nv, y)) return;
     hal::gemm_nvfp4(x, nv, y);
     return;
   }

@@ -1,0 +1,19 @@
+# Kimi-K3 stub (Kimi-STUB-v0) — prefer hybrid；单卡 pure_gpu 会自动降级 layer_stream
+model:
+  path: models/fake_kimi.kimiq
+  dtype: nvfp4
+  tokenizer_dir: models/Qwen3.5-4B-hf
+
+mode: hybrid_gpu
+
+tiers:
+  dram_hot_gb: 8
+  kv_pool_gb: 2
+  gpu_vram_gb: 8
+
+server:
+  port: 15087
+  api_key_env: LLMOC_API_KEY
+
+decode:
+  max_new_tokens: 256

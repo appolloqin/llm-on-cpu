@@ -88,8 +88,12 @@ T_token = max(
 | 模式 | 触发条件 | 权重放置策略 | 性能定位 |
 |---|---|---|---|
 | ① pure-cpu（默认） | 无可用显卡 | attn/dense/共享专家常驻 DRAM；路由专家 LRU@DRAM；冷专家 NVMe | 本文全篇公式，目标 ≥30 tok/s |
+| **layer_stream** | **工作集装不下 / 显式要「先跑起来」** | **按层（窗口）从 NVMe/DRAM 装入再算**；不要求整模常驻 | **可运行优先**；不承诺 30 tok/s；见 [`DESIGN_LAYER_STREAM.md`](DESIGN_LAYER_STREAM.md) |
 | ② hybrid-gpu | 存在 8~24G 消费级卡 | **固定入 VRAM**: 全部 attn 权重+KV+MTP头（体积小、访问频繁）；VRAM 余量作 L1 专家热区放最热专家；DRAM 作 L2 热区；NVMe 兜底 | VRAM ~1000GB/s 抬高速度上限，PCIe(32~64GB/s) 成为新瓶颈项参与 T_token 取 max |
 | ③ pure-gpu | 全模型激活路径 + KV 可装入全部 VRAM | 权重整体常驻 VRAM，offload 路径整体关闭 | 退化为经典服务引擎，吞吐(batching)优先 |
+
+**入口**：`llmoc_server` / `_int4` / `_glm` / `_ds`（DS-STUB-v0）/ `_kimi`（Kimi-STUB-v0）。  
+GPU GEMM（无 nvcc）：BF16、QLWC INT4、AWQ、NVFP4 → 反量化 FP32 → cuBLAS。
 
 T_token 公式泛化（三模统一）：
 
@@ -114,7 +118,7 @@ T_token = max(
 | Paged KV + continuous batching | kv-manager page 化；scheduler 批调度 |
 | 前缀 radix 复用 | kv-manager 内置前缀基数树 |
 | 参数热温冷分级卸载 | weight-manager 的三级驻留（专家粒度） |
-| 层级流式按需加载 | 内存告急时的降级模式（退化到层粒度） |
+| 层级流式按需加载 | **`mode: layer_stream`**（可运行优先）；设计 [`DESIGN_LAYER_STREAM.md`](DESIGN_LAYER_STREAM.md)；内存告急时亦可降级到层粒度 |
 | 多 token 并行产出 | MTP 投机解码 verify 循环 |
 | 专家级 offload + 带宽自适应 | weight-manager / PlacementPlanner / D6 |
 
@@ -191,7 +195,7 @@ DeviceHAL:
 |---|---|
 | 内存水位 >85% | 热区收缩（降低 N_hot），冷拉增多 |
 | NVMe 读延迟飙升 | 降并发批大小，优先保已接请求 SLO |
-| 连续 OOM 风险 | 退化为层级全流式模式（慢但不死） |
+| 连续 OOM 风险 | 退化为 **layer_stream**（层窗口；慢但不死）；见 DESIGN_LAYER_STREAM |
 | 路由偏差超阈 | RouterStats 定期重采样自动更新驻留计划 |
 
 ## 8. 测试与验收标准

@@ -32,6 +32,28 @@ TINY_TEST(M5, HybridDegradesWithoutCuda) {
   EXPECT_TRUE(deg);
 }
 
+TINY_TEST(M5, LayerStreamParseAndResolve) {
+  EXPECT_TRUE(llmoc::sched::parse_mode("layer_stream") == llmoc::sched::ExecMode::kLayerStream);
+  EXPECT_TRUE(std::string(llmoc::sched::mode_name(llmoc::sched::ExecMode::kLayerStream)) ==
+              "layer_stream");
+  bool deg = false;
+  auto m = llmoc::sched::resolve_mode(llmoc::sched::ExecMode::kLayerStream, false, &deg);
+  EXPECT_TRUE(m == llmoc::sched::ExecMode::kLayerStream);
+  EXPECT_TRUE(!deg);
+  m = llmoc::sched::resolve_mode(llmoc::sched::ExecMode::kLayerStream, true, &deg);
+  EXPECT_TRUE(m == llmoc::sched::ExecMode::kLayerStream);
+}
+
+TINY_TEST(M5, PlannerLayerStream) {
+  llmoc::sched::PlacementPlanner::Config cfg;
+  cfg.vram_bytes = 4ull << 30;
+  cfg.dram_bytes = 8ull << 30;
+  std::vector<llmoc::sched::ExpertHint> ex = {{0, 0, 1.0, 1ull << 20}};
+  auto p = llmoc::sched::PlacementPlanner::solve(llmoc::sched::ExecMode::kLayerStream, cfg, ex);
+  EXPECT_TRUE(p.ok);
+  EXPECT_TRUE(p.summary.find("layer_stream") != std::string::npos);
+}
+
 TINY_TEST(M5, PlannerPureCpuAllDram) {
   llmoc::sched::PlacementPlanner::Config cfg;
   cfg.vram_bytes = 8ull << 30;

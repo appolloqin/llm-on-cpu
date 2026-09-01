@@ -591,4 +591,10 @@ void dequant_int4_row(const qlwc::Int4View& W, int row, float* out) {
   }
 }
 
+void dequant_int4_matrix(const qlwc::Int4View& W, float* out) {
+  if (!out || !W.qweight || W.M <= 0 || W.K <= 0) throw std::runtime_error("dequant_int4_matrix bad args");
+  for (int row = 0; row < W.M; ++row)
+    dequant_int4_row(W, row, out + static_cast<size_t>(row) * W.K);
+}
+
 }  // namespace llmoc::hal

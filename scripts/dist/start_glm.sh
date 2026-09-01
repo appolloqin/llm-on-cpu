@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start GLM server (default: NVFP4 config). Modes: pure_cpu | hybrid_gpu | pure_gpu
+# Start GLM server (default: NVFP4). Modes: pure_cpu | hybrid_gpu | pure_gpu
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
