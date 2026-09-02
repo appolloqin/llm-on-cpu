@@ -31,8 +31,8 @@ REM 已有引擎 INT4 权重则直接提示；prepare_model 也会用 QLW1 魔�
 if exist "models\%SHORT%.int4.qlwc" (
   echo == [INT4] found models\%SHORT%.int4.qlwc — will skip re-download / re-quantize unless --force-int4
 )
-echo == [INT4] prepare %MODEL%  ^(BF16 HF -^> LWC -^> QLWC; auto-skip if already INT4^)
-echo     Tip: pass BF16 base id ^(e.g. Qwen/Qwen3.5-4B^), not *-AWQ / *-GPTQ repos
+echo == [INT4] prepare %MODEL%  ^(BF16 HF -^> LWC -^> QLWC; or AWQ/compressed-tensors -^> QLWC import^)
+echo     Tip: BF16 base ^(Qwen/Qwen3.8-27B^) or pre-quant ^(cyankiwi/Qwen3.8-27B-AWQ-INT4^)
 call node tools\prepare_model.mjs --model %MODEL% --prune-hf --int4 %EXTRA%
 if errorlevel 1 (
   echo ERROR: prepare_model failed. See log above.

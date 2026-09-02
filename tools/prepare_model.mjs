@@ -10,7 +10,7 @@
 //
 // INT4 智能跳过:
 //   - 已有合法 .int4.qlwc → 不再下载/转 LWC/再量化
-//   - HF config 已是 AWQ/GPTQ 等 → 拒绝「再量化一次」（需用 BF16 基座或现成 .qlwc）
+//   - HF config 已是 AWQ/GPTQ/compressed-tensors → import_awq_hf_qlwc 重打包为 QLWC
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -184,9 +184,29 @@ function detectHfPreQuantized(hfDir) {
     method ||
     (typeof bits === "number" && bits > 0 && bits <= 8)
   ) {
-    return { method: method || `bits=${bits}`, bits };
+    const groups = qc.config_groups || {};
+    const g0 = groups.group_0 || groups[Object.keys(groups)[0]] || {};
+    const wg = g0.weights || {};
+    const fmt = String(qc.format || "").toLowerCase();
+    return {
+      method: method || fmt || `bits=${bits}`,
+      bits,
+      format: fmt,
+      groupSize: wg.group_size ?? qc.group_size ?? 128,
+      symmetric: wg.symmetric ?? true,
+    };
   }
   return null;
+}
+
+/** HF 预量化是否可走 import_awq_hf_qlwc（重打包，非 BF16 再量化） */
+function hfQuantImportable(info) {
+  if (!info) return false;
+  const m = String(info.method || "").toLowerCase();
+  const fmt = String(info.format || "").toLowerCase();
+  if (m === "awq" || m === "compressed-tensors") return true;
+  if (fmt.includes("pack-quantized")) return true;
+  return false;
 }
 
 /** 模型 id 字面量暗示已是量化仓（如 *-AWQ / *-GPTQ） */
@@ -271,6 +291,7 @@ function main() {
 
   const qlwcOk = opt.int4 ? qlwcLooksOk(opt.outQlwc) : weightLooksOk(opt.outQlwc);
   const hfPreQuant = hasConfig ? detectHfPreQuantized(opt.outHf) : null;
+  const hfImport = opt.int4 && hfQuantImportable(hfPreQuant);
   const idPreQuant = modelIdLooksPreQuantized(opt.model);
 
   console.log("\n== [plan] auto-detect");
@@ -286,7 +307,7 @@ function main() {
       console.log(
         `  hf quant:   detected ${hfPreQuant.method}` +
           (hfPreQuant.bits != null ? ` bits=${hfPreQuant.bits}` : "") +
-          " — will NOT re-quantize via BF16 LWC"
+          (hfImport ? " — will import → QLWC (no BF16 re-quant)" : " — cannot auto-import")
       );
     } else if (idPreQuant) {
       console.log(
@@ -311,20 +332,19 @@ function main() {
     return;
   }
 
-  // HF 已是 AWQ/GPTQ 等：本工具只会从 BF16/F16 LWC 生成 QLWC，禁止傻转一遍
-  if (opt.int4 && hfPreQuant && !qlwcOk) {
+  // HF 已是 AWQ/GPTQ 等：可 import 则走 import；否则拒绝二次量化
+  if (opt.int4 && hfPreQuant && !qlwcOk && !hfImport) {
     throw new Error(
       `HF weights are already quantized (${hfPreQuant.method}) under ${opt.outHf}.\n` +
-        `  This pipeline only does: BF16/F16 HF → .lwc → .int4.qlwc (layout GPTQ-style).\n` +
-        `  Do NOT re-quantize AWQ/GPTQ HF repos.\n` +
-        `  Fix: use the BF16 base model id, or place a ready file at ${opt.outQlwc}.`
+        `  Supported import: AWQ / compressed-tensors pack-quantized → .int4.qlwc.\n` +
+        `  Otherwise use BF16 base model id, or place a ready file at ${opt.outQlwc}.`
     );
   }
 
   // 最终目标是否已就绪
   const goalOk = opt.int4 ? qlwcOk : lwcOk;
-  // 转 LWC / 量化还缺不缺源
-  const needLwc = !lwcOk && !(opt.int4 && qlwcOk);
+  // 转 LWC / 量化还缺不缺源（HF import 不需要 LWC）
+  const needLwc = !lwcOk && !(opt.int4 && (qlwcOk || hfImport));
   const needShards = needLwc && !hasShards;
 
   // ---- download ----
@@ -368,6 +388,8 @@ function main() {
 
   const shardsAfter = listSafetensors(opt.outHf);
   const hasShardsAfter = shardsAfter.length > 0;
+  const hfPreAfter = detectHfPreQuantized(opt.outHf);
+  const hfImportAfter = opt.int4 && hfQuantImportable(hfPreAfter);
 
   // ---- convert ----
   let didConvert = false;
@@ -378,8 +400,8 @@ function main() {
     doConvert = true;
   } else if (lwcOk) {
     console.log("\n== [convert] skipped (LWC already OK)");
-  } else if (opt.int4 && qlwcOk) {
-    console.log("\n== [convert] skipped (QLWC already OK; LWC not needed)");
+  } else if (opt.int4 && (qlwcOk || hfImportAfter)) {
+    console.log("\n== [convert] skipped (QLWC import path / already OK; LWC not needed)");
   } else if (!hasShardsAfter) {
     throw new Error(
       `need *.safetensors under ${opt.outHf} to convert, but none found.\n` +
@@ -413,6 +435,7 @@ function main() {
   const needVerify =
     !opt.noVerify &&
     weightLooksOk(opt.outLwc) &&
+    !hfImportAfter &&
     (didConvert || needLwcForInt4 || opt.pruneHf || opt.removeHf || !opt.int4);
 
   if (needVerify) {
@@ -446,53 +469,46 @@ function main() {
     console.log("\n== [verify] skipped (QLWC already OK)");
   } else if (opt.noVerify) {
     console.log("\n== [verify] skipped (--no-verify)");
-  } else if (!weightLooksOk(opt.outLwc) && !(opt.int4 && qlwcOk)) {
+  } else if (!weightLooksOk(opt.outLwc) && !(opt.int4 && (qlwcOk || hfImportAfter))) {
     throw new Error(`no usable LWC at ${opt.outLwc}`);
   } else {
     console.log("\n== [verify] skipped (LWC already verified / unchanged)");
   }
 
-  // ---- prune / remove HF ----
-  if (opt.removeHf) {
-    if (!hfHasConfig(opt.outHf) && !hfHasTokenizer(opt.outHf) && !hasShardsAfter) {
-      console.log("\n== [remove-hf] skipped (already gone)");
-    } else {
-      console.log(`\n== [remove-hf] ${opt.outHf}`);
-      console.log(`  freed ${formatBytes(removeHfDir(opt.outHf))}`);
-    }
-  } else if (opt.pruneHf) {
-    const left = listSafetensors(opt.outHf);
-    if (left.length === 0) {
-      console.log("\n== [prune-hf] skipped (no weight shards left)");
-    } else if (!(lwcOk || (opt.int4 && qlwcOk))) {
-      throw new Error("[prune-hf] refused: no OK engine weights yet");
-    } else {
-      console.log(
-        `\n== [prune-hf] drop weight shards in ${opt.outHf} (keep config/tokenizer)`
-      );
-      console.log(`  freed ${formatBytes(pruneHfWeights(opt.outHf))}`);
-    }
-  }
-
-  // ---- INT4 ----
+  // ---- INT4 (before prune: import/quantize must finish first) ----
   if (opt.int4) {
-    // 下载后再次探测：id 像 AWQ 但本地 config 才是权威
-    const hfPreAfter = detectHfPreQuantized(opt.outHf);
-    if (hfPreAfter && !qlwcLooksOk(opt.outQlwc) && !opt.forceInt4) {
+    if (hfPreAfter && !qlwcLooksOk(opt.outQlwc) && !hfQuantImportable(hfPreAfter) && !opt.forceInt4) {
       throw new Error(
-        `Refusing INT4 re-quantize: HF is already ${hfPreAfter.method}.\n` +
+        `Refusing INT4 re-quantize: HF is already ${hfPreAfter.method} (no import path).\n` +
           `  Use BF16 base model, or provide ${opt.outQlwc}.`
       );
     }
     if (qlwcLooksOk(opt.outQlwc) && !opt.forceInt4) {
       console.log(`\n== [int4] skipped (already OK: ${opt.outQlwc})`);
+    } else if (hfImportAfter) {
+      if (!hasShardsAfter) {
+        throw new Error(`INT4 import needs *.safetensors under ${opt.outHf}`);
+      }
+      const impArgs = [
+        path.join("tools", "import_awq_hf_qlwc.mjs"),
+        "--src",
+        opt.outHf,
+        "--out",
+        opt.outQlwc,
+        "--group-size",
+        String(hfPreAfter.groupSize ?? 128),
+      ];
+      run("int4-import", node, impArgs);
+      if (!qlwcLooksOk(opt.outQlwc)) {
+        throw new Error(`import produced invalid QLWC (need QLW1 magic): ${opt.outQlwc}`);
+      }
     } else {
       if (!weightLooksOk(opt.outLwc)) {
         throw new Error(`INT4 needs LWC first: missing/small ${opt.outLwc}`);
       }
       if (hfPreAfter) {
         throw new Error(
-          `Cannot build QLWC from pre-quantized HF (${hfPreAfter.method}); need BF16/F16 LWC.`
+          `Cannot build QLWC from pre-quantized HF (${hfPreAfter.method}); need BF16/F16 LWC or importable AWQ.`
         );
       }
       run("int4-quantize", node, [
@@ -508,15 +524,43 @@ function main() {
         throw new Error(`quantize produced invalid QLWC (need QLW1 magic): ${opt.outQlwc}`);
       }
     }
+    qlwcOk = qlwcLooksOk(opt.outQlwc);
     if (fs.existsSync(abs(opt.outLwc))) {
       const sz = fileSize(opt.outLwc);
       fs.unlinkSync(abs(opt.outLwc));
-      console.log(
-        `\n== [int4] removed intermediate LWC ${opt.outLwc} (${formatBytes(sz)})`
-      );
+      console.log(`\n== [int4] removed intermediate LWC ${opt.outLwc} (${formatBytes(sz)})`);
     } else {
       console.log("\n== [int4] intermediate LWC already absent");
     }
+  }
+
+  // ---- prune / remove HF ----
+  if (opt.removeHf) {
+    if (!hfHasConfig(opt.outHf) && !hfHasTokenizer(opt.outHf) && !hasShardsAfter) {
+      console.log("\n== [remove-hf] skipped (already gone)");
+    } else {
+      console.log(`\n== [remove-hf] ${opt.outHf}`);
+      console.log(`  freed ${formatBytes(removeHfDir(opt.outHf))}`);
+    }
+  } else if (opt.pruneHf) {
+    const left = listSafetensors(opt.outHf);
+    if (left.length === 0) {
+      console.log("\n== [prune-hf] skipped (no weight shards left)");
+    } else if (!(opt.int4 ? qlwcOk : lwcOk)) {
+      throw new Error(
+        opt.int4
+          ? "[prune-hf] refused: need OK .int4.qlwc first"
+          : "[prune-hf] refused: no OK engine weights yet"
+      );
+    } else {
+      console.log(
+        `\n== [prune-hf] drop weight shards in ${opt.outHf} (keep config/tokenizer)`
+      );
+      console.log(`  freed ${formatBytes(pruneHfWeights(opt.outHf))}`);
+    }
+  }
+
+  if (opt.int4) {
     console.log(`\n=== prepare OK -> ${opt.outQlwc} ===`);
   } else {
     console.log(`\n=== prepare OK -> ${opt.outLwc} ===`);

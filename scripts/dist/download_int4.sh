@@ -19,7 +19,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 SHORT="${MODEL##*/}"
-echo "== [INT4] prepare ${MODEL} (auto-skip done steps)"
+echo "== [INT4] prepare ${MODEL} (AWQ/compressed-tensors→QLWC import; or BF16→LWC→QLWC)"
+echo "    Tip: pre-quant (cyankiwi/Qwen3.8-27B-AWQ-INT4) or BF16 base (Qwen/Qwen3.8-27B)"
 node tools/prepare_model.mjs --model "${MODEL}" --prune-hf --int4 "${EXTRA[@]}"
 echo
 echo "OK. Engine weights: models/${SHORT}.int4.qlwc"

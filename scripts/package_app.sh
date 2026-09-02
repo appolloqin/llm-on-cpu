@@ -85,7 +85,7 @@ cp README.md "${STAGE}/"
 [[ -f docs/DESIGN_LAYER_STREAM.md ]] && cp docs/DESIGN_LAYER_STREAM.md "${STAGE}/docs/"
 
 # 发布包一键脚本 + Node 工具链（下载/转换/量化；需本机 Node≥18）
-for t in download_model.mjs convert_lwc.mjs prepare_model.mjs quantize_int4.mjs; do
+for t in download_model.mjs convert_lwc.mjs prepare_model.mjs quantize_int4.mjs import_awq_hf_qlwc.mjs; do
   cp "tools/${t}" "${STAGE}/tools/"
 done
 mkdir -p "${STAGE}/tools/glm"

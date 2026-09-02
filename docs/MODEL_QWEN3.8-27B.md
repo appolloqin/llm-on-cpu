@@ -53,8 +53,14 @@ start_bf16.cmd
 ### 2.2 推荐：聊天用 INT4
 
 ```bat
+REM 方式 A：已有 AWQ / compressed-tensors 量化仓（推荐，无需再下 BF16）
+download_int4.cmd --model cyankiwi/Qwen3.8-27B-AWQ-INT4
+REM configs/engine_int4.yaml → path: models/Qwen3.8-27B-AWQ-INT4.int4.qlwc
+
+REM 方式 B：BF16 基座 → 本引擎自量化
 download_int4.cmd --model Qwen/Qwen3.8-27B
-REM 编辑 configs/engine_int4.yaml → path 指向 *.int4.qlwc，tokenizer_dir 指向 *-hf
+REM path: models/Qwen3.8-27B.int4.qlwc
+
 start_int4.cmd
 ```
 
