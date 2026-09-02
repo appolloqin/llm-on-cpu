@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "hal/cuda_backend.h"
+#include "hal/int4_ops.h"
 #include "hal/quant_views.h"
 #include "glm/hal/glm_awq_int4_ops.h"
 #include "glm/hal/glm_nvfp4_ops.h"
@@ -121,5 +122,120 @@ extern "C" __global__ void add1(float* x) { x[0] += 1.0f; }
   EXPECT_TRUE(hal::cuda::d2h(&out, d, sizeof(float)));
   EXPECT_TRUE(out == 42.f);
   hal::cuda::device_free(d);
+  hal::cuda::disable();
+}
+
+// GPU 原生 INT4 dequant-GEMV 与 CPU hal::gemm_int4 对拍(AWQ 对称)
+TINY_TEST(GpuQuant, AwqGemvJitMatchesCpu) {
+  if (!hal::cuda::probe_available() || !hal::cuda::enable(256ull << 20)) {
+    EXPECT_TRUE(true);
+    return;
+  }
+  if (!hal::cuda::jit_available()) {
+    EXPECT_TRUE(true);
+    hal::cuda::disable();
+    return;
+  }
+  const int M = 24, K = 256, gs = 128;
+  const int ng = (K + gs - 1) / gs;
+  // 构造量化数据(确定性伪随机)
+  std::vector<uint8_t> q(static_cast<size_t>(M) * K);
+  for (size_t i = 0; i < q.size(); ++i) q[i] = static_cast<uint8_t>((i * 7 + 3) % 16);
+  std::vector<uint8_t> packed;
+  pack_awq_row(q, packed, M, K);
+  std::vector<uint16_t> scales(static_cast<size_t>(M) * ng);
+  for (size_t i = 0; i < scales.size(); ++i) scales[i] = f32_to_f16bits(0.01f * float((i % 5) + 1));
+  std::vector<float> x(K), y_cpu(M), y_gpu(M, -1e9f);
+  for (int k = 0; k < K; ++k) x[k] = 0.02f * float((k % 11) - 5);
+
+  qlwc::Int4View W;
+  W.qweight = packed.data();
+  W.scales = scales.data();
+  W.zeros = nullptr;
+  W.M = M; W.K = K; W.group_size = gs;
+  W.scheme = qlwc::Scheme::kAwqSym;
+  hal::gemm_int4(x.data(), W, y_cpu.data());
+
+  void* dq = hal::cuda::device_alloc(packed.size());
+  void* ds = hal::cuda::device_alloc(scales.size() * 2);
+  void* dx = hal::cuda::device_alloc(K * 4);
+  void* dy = hal::cuda::device_alloc(M * 4);
+  EXPECT_TRUE(dq && ds && dx && dy);
+  EXPECT_TRUE(hal::cuda::h2d(dq, packed.data(), packed.size()));
+  EXPECT_TRUE(hal::cuda::h2d(ds, scales.data(), scales.size() * 2));
+  EXPECT_TRUE(hal::cuda::h2d(dx, x.data(), K * 4));
+  EXPECT_TRUE(hal::cuda::jit_gemv_int4(reinterpret_cast<const uint8_t*>(dq),
+                                       reinterpret_cast<const uint16_t*>(ds), nullptr,
+                                       reinterpret_cast<const float*>(dx),
+                                       reinterpret_cast<float*>(dy), M, K, ng, gs, true));
+  EXPECT_TRUE(hal::cuda::d2h(y_gpu.data(), dy, M * 4));
+  for (int m = 0; m < M; ++m) {
+    EXPECT_TRUE(std::fabs(y_gpu[m] - y_cpu[m]) < 1e-3f * (1.f + std::fabs(y_cpu[m])));
+  }
+  hal::cuda::device_free(dq);
+  hal::cuda::device_free(ds);
+  hal::cuda::device_free(dx);
+  hal::cuda::device_free(dy);
+  hal::cuda::disable();
+}
+
+// GPTQ 非对称(zeros!=null)变体
+TINY_TEST(GpuQuant, GptqGemvJitMatchesCpu) {
+  if (!hal::cuda::probe_available() || !hal::cuda::enable(256ull << 20)) {
+    EXPECT_TRUE(true);
+    return;
+  }
+  if (!hal::cuda::jit_available()) {
+    EXPECT_TRUE(true);
+    hal::cuda::disable();
+    return;
+  }
+  const int M = 16, K = 256, gs = 128;
+  const int ng = (K + gs - 1) / gs;
+  std::vector<uint8_t> q(static_cast<size_t>(M) * K);
+  for (size_t i = 0; i < q.size(); ++i) q[i] = static_cast<uint8_t>((i * 5 + 1) % 16);
+  std::vector<uint8_t> packed;
+  pack_awq_row(q, packed, M, K);
+  std::vector<uint16_t> scales(static_cast<size_t>(M) * ng);
+  std::vector<uint16_t> zeros(static_cast<size_t>(M) * ng);
+  for (size_t i = 0; i < scales.size(); ++i) {
+    scales[i] = f32_to_f16bits(0.02f * float((i % 3) + 1));
+    zeros[i] = f32_to_f16bits(-0.1f * float((i % 4)));
+  }
+  std::vector<float> x(K), y_cpu(M), y_gpu(M, -1e9f);
+  for (int k = 0; k < K; ++k) x[k] = 0.03f * float((k % 7) - 3);
+
+  qlwc::Int4View W;
+  W.qweight = packed.data();
+  W.scales = scales.data();
+  W.zeros = zeros.data();
+  W.M = M; W.K = K; W.group_size = gs;
+  W.scheme = qlwc::Scheme::kGptqAsym;
+  hal::gemm_int4(x.data(), W, y_cpu.data());
+
+  void* dq = hal::cuda::device_alloc(packed.size());
+  void* ds = hal::cuda::device_alloc(scales.size() * 2);
+  void* dz = hal::cuda::device_alloc(zeros.size() * 2);
+  void* dx = hal::cuda::device_alloc(K * 4);
+  void* dy = hal::cuda::device_alloc(M * 4);
+  EXPECT_TRUE(dq && ds && dz && dx && dy);
+  EXPECT_TRUE(hal::cuda::h2d(dq, packed.data(), packed.size()));
+  EXPECT_TRUE(hal::cuda::h2d(ds, scales.data(), scales.size() * 2));
+  EXPECT_TRUE(hal::cuda::h2d(dz, zeros.data(), zeros.size() * 2));
+  EXPECT_TRUE(hal::cuda::h2d(dx, x.data(), K * 4));
+  EXPECT_TRUE(hal::cuda::jit_gemv_int4(reinterpret_cast<const uint8_t*>(dq),
+                                       reinterpret_cast<const uint16_t*>(ds),
+                                       reinterpret_cast<const uint16_t*>(dz),
+                                       reinterpret_cast<const float*>(dx),
+                                       reinterpret_cast<float*>(dy), M, K, ng, gs, false));
+  EXPECT_TRUE(hal::cuda::d2h(y_gpu.data(), dy, M * 4));
+  for (int m = 0; m < M; ++m) {
+    EXPECT_TRUE(std::fabs(y_gpu[m] - y_cpu[m]) < 1e-3f * (1.f + std::fabs(y_cpu[m])));
+  }
+  hal::cuda::device_free(dq);
+  hal::cuda::device_free(ds);
+  hal::cuda::device_free(dz);
+  hal::cuda::device_free(dx);
+  hal::cuda::device_free(dy);
   hal::cuda::disable();
 }

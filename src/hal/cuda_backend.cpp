@@ -122,6 +122,7 @@ int g_cap_m = 0;
 int g_cap_n = 0;  // batch columns for X/Y
 std::unordered_map<const void*, CacheEntry> g_cache;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
+std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunction 缓存(disable 时清空)
 
 // Skip lm_head / vocab-scale uploads (stay on CPU INT4).
 constexpr int kMaxGpuInt4Rows = 65536;
@@ -509,6 +510,7 @@ bool enable(size_t vram_budget_bytes) {
 
 void disable() {
   std::lock_guard<std::mutex> lock(g_mu);
+  g_jit_kernels.clear();  // 名字缓存先清, 再卸载模块, 避免悬空句柄
   for (auto& kv : g_jit_modules) {
     if (kv.second && g_api.cuModuleUnload) g_api.cuModuleUnload(kv.second);
   }
@@ -630,6 +632,100 @@ bool jit_launch(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, un
   if (!ensure_driver_ctx()) return false;
   return g_api.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shmem_bytes, nullptr, params,
                               nullptr) == 0;
+}
+
+// ---- GPU 原生 INT4 dequant-GEMV kernel(权重量化形态常驻, kernel 内反量化) ----
+namespace {
+
+// kernel 源: 与 CPU hal::gemm_int4 语义一致。
+// 打包格式: qweight 行主序 M×rb(rb=(K+1)/2), 偶数 k 取低 4 位, 奇数 k 取高 4 位。
+// awq: w=(q-7)*scale; gptq: w=q*scale+zero。每 block 算一行, 256 线程, warp shuffle 归约。
+const char* kGemvInt4Src = R"CUDA(
+__device__ __forceinline__ float f16_to_f32_dev(unsigned short h) {
+  unsigned int sign = (h & 0x8000u) << 16;
+  unsigned int exp = (h >> 10) & 0x1Fu;
+  unsigned int man = h & 0x3FFu;
+  unsigned int bits;
+  if (exp == 0u) {
+    if (man == 0u) { bits = sign; }
+    else {
+      exp = 1u;
+      while ((man & 0x400u) == 0u) { man <<= 1; exp -= 1u; }
+      man &= 0x3FFu;
+      bits = sign | ((exp + 112u) << 23) | (man << 13);
+    }
+  } else if (exp == 31u) {
+    bits = sign | 0x7F800000u | (man << 13);
+  } else {
+    bits = sign | ((exp + 112u) << 23) | (man << 13);
+  }
+  return __uint_as_float(bits);
+}
+
+extern "C" __global__ void gemv_int4(
+    const unsigned char* __restrict__ qweight,
+    const unsigned short* __restrict__ scales,
+    const unsigned short* __restrict__ zeros,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K, int ng, int gs, int is_awq) {
+  const int m = blockIdx.x;
+  if (m >= M) return;
+  const int rb = (K + 1) >> 1;
+  const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
+  float acc = 0.f;
+  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+    const int g = k / gs;
+    const float s = f16_to_f32_dev(scales[(size_t)m * ng + g]);
+    const unsigned char b = qrow[k >> 1];
+    const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+    float w;
+    if (is_awq) {
+      w = (float)(qi - 7) * s;
+    } else {
+      const float z = zeros ? f16_to_f32_dev(zeros[(size_t)m * ng + g]) : 0.f;
+      w = (float)qi * s + z;
+    }
+    acc += x[k] * w;
+  }
+  // warp 内归约
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  __shared__ float smem[32];
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  if (lane == 0) smem[warp] = acc;
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarp = (blockDim.x + 31) >> 5;
+    float v = (lane < nwarp) ? smem[lane] : 0.f;
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    if (lane == 0) y[m] = v;
+  }
+}
+)CUDA";
+
+// kernel 名→句柄缓存(避免每 token 重编译; 与 g_jit_kernels 共享生命周期, disable 时清空)
+void* get_jit_kernel(const char* src, const char* name) {
+  const auto it = g_jit_kernels.find(name);
+  if (it != g_jit_kernels.end()) return it->second;
+  void* fn = nullptr;
+  if (!jit_compile(src, name, &fn)) return nullptr;
+  g_jit_kernels[name] = fn;
+  return fn;
+}
+
+}  // namespace
+
+bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
+                   const float* d_x, float* d_y, int M, int K, int ng, int gs, bool is_awq) {
+  if (!d_qweight || !d_scales || !d_x || !d_y || M <= 0 || K <= 0 || ng <= 0 || gs <= 0)
+    return false;
+  if (!is_awq && !d_zeros) return false;
+  void* fn = get_jit_kernel(kGemvInt4Src, "gemv_int4");
+  if (!fn) return false;
+  int is_awq_i = is_awq ? 1 : 0;
+  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_x, &d_y, &M, &K, &ng, &gs, &is_awq_i};
+  return jit_launch(fn, static_cast<unsigned>(M), 1, 1, 256, 1, 1, 0, params);
 }
 
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {
