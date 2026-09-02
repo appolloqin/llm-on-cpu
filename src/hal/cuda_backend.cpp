@@ -37,10 +37,33 @@ using cudaFree_t = int (*)(void*);
 using cudaMemcpy_t = int (*)(void*, const void*, size_t, int);
 using cudaGetDeviceCount_t = int (*)(int*);
 using cudaSetDevice_t = int (*)(int);
+using cudaGetDeviceProperties_t = int (*)(void*, int);
 using cublasCreate_t = int (*)(void**);
 using cublasDestroy_t = int (*)(void*);
 using cublasSgemm_t = int (*)(void*, int, int, int, int, int, const float*, const float*, int,
                               const float*, int, const float*, float*, int);
+
+// ---- driver API (nvcuda.dll) for JIT kernel launch ----
+using cuCtxGetCurrent_t = int (*)(void**);
+using cuDevicePrimaryCtxRetain_t = int (*)(void**, int);
+using cuCtxSetCurrent_t = int (*)(void*);
+using cuDeviceGetAttribute_t = int (*)(int*, int, int);
+using cuModuleLoadData_t = int (*)(void**, const void*);
+using cuModuleGetFunction_t = int (*)(void**, void*, const char*);
+using cuModuleUnload_t = int (*)(void*);
+using cuLaunchKernel_t = int (*)(void*, unsigned, unsigned, unsigned, unsigned, unsigned,
+                                 unsigned, unsigned, void*, void**, void**);
+
+// ---- NVRTC (nvrtc64_XXX.dll) for runtime compilation ----
+using nvrtcCreateProgram_t = int (*)(void**, const char*, const char*, int, const char* const*,
+                                     const char* const*);
+using nvrtcCompileProgram_t = int (*)(void*, int, const char* const*);
+using nvrtcGetPTXSize_t = int (*)(void*, size_t*);
+using nvrtcGetPTX_t = int (*)(void*, char*);
+using nvrtcGetProgramLogSize_t = int (*)(void*, size_t*);
+using nvrtcGetProgramLog_t = int (*)(void*, char*);
+using nvrtcDestroyProgram_t = int (*)(void**);
+using nvrtcGetErrorString_t = const char* (*)(int);
 
 struct Api {
   void* cudart = nullptr;
@@ -50,9 +73,30 @@ struct Api {
   cudaMemcpy_t cudaMemcpy = nullptr;
   cudaGetDeviceCount_t cudaGetDeviceCount = nullptr;
   cudaSetDevice_t cudaSetDevice = nullptr;
+  cudaGetDeviceProperties_t cudaGetDeviceProperties = nullptr;
   cublasCreate_t cublasCreate = nullptr;
   cublasDestroy_t cublasDestroy = nullptr;
   cublasSgemm_t cublasSgemm = nullptr;
+
+  void* nvcuda = nullptr;
+  cuCtxGetCurrent_t cuCtxGetCurrent = nullptr;
+  cuDevicePrimaryCtxRetain_t cuDevicePrimaryCtxRetain = nullptr;
+  cuCtxSetCurrent_t cuCtxSetCurrent = nullptr;
+  cuDeviceGetAttribute_t cuDeviceGetAttribute = nullptr;
+  cuModuleLoadData_t cuModuleLoadData = nullptr;
+  cuModuleGetFunction_t cuModuleGetFunction = nullptr;
+  cuModuleUnload_t cuModuleUnload = nullptr;
+  cuLaunchKernel_t cuLaunchKernel = nullptr;
+
+  void* nvrtc = nullptr;
+  nvrtcCreateProgram_t nvrtcCreateProgram = nullptr;
+  nvrtcCompileProgram_t nvrtcCompileProgram = nullptr;
+  nvrtcGetPTXSize_t nvrtcGetPTXSize = nullptr;
+  nvrtcGetPTX_t nvrtcGetPTX = nullptr;
+  nvrtcGetProgramLogSize_t nvrtcGetProgramLogSize = nullptr;
+  nvrtcGetProgramLog_t nvrtcGetProgramLog = nullptr;
+  nvrtcDestroyProgram_t nvrtcDestroyProgram = nullptr;
+  nvrtcGetErrorString_t nvrtcGetErrorString = nullptr;
 };
 
 struct CacheEntry {
@@ -77,6 +121,7 @@ int g_cap_k = 0;
 int g_cap_m = 0;
 int g_cap_n = 0;  // batch columns for X/Y
 std::unordered_map<const void*, CacheEntry> g_cache;
+std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
 
 // Skip lm_head / vocab-scale uploads (stay on CPU INT4).
 constexpr int kMaxGpuInt4Rows = 65536;
@@ -175,6 +220,72 @@ bool load_apis(std::string& err) {
       !g_api.cublasSgemm) {
     err = "missing CUDA symbols";
     return false;
+  }
+  g_api.cudaGetDeviceProperties =
+      reinterpret_cast<cudaGetDeviceProperties_t>(sym(g_api.cudart, "cudaGetDeviceProperties"));
+
+  // ---- 可选: driver API (nvcuda.dll) + NVRTC, 用于运行时 JIT kernel (no nvcc) ----
+  // 加载失败不致命: jit_available()=false, 走 cublas/CPU 回退。
+#if defined(_WIN32)
+  g_api.nvcuda = load_lib("nvcuda.dll");
+  if (g_api.nvcuda) {
+    g_api.cuCtxGetCurrent = reinterpret_cast<cuCtxGetCurrent_t>(sym(g_api.nvcuda, "cuCtxGetCurrent"));
+    g_api.cuDevicePrimaryCtxRetain =
+        reinterpret_cast<cuDevicePrimaryCtxRetain_t>(sym(g_api.nvcuda, "cuDevicePrimaryCtxRetain"));
+    g_api.cuCtxSetCurrent = reinterpret_cast<cuCtxSetCurrent_t>(sym(g_api.nvcuda, "cuCtxSetCurrent"));
+    g_api.cuDeviceGetAttribute =
+        reinterpret_cast<cuDeviceGetAttribute_t>(sym(g_api.nvcuda, "cuDeviceGetAttribute"));
+    g_api.cuModuleLoadData =
+        reinterpret_cast<cuModuleLoadData_t>(sym(g_api.nvcuda, "cuModuleLoadData"));
+    g_api.cuModuleGetFunction =
+        reinterpret_cast<cuModuleGetFunction_t>(sym(g_api.nvcuda, "cuModuleGetFunction"));
+    g_api.cuModuleUnload = reinterpret_cast<cuModuleUnload_t>(sym(g_api.nvcuda, "cuModuleUnload"));
+    g_api.cuLaunchKernel = reinterpret_cast<cuLaunchKernel_t>(sym(g_api.nvcuda, "cuLaunchKernel"));
+  }
+  {
+    const char* nvrtc_names[] = {"nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_110_0.dll",
+                                 nullptr};
+    for (int d = 0; dirs[d] && !g_api.nvrtc; ++d) {
+      for (int i = 0; nvrtc_names[i] && !g_api.nvrtc; ++i) {
+        const std::string p = std::string(dirs[d]) + nvrtc_names[i];
+        g_api.nvrtc = dirs[d][0] ? load_lib_path(p) : load_lib(nvrtc_names[i]);
+      }
+    }
+  }
+#else
+  g_api.nvcuda = load_lib("libcuda.so.1");
+  if (g_api.nvcuda) {
+    g_api.cuCtxGetCurrent = reinterpret_cast<cuCtxGetCurrent_t>(sym(g_api.nvcuda, "cuCtxGetCurrent"));
+    g_api.cuDevicePrimaryCtxRetain =
+        reinterpret_cast<cuDevicePrimaryCtxRetain_t>(sym(g_api.nvcuda, "cuDevicePrimaryCtxRetain"));
+    g_api.cuCtxSetCurrent = reinterpret_cast<cuCtxSetCurrent_t>(sym(g_api.nvcuda, "cuCtxSetCurrent"));
+    g_api.cuDeviceGetAttribute =
+        reinterpret_cast<cuDeviceGetAttribute_t>(sym(g_api.nvcuda, "cuDeviceGetAttribute"));
+    g_api.cuModuleLoadData =
+        reinterpret_cast<cuModuleLoadData_t>(sym(g_api.nvcuda, "cuModuleLoadData"));
+    g_api.cuModuleGetFunction =
+        reinterpret_cast<cuModuleGetFunction_t>(sym(g_api.nvcuda, "cuModuleGetFunction"));
+    g_api.cuModuleUnload = reinterpret_cast<cuModuleUnload_t>(sym(g_api.nvcuda, "cuModuleUnload"));
+    g_api.cuLaunchKernel = reinterpret_cast<cuLaunchKernel_t>(sym(g_api.nvcuda, "cuLaunchKernel"));
+  }
+  if (!g_api.nvrtc) g_api.nvrtc = load_lib("libnvrtc.so.12");
+  if (!g_api.nvrtc) g_api.nvrtc = load_lib("libnvrtc.so");
+#endif
+  if (g_api.nvrtc) {
+    g_api.nvrtcCreateProgram =
+        reinterpret_cast<nvrtcCreateProgram_t>(sym(g_api.nvrtc, "nvrtcCreateProgram"));
+    g_api.nvrtcCompileProgram =
+        reinterpret_cast<nvrtcCompileProgram_t>(sym(g_api.nvrtc, "nvrtcCompileProgram"));
+    g_api.nvrtcGetPTXSize = reinterpret_cast<nvrtcGetPTXSize_t>(sym(g_api.nvrtc, "nvrtcGetPTXSize"));
+    g_api.nvrtcGetPTX = reinterpret_cast<nvrtcGetPTX_t>(sym(g_api.nvrtc, "nvrtcGetPTX"));
+    g_api.nvrtcGetProgramLogSize =
+        reinterpret_cast<nvrtcGetProgramLogSize_t>(sym(g_api.nvrtc, "nvrtcGetProgramLogSize"));
+    g_api.nvrtcGetProgramLog =
+        reinterpret_cast<nvrtcGetProgramLog_t>(sym(g_api.nvrtc, "nvrtcGetProgramLog"));
+    g_api.nvrtcDestroyProgram =
+        reinterpret_cast<nvrtcDestroyProgram_t>(sym(g_api.nvrtc, "nvrtcDestroyProgram"));
+    g_api.nvrtcGetErrorString =
+        reinterpret_cast<nvrtcGetErrorString_t>(sym(g_api.nvrtc, "nvrtcGetErrorString"));
   }
   return true;
 }
@@ -398,6 +509,10 @@ bool enable(size_t vram_budget_bytes) {
 
 void disable() {
   std::lock_guard<std::mutex> lock(g_mu);
+  for (auto& kv : g_jit_modules) {
+    if (kv.second && g_api.cuModuleUnload) g_api.cuModuleUnload(kv.second);
+  }
+  g_jit_modules.clear();
   for (auto& kv : g_cache) {
     if (kv.second.d_W) g_api.cudaFree(kv.second.d_W);
   }
@@ -411,6 +526,110 @@ void disable() {
   g_used = 0;
   g_enabled = false;
   g_status = "disabled";
+}
+
+bool jit_available() {
+  return g_enabled && g_api.nvrtc && g_api.nvcuda && g_api.nvrtcCreateProgram &&
+         g_api.nvrtcCompileProgram && g_api.nvrtcGetPTXSize && g_api.nvrtcGetPTX &&
+         g_api.cuModuleLoadData && g_api.cuModuleGetFunction && g_api.cuLaunchKernel;
+}
+
+namespace {
+bool ensure_driver_ctx() {
+  if (!g_api.cuCtxGetCurrent) return false;
+  void* cur = nullptr;
+  if (g_api.cuCtxGetCurrent(&cur) != 0) return false;
+  if (cur) return true;
+  if (!g_api.cuDevicePrimaryCtxRetain || !g_api.cuCtxSetCurrent) return false;
+  void* pctx = nullptr;
+  if (g_api.cuDevicePrimaryCtxRetain(&pctx, 0) != 0 || !pctx) return false;
+  return g_api.cuCtxSetCurrent(pctx) == 0;
+}
+
+std::string jit_arch_opt() {
+  int major = 8, minor = 0;
+  // CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR=75, MINOR=76
+  if (g_api.cuDeviceGetAttribute) {
+    int mj = 0, mn = 0;
+    if (g_api.cuDeviceGetAttribute(&mj, 75, 0) == 0 &&
+        g_api.cuDeviceGetAttribute(&mn, 76, 0) == 0 && mj >= 1 && mj <= 99) {
+      major = mj;
+      minor = mn;
+    }
+  }
+  return "--gpu-architecture=compute_" + std::to_string(major) + std::to_string(minor);
+}
+}  // namespace
+
+bool jit_compile(const char* cuda_src, const char* kernel_name, void** out_fn) {
+  if (out_fn) *out_fn = nullptr;
+  if (!cuda_src || !kernel_name || !out_fn) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (!jit_available()) {
+    g_status = "jit unavailable (nvrtc/nvcuda)";
+    return false;
+  }
+  if (!ensure_driver_ctx()) {
+    g_status = "jit: no driver ctx";
+    return false;
+  }
+  void* prog = nullptr;
+  if (g_api.nvrtcCreateProgram(&prog, cuda_src, kernel_name, 0, nullptr, nullptr) != 0 || !prog) {
+    g_status = "jit: nvrtcCreateProgram failed";
+    return false;
+  }
+  const std::string arch = jit_arch_opt();
+  const char* opts[] = {arch.c_str(), "--use_fast_math"};
+  const int rc = g_api.nvrtcCompileProgram(prog, 2, opts);
+  if (rc != 0) {
+    size_t logsz = 0;
+    std::string log = "jit: compile failed";
+    if (g_api.nvrtcGetProgramLogSize && g_api.nvrtcGetProgramLog) {
+      g_api.nvrtcGetProgramLogSize(prog, &logsz);
+      std::string buf(logsz, '\0');
+      g_api.nvrtcGetProgramLog(prog, buf.data());
+      log += ": " + buf;
+    }
+    if (g_api.nvrtcGetErrorString) log += std::string(" [") + g_api.nvrtcGetErrorString(rc) + "]";
+    g_status = log.substr(0, 512);
+    if (g_api.nvrtcDestroyProgram) g_api.nvrtcDestroyProgram(&prog);
+    return false;
+  }
+  size_t ptxsz = 0;
+  if (g_api.nvrtcGetPTXSize(prog, &ptxsz) != 0 || ptxsz == 0) {
+    g_status = "jit: no ptx";
+    if (g_api.nvrtcDestroyProgram) g_api.nvrtcDestroyProgram(&prog);
+    return false;
+  }
+  std::string ptx(ptxsz, '\0');
+  if (g_api.nvrtcGetPTX(prog, ptx.data()) != 0) {
+    g_status = "jit: get ptx failed";
+    if (g_api.nvrtcDestroyProgram) g_api.nvrtcDestroyProgram(&prog);
+    return false;
+  }
+  if (g_api.nvrtcDestroyProgram) g_api.nvrtcDestroyProgram(&prog);
+  void* mod = nullptr;
+  if (g_api.cuModuleLoadData(&mod, ptx.c_str()) != 0 || !mod) {
+    g_status = "jit: cuModuleLoadData failed";
+    return false;
+  }
+  void* fn = nullptr;
+  if (g_api.cuModuleGetFunction(&fn, mod, kernel_name) != 0 || !fn) {
+    g_status = "jit: cuModuleGetFunction failed";
+    if (g_api.cuModuleUnload) g_api.cuModuleUnload(mod);
+    return false;
+  }
+  g_jit_modules[fn] = mod;
+  *out_fn = fn;
+  return true;
+}
+
+bool jit_launch(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
+                unsigned bz, unsigned shmem_bytes, void** params) {
+  if (!fn || !g_api.cuLaunchKernel) return false;
+  if (!ensure_driver_ctx()) return false;
+  return g_api.cuLaunchKernel(fn, gx, gy, gz, bx, by, bz, shmem_bytes, nullptr, params,
+                              nullptr) == 0;
 }
 
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {

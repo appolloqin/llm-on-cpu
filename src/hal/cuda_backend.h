@@ -48,6 +48,16 @@ void device_free(void* p);
 bool h2d(void* dst, const void* src, size_t bytes);
 bool d2h(void* dst, const void* src, size_t bytes);
 
+// ---- NVRTC JIT (no nvcc): 运行时编译 CUDA kernel, driver API 启动 ----
+// 动态加载 nvrtc64_XXX.dll + nvcuda.dll; 任一缺失 → jit_available()=false, 优雅降级。
+bool jit_available();
+// 编译 cuda_src 中名为 kernel_name 的 __global__ kernel; 成功返回 true 并填充 out_fn(供 jit_launch)。
+// 失败返回 false, g_status 记录原因。函数句柄缓存到 disable() 自动卸载。
+bool jit_compile(const char* cuda_src, const char* kernel_name, void** out_fn);
+// 启动已编译 kernel; params 为内核参数地址数组(void*[])。grid/block 为线程组织。
+bool jit_launch(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
+                unsigned bz, unsigned shmem_bytes, void** params);
+
 void log_status();
 
 }  // namespace llmoc::hal::cuda

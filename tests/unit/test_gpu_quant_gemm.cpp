@@ -94,3 +94,32 @@ TINY_TEST(GpuQuant, Nvfp4MatchesCpuIfCuda) {
   }
   hal::cuda::disable();
 }
+
+TINY_TEST(GpuQuant, JitCompilesAndLaunches) {
+  if (!hal::cuda::probe_available() || !hal::cuda::enable(256ull << 20)) {
+    EXPECT_TRUE(true);
+    return;
+  }
+  if (!hal::cuda::jit_available()) {
+    EXPECT_TRUE(true);  // 无 nvrtc/nvcuda: 优雅降级
+    hal::cuda::disable();
+    return;
+  }
+  const char* src = R"CUDA(
+extern "C" __global__ void add1(float* x) { x[0] += 1.0f; }
+)CUDA";
+  void* fn = nullptr;
+  EXPECT_TRUE(hal::cuda::jit_compile(src, "add1", &fn));
+  EXPECT_TRUE(fn != nullptr);
+  float host = 41.f;
+  void* d = hal::cuda::device_alloc(sizeof(float));
+  EXPECT_TRUE(d != nullptr);
+  EXPECT_TRUE(hal::cuda::h2d(d, &host, sizeof(float)));
+  void* params[] = {&d};
+  EXPECT_TRUE(hal::cuda::jit_launch(fn, 1, 1, 1, 1, 1, 1, 0, params));
+  float out = 0.f;
+  EXPECT_TRUE(hal::cuda::d2h(&out, d, sizeof(float)));
+  EXPECT_TRUE(out == 42.f);
+  hal::cuda::device_free(d);
+  hal::cuda::disable();
+}
