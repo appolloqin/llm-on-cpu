@@ -1,0 +1,31 @@
+# INT4 hybrid_gpu 验收配置
+model:
+  path: models/Qwen3.5-4B.int4.qlwc
+  dtype: int4
+  mtp: auto
+  tokenizer_dir: models/Qwen3.5-4B-hf
+
+mode: hybrid_gpu
+
+layer_stream:
+  window_layers: 2
+  device: cpu
+  max_window_mb: 0
+  auto: true
+
+tiers:
+  dram_hot_gb: 6
+  kv_pool_gb: 1
+  prefetch_buf_gb: 0.5
+  gpu_vram_gb: 4
+
+decode:
+  spec_k: 3
+  max_new_tokens: 204800
+
+io:
+  workers: 2
+
+server:
+  port: 15085
+  api_key_env: LLMOC_API_KEY

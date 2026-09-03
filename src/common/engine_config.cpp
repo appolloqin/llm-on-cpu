@@ -78,6 +78,10 @@ EngineConfig EngineConfig::load(const std::string& path) {
     const std::string key = trim(line.substr(0, colon));
     const std::string val = trim(line.substr(colon + 1));
     const std::string full = section.empty() ? key : section + "." + key;
+    // 根级 key(无 section): mode, server.port 等。section 只在碰到 "x:" 头时被覆写,
+    // 不会因为 "model:" 结束而清空, 所以根级 key 会被错误归到 model.* 下。直接按 key 识别。
+    if (key == "mode") cfg.mode = val;
+    else if (key == "server.port") cfg.server_port = std::stoi(val);
     if (full == "model.path") cfg.model_path = val;
     else if (full == "model.dtype") cfg.model_dtype = val;
     else if (full == "model.mtp") cfg.mtp = val;
