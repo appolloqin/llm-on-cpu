@@ -747,6 +747,10 @@ __device__ __forceinline__ float f16_to_f32_dev(unsigned short h) {
   return __uint_as_float(bits);
 }
 
+// 多行/块的 GEMV kernel: 每个 block 处理 ROWS_PER_BLOCK 行, blockDim.x 并行 K 维。
+// 关键优化: scales/zeros 加载到 shared mem(避免重复 FP16→FP32), qrow 按 int4 向量化读
+// (16 字节 = 32 INT4 = 2 warp-iter), x 按 float4 向量化读(16 字节 = 4 floats)。
+#define ROWS_PER_BLOCK 8
 extern "C" __global__ void gemv_int4(
     const unsigned char* __restrict__ qweight,
     const unsigned short* __restrict__ scales,
@@ -754,38 +758,71 @@ extern "C" __global__ void gemv_int4(
     const float* __restrict__ x,
     float* __restrict__ y,
     int M, int K, int ng, int gs, int is_awq) {
-  const int m = blockIdx.x;
-  if (m >= M) return;
+  const int row0 = blockIdx.x * ROWS_PER_BLOCK;
+  const int tid = threadIdx.x;
   const int rb = (K + 1) >> 1;
+  // 共享 scales/zeros(ng <= K/128 ≈ 24, 适合 shared)
+  extern __shared__ unsigned short smem_buf[];
+  unsigned short* s_scales = smem_buf;
+  unsigned short* s_zeros = is_awq ? nullptr : smem_buf + ROWS_PER_BLOCK * ng;
+  for (int row_off = 0; row_off < ROWS_PER_BLOCK; ++row_off) {
+    const int m = row0 + row_off;
+    if (m >= M) break;
+    for (int g = tid; g < ng; g += blockDim.x) {
+      s_scales[row_off * ng + g] = scales[m * ng + g];
+    }
+    if (!is_awq) {
+      for (int g = tid; g < ng; g += blockDim.x) {
+        s_zeros[row_off * ng + g] = zeros[m * ng + g];
+      }
+    }
+  }
+  __syncthreads();
+  // 主体: 每行一个 warp 处理; blockDim.x / 32 warps_per_block 行并行
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  if (warp_id >= ROWS_PER_BLOCK) return;
+  const int m = row0 + warp_id;
+  if (m >= M) return;
   const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
   float acc = 0.f;
-  for (int k = threadIdx.x; k < K; k += blockDim.x) {
+  // 每 lane 处理 K/32 个连续 k; 用 uchar4 向量化读 packed weight(8 INT4/load)
+  for (int k = lane * 8; k < K; k += 32 * 8) {
     const int g = k / gs;
-    const float s = f16_to_f32_dev(scales[(size_t)m * ng + g]);
-    const unsigned char b = qrow[k >> 1];
-    const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-    float w;
-    if (is_awq) {
-      w = (float)(qi - 7) * s;
+    const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
+    const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
+    // 向量化读 4 bytes = 8 INT4; 安全前提: rb%4==0(K=8*n)
+    const int kp = k >> 1;
+    if (kp + 3 < rb) {
+      const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
+      // v.x[lo,hi], v.z[lo,hi] 等; 每字节 2 个 INT4
+      const float x0 = x[k + 0], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
+      const float x4 = x[k + 4], x5 = x[k + 5], x6 = x[k + 6], x7 = x[k + 7];
+      const float w0 = ((float)((v.x & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w1 = ((float)((v.x >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w2 = ((float)((v.y & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w3 = ((float)((v.y >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w4 = ((float)((v.z & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w5 = ((float)((v.z >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w6 = ((float)((v.w & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w7 = ((float)((v.w >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      acc += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
     } else {
-      const float z = zeros ? f16_to_f32_dev(zeros[(size_t)m * ng + g]) : 0.f;
-      w = (float)qi * s + z;
+      // 尾部逐字节处理
+      for (int kk = k; kk < k + 8 && kk < K; ++kk) {
+        const int gg = kk / gs;
+        const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
+        const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
+        const unsigned char b = qrow[kk >> 1];
+        const int qi = (kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+        const float w = ((float)qi - (is_awq ? 7 : 0)) * ss + (is_awq ? 0.f : zz);
+        acc += x[kk] * w;
+      }
     }
-    acc += x[k] * w;
   }
-  // warp 内归约
+  // warp reduce
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
-  __shared__ float smem[32];
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  if (lane == 0) smem[warp] = acc;
-  __syncthreads();
-  if (warp == 0) {
-    const int nwarp = (blockDim.x + 31) >> 5;
-    float v = (lane < nwarp) ? smem[lane] : 0.f;
-    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
-    if (lane == 0) y[m] = v;
-  }
+  if (lane == 0) y[m] = acc;
 }
 )CUDA";
 
@@ -810,7 +847,13 @@ bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
   if (!fn) return false;
   int is_awq_i = is_awq ? 1 : 0;
   void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_x, &d_y, &M, &K, &ng, &gs, &is_awq_i};
-  return jit_launch(fn, static_cast<unsigned>(M), 1, 1, 256, 1, 1, 0, params);
+  constexpr int ROWS_PER_BLOCK = 8;
+  constexpr int BLOCK_DIM = ROWS_PER_BLOCK * 32;  // 8 warps × 32 = 256
+  const int blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+  const unsigned shmem = sizeof(unsigned short) * ROWS_PER_BLOCK * ng *
+                         (is_awq ? 1 : 2);
+  return jit_launch(fn, static_cast<unsigned>(blocks), 1, 1,
+                    static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
 }
 
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {
