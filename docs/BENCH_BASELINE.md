@@ -131,3 +131,23 @@ $env:OMP_NUM_THREADS='8'
 
 hybrid_gpu 已追平 CPU baseline; 进一步要 ≥30 tok/s 需减少 H2D/D2H + 用 CUDA Graphs 把 33 次
 GEMV 合成一次发射。
+
+### 4B hybrid_gpu 详细 profiling (Task 2.3 调研)
+
+LLMOC_PROFILE=1 时 forward_to_hidden 末打印每 token 耗时分解(单位 ms):
+
+| 阶段                       | 典型值       | 说明                                   |
+|----------------------------|------------:|----------------------------------------|
+| layers_linear (27 GDN)     | 100-120     | 每层 ~3.7ms，含 5 GEMV + conv1d + gated_delta_recurrent |
+| layers_full  (5 SA)        |  30-35      | 每层 ~6.7ms，含 4 GEMV + attn_decode_one |
+| lm_head (V=248320 GEMV)   |  22-28      | CPU AVX2 INT4 fast path                 |
+| 总                         | 150-180     | 对应 5.5-6.5 tok/s                      |
+
+**lm_head GPU 路径实验**：尝试用 gemm_view 替代 hal::gemm_int4，结果退化到 2.6 tok/s。
+原因：ench_decode_tps 未调 warm_gpu_int4_weights() → INT4 JIT 路径失败 → 走
+cublasSgemm 回退 + 248K float D2H，比 CPU AVX2 INT4 慢。故 lm_head 保持 CPU 路径。
+
+**到 ≥30 tok/s 的瓶颈**：
+1. Linear 层 CPU 开销（conv1d + gated_delta_recurrent + rmsnorm + reshape）占大头
+2. 每 token 5 次 GEMV × 8 us H2D + 10 us D2H ≈ 80 us（次要）
+3. 需要把 rmsnorm / gated_delta / silu / conv1d 也搬到 GPU 并用 CUDA Graphs 合并发射
