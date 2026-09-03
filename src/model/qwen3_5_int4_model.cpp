@@ -353,6 +353,10 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
     try_one(lp.wup);
     try_one(lp.wdown);
   }
+  // lm_head 量化形态上卡 (prefetch_int4_weight 走 resident → 走 try_gemm_int4 走 JIT gemv_int4, 单次 24ms→3ms)
+  if (lm_is_int4_) try_one(lm_int4_);
+  // embed 量化形态可选也上卡
+  if (emb_is_int4_) try_one(emb_int4_);
   LOG_INFO("Qwen35Int4: warm_gpu_int4 ok=%d fail/budget=%d used=%.2fGiB / budget=%.2fGiB", n_ok,
            n_fail, hal::cuda::vram_used() / double(1ull << 30),
            hal::cuda::vram_budget() / double(1ull << 30));
@@ -800,16 +804,24 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   prefix_logits_.clear();
   logits.resize(static_cast<size_t>(V));
   if (lm_is_int4_) {
-#if defined(LLMOC_ENABLE_AVX2)
-    if (lm_int4_.qweight) {
-      const int rb = (lm_int4_.K + 1) / 2;
-      _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
-      if (V > 4)
-        _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight + static_cast<size_t>(4) * rb),
-                     _MM_HINT_T0);
+    // 先尝试 GPU resident INT4 (warm_gpu_int4 把 lm_head 也上传 → try_gemm_int4 走 JIT gemv_int4
+    // M=248320 量化字节 ~318MB, K=2560 → ~3-5ms; 比 CPU AVX2 ~24ms 快 5-8x)
+    bool gpu_ok = false;
+    if (hal::cuda::enabled()) {
+      gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
     }
+    if (!gpu_ok) {
+#if defined(LLMOC_ENABLE_AVX2)
+      if (lm_int4_.qweight) {
+        const int rb = (lm_int4_.K + 1) / 2;
+        _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
+        if (V > 4)
+          _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight + static_cast<size_t>(4) * rb),
+                       _MM_HINT_T0);
+      }
 #endif
-    hal::gemm_int4(h.data(), lm_int4_, logits.data());
+      hal::gemm_int4(h.data(), lm_int4_, logits.data());
+    }
   } else {
     hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
   }
@@ -825,12 +837,31 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
 }
 
 bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
-                                            SessionCache& cache, int32_t& out_token) {
+                                             SessionCache& cache, int32_t& out_token) {
   if (tokens.size() != 1 || !lm_is_int4_) return false;
   const int H = cfg_.hidden;
   auto& sc = scratch();
   Int4Scratch::fit(sc.last, static_cast<size_t>(H));
   forward_to_hidden(tokens, cache, false, sc.last.data());
+  // 先尝试 GPU resident INT4 (JIT gemv_int4 M=248320 ~3ms); 失败回退 CPU AVX2 24ms
+  if (hal::cuda::enabled()) {
+    Int4Scratch::fit(sc.logits, lm_int4_.M);
+    if (hal::cuda::try_gemm_int4(sc.last.data(), lm_int4_, sc.logits.data())) {
+      static bool info_once = false;
+      if (!info_once) { LOG_INFO("lm_head GPU path OK (resident JIT)"); info_once = true; }
+      const float* lp = sc.logits.data();
+      float best_val = lp[0];
+      int best = 0;
+      for (int i = 1; i < lm_int4_.M; ++i) {
+        if (lp[i] > best_val) { best_val = lp[i]; best = i; }
+      }
+      out_token = best;
+      last_logits_.assign(1, best_val);
+      prefix_hiddens_.clear();
+      prefix_logits_.clear();
+      return true;
+    }
+  }
 #if defined(LLMOC_ENABLE_AVX2)
   if (lm_int4_.qweight)
     _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);

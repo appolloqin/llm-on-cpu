@@ -10,6 +10,7 @@
 #include "common/engine_config.h"
 #include "common/log.h"
 #include "common/omp_tune.h"
+#include "hal/cuda_backend.h"
 #include "model/generate.h"
 #include "model/qwen3_5_int4_model.h"
 #include "model/qwen3_5_model.h"
@@ -46,6 +47,14 @@ int main(int argc, char** argv) {
     qstore.open(cfg.model_path);
     auto m = std::make_unique<llmoc::model::Qwen35Int4Model>();
     m->load(&qstore, tok_dir + "/config.json");
+    // hybrid / pure_gpu: 启用 CUDA + 上传层权重 (resident) 让 layer GEMV 走 JIT
+    if (cfg.mode == "hybrid_gpu" || cfg.mode == "pure_gpu") {
+      const double vram_gb = cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0;
+      if (llmoc::hal::cuda::probe_available() &&
+          llmoc::hal::cuda::enable(static_cast<size_t>(vram_gb * (1ull << 30)))) {
+        m->warm_gpu_int4_weights();
+      }
+    }
     model = std::move(m);
   } else {
     llmoc::wt::WeightManager::Config wcfg;

@@ -224,6 +224,9 @@ target_link_libraries(lwc_verify PRIVATE llmoc_weights)
 add_executable(int4_gemm_bench tools/int4_gemm_bench/main.cpp)
 target_link_libraries(int4_gemm_bench PRIVATE llmoc_weights)
 
+add_executable(lmhead_jit_bench tools/lmhead_jit_bench/main.cpp)
+target_link_libraries(lmhead_jit_bench PRIVATE llmoc_weights)
+
 add_executable(nan_probe
   tools/nan_probe/main.cpp
   src/model/qwen3_5_int4_model.cpp
