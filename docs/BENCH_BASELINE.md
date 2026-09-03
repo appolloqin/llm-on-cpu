@@ -120,3 +120,14 @@ $env:OMP_NUM_THREADS='8'
 
 **根因**: JIT GEMV kernel 不如 AVX2 INT4 + 每 token H2D/D2H 开销 ~0.66ms ≈ 占了一半 forward 时间。
 **修复方向 (Task 2.x)**: kernel 向量化 (uchar4→8 INT4, shared mem scales), 激活驻设备, 逐层零拷贝。
+
+### 4B e2e 后续 (Task 1.6 + 2.x)
+
+| 优化点                          | decode tok/s | ms/tok |
+|---------------------------------|-------------:|-------:|
+| baseline (CPU AVX2 INT4)        | 7.88         | 127    |
+| hybrid_gpu + 单线程/行 kernel   | 2.71         | 369    |
+| hybrid_gpu + 8行/block + vec4   | **7.52**     | 132    |
+
+hybrid_gpu 已追平 CPU baseline; 进一步要 ≥30 tok/s 需减少 H2D/D2H + 用 CUDA Graphs 把 33 次
+GEMV 合成一次发射。
