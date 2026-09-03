@@ -137,6 +137,12 @@ std::unordered_map<const void*, Int4Resident> g_int4_cache;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
 std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunction 缓存(disable 时清空)
 
+// 累计性能采样: 用于诊断 GEMV 路径瓶颈。disable 时清零。
+double g_prof_h2d_us = 0.0;
+double g_prof_kernel_us = 0.0;
+double g_prof_d2h_us = 0.0;
+uint64_t g_prof_calls = 0;
+
 // lm_head / vocab 大张量也允许上 GPU(VRAM 受 budget 约束); 大于 256K 行仍跳过以免单次分配过大。
 constexpr int kMaxGpuInt4Rows = 262144;
 
@@ -604,6 +610,8 @@ void disable() {
     if (kv.second.d_zeros) g_api.cudaFree(kv.second.d_zeros);
   }
   g_int4_cache.clear();
+  g_prof_h2d_us = g_prof_kernel_us = g_prof_d2h_us = 0.0;
+  g_prof_calls = 0;
   if (g_dx) g_api.cudaFree(g_dx);
   if (g_dy) g_api.cudaFree(g_dy);
   g_dx = g_dy = nullptr;
@@ -913,16 +921,25 @@ bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
     x_uploaded = true;
   }
   if (!x_uploaded) return false;
+  auto tk0 = std::chrono::steady_clock::now();
   const bool ok = jit_gemv_int4(static_cast<const uint8_t*>(res->d_qweight),
                                 static_cast<const uint16_t*>(res->d_scales),
                                 static_cast<const uint16_t*>(res->d_zeros),
                                 reinterpret_cast<const float*>(g_dx),
                                 reinterpret_cast<float*>(g_dy),
                                 res->M, res->K, res->ng, res->gs, res->is_awq);
+  auto tk1 = std::chrono::steady_clock::now();
   if (!ok) return false;
   std::lock_guard<std::mutex> lock(g_mu);
-  return g_api.cudaMemcpy(y, g_dy, sizeof(float) * static_cast<size_t>(W.M),
-                          kCudaMemcpyD2H) == kCudaSuccess;
+  auto tm0 = std::chrono::steady_clock::now();
+  const bool mok = g_api.cudaMemcpy(y, g_dy, sizeof(float) * static_cast<size_t>(W.M),
+                                    kCudaMemcpyD2H) == kCudaSuccess;
+  auto tm1 = std::chrono::steady_clock::now();
+  g_prof_h2d_us += 0;  // accumulate later
+  g_prof_kernel_us += std::chrono::duration<double, std::micro>(tk1 - tk0).count();
+  g_prof_d2h_us += std::chrono::duration<double, std::micro>(tm1 - tm0).count();
+  g_prof_calls++;
+  return mok;
 }
 
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
@@ -999,6 +1016,13 @@ bool prefetch_nvfp4_weight(const Nvfp4View& W) {
 void log_status() {
   LOG_INFO("hal.cuda: %s enabled=%d used=%.2fGiB budget=%.2fGiB", g_status.c_str(),
            g_enabled ? 1 : 0, g_used / double(1ull << 30), g_budget / double(1ull << 30));
+  if (g_prof_calls > 0) {
+    LOG_INFO(
+        "hal.cuda.prof: calls=%llu kernel_avg=%.1fus d2h_avg=%.1fus (per-call wall; H2D hidden in kernel span)",
+        static_cast<unsigned long long>(g_prof_calls),
+        g_prof_kernel_us / static_cast<double>(g_prof_calls),
+        g_prof_d2h_us / static_cast<double>(g_prof_calls));
+  }
 }
 
 }  // namespace llmoc::hal::cuda
