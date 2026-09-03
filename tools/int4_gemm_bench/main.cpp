@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "hal/cpu_ops.h"
+#include "hal/cuda_backend.h"
 #include "hal/int4_ops.h"
 
 using SteadyClock = std::chrono::steady_clock;
@@ -62,6 +63,43 @@ static void bench_shape(int M, int K, int iters, int gs) {
   const double gflops = (2.0 * M * K) / (ms * 1e6);
 
   std::printf("[int4_gemm_bench] INT4  M=%7d K=%d  %.3f ms/call  %.1f GFLOP/s\n", M, K, ms, gflops);
+
+  // GPU 路径(若可用): FP32 cublas GEMV + INT4 GEMV JIT kernel。
+  if (M == 1 || K == 1) return;
+  if (!llmoc::hal::cuda::probe_available()) {
+    std::printf("[int4_gemm_bench]        cuda skipped: probe_available=false\n");
+    return;
+  }
+  // INT4 量化字节: M*K/2 (权重) + 2*M*ng*sizeof(uint16) (scales + zeros)  ≈ M*K/2 + 微量
+  const int gs_local = gs > 0 ? gs : 128;
+  const size_t int4_bytes = (static_cast<size_t>(M) * K) / 2 +
+                             4ull * M * ((K + gs_local - 1) / gs_local);
+  const size_t budget = std::max(2ull << 30, int4_bytes + (32ull << 20));
+  if (!llmoc::hal::cuda::enable(budget)) {
+    std::printf("[int4_gemm_bench]        cuda skipped: enable failed\n");
+    return;
+  }
+  llmoc::hal::cuda::log_status();
+  if (!llmoc::hal::cuda::prefetch_int4_weight(W)) {
+    std::printf(
+        "[int4_gemm_bench]        cuda skipped: prefetch failed (M=%d K=%d int4_bytes=%.2f MiB)\n",
+        M, K, int4_bytes / (1024.0 * 1024.0));
+    llmoc::hal::cuda::log_status();
+    llmoc::hal::cuda::disable();
+    return;
+  }
+  for (int i = 0; i < 2; ++i) llmoc::hal::cuda::try_gemm_int4(x.data(), W, y.data());
+  auto gt0 = SteadyClock::now();
+  for (int i = 0; i < iters; ++i) llmoc::hal::cuda::try_gemm_int4(x.data(), W, y.data());
+  auto gt1 = SteadyClock::now();
+  const double gms = std::chrono::duration<double, std::milli>(gt1 - gt0).count() /
+                     static_cast<double>(iters);
+  const double ggflops = (2.0 * M * K) / (gms * 1e6);
+  std::printf(
+      "[int4_gemm_bench] GPU    M=%7d K=%d  %.3f ms/call  %.1f GFLOP/s  (jit=%d)\n",
+      M, K, gms, ggflops, llmoc::hal::cuda::jit_available() ? 1 : 0);
+  llmoc::hal::cuda::log_status();
+  llmoc::hal::cuda::disable();
 }
 
 int main(int argc, char** argv) {
