@@ -116,6 +116,7 @@ struct Int4Resident {
   int M = 0, K = 0, ng = 0, gs = 0;
   bool is_awq = true;
   size_t bytes = 0;
+  uint64_t last_use = 0;
 };
 
 Api g_api;
@@ -134,6 +135,7 @@ int g_cap_m = 0;
 int g_cap_n = 0;  // batch columns for X/Y
 std::unordered_map<const void*, CacheEntry> g_cache;
 std::unordered_map<const void*, Int4Resident> g_int4_cache;
+uint64_t g_lru_tick = 0;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
 std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunction 缓存(disable 时清空)
 
@@ -402,6 +404,7 @@ const Int4Resident* ensure_int4_resident(const qlwc::Int4View& W) {
   auto it = g_int4_cache.find(W.qweight);
   if (it != g_int4_cache.end()) {
     if (it->second.M != W.M || it->second.K != W.K) return nullptr;
+    it->second.last_use = ++g_lru_tick;
     return &it->second;
   }
   const int gs = W.group_size > 0 ? W.group_size : 128;
@@ -412,7 +415,24 @@ const Int4Resident* ensure_int4_resident(const qlwc::Int4View& W) {
   const size_t ns = static_cast<size_t>(W.M) * ng;
   const size_t nz = is_awq ? 0 : ns;
   const size_t total = nw + ns * sizeof(uint16_t) + nz * sizeof(uint16_t);
-  if (g_budget > 0 && g_used + total > g_budget) return nullptr;
+  if (g_budget > 0 && g_used + total > g_budget) {
+    // LRU 腾出空间
+    std::vector<std::pair<uint64_t, const void*>> items;
+    items.reserve(g_int4_cache.size());
+    for (auto& kv : g_int4_cache) items.push_back({kv.second.last_use, kv.first});
+    std::sort(items.begin(), items.end());
+    for (auto& p : items) {
+      if (g_used + total <= g_budget) break;
+      auto it2 = g_int4_cache.find(p.second);
+      if (it2 == g_int4_cache.end()) continue;
+      if (it2->second.d_qweight) g_api.cudaFree(it2->second.d_qweight);
+      if (it2->second.d_scales) g_api.cudaFree(it2->second.d_scales);
+      if (it2->second.d_zeros) g_api.cudaFree(it2->second.d_zeros);
+      g_used -= it2->second.bytes;
+      g_int4_cache.erase(it2);
+    }
+    if (g_used + total > g_budget) return nullptr;
+  }
   void* dq = nullptr;
   void* ds = nullptr;
   void* dz = nullptr;
@@ -454,6 +474,7 @@ const Int4Resident* ensure_int4_resident(const qlwc::Int4View& W) {
   e.gs = gs;
   e.is_awq = is_awq;
   e.bytes = total;
+  e.last_use = ++g_lru_tick;
   g_int4_cache[W.qweight] = e;
   g_used += total;
   return &g_int4_cache[W.qweight];
