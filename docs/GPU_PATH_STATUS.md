@@ -1,88 +1,63 @@
-# 4B hybrid_gpu 到 ≥30 tok/s 路径 (Task 2.3 现状评估)
+# FreeToken-Style Hybrid GPU — 阶段总结
 
-## 当前状态 (freetoken-hybrid-gpu @ 4cd835f)
+## 现状 (commit bb07b03)
 
-| 阶段 | hybrid_gpu 4B decode |
-|------|-------:|
-| warmup 上传 ~310MB 层 INT4 权重 (resident) | 1s (一次性) |
-| 224 个层 GEMV (GPU JIT gemv_int4) | ~50ms |
-| gated_delta_recurrent + residual + conv (CPU) | ~35ms |
-| lm_head GEMV (hal::gemm_int4 CPU) | **24ms** |
-| MTP + draft + verify | 0ms (禁用) |
-| **总和** | **~130ms → 7.5 tok/s** |
+| 阶段 | tok/s (pure_decode, M=1, RTX4060 + i7-14650HX) |
+|------|--------:|
+| CPU baseline (engine_int4, OMP=8) | 7.88 |
+| hybrid_gpu @ commit 4cd835f (LRU) | 13.11 |
+| hybrid_gpu @ commit **bb07b03** (lm W16 + 7GiB) | **19.77** |
 
-## 已达到的优化 (commits)
+**已提升 2.5×**。
 
-- `e4d33bc` INT4 GEMV kernel (8 rows/block + vec uchar4 + shared scales)
-- `5b79e16` INT4 量化字节驻留 VRAM, JIT GEMV 路径
-- `c44b6bd` 性能优化追平 CPU 7.52 tok/s
-- `b3d1b8e` 放开行数上限让 lm_head 可上卡
-- `4cd835f` VRAM 缓存 LRU 淘汰
+## 已实现的优化 (本会话新增 commits)
 
-## 实测: lm_head 上 GPU (130→316 之前的回归)
+- `4cd835f` INT4 VRAM cache LRU (Task 3)
+- `c6cfa72` INT4 lm_head GPU dispatch + bench 暖机
+- `bb07b03` BF16/tied lm_head → prefetch_w16 + 7GiB budget
 
-`--warm > 0` + `warm_gpu_int4_weights` 触发上传 layer + lm_head 全上卡后,
-首次 GEMV 走 JIT 实测反而退化, 因为:
+## 实测 profile 分解 (hybrid_gpu 4B)
 
-1. **kMaxGpuInt4Rows**: lm_head N=248320, 旧上限 65536 → resident 路径跳过,
-   回退到 `ensure_int4_device` 把 1.5GB FP32 上传 (超 budget) → 走 CPU 但带额外 lock 开销
-2. **microbench 实测**:
-   | shape | CPU | GPU resident JIT | 赢家 |
-   |-------|----:|------:|------|
-   | 896x3072 (down) | 0.081 | 0.106 | CPU |
-   | 3584x3072 (mlp) | 0.224 | 0.259 | CPU |
-   | 9216x3072       | 0.508 | 0.672 | CPU |
-   | 248320x3072 lm  | 11.32 | (resident only) | GPU ~15ms |
+| 阶段 | 时间 | 来源 |
+|------|------|------|
+| linear_attn GEMV (4×/layer × 27) | ~28 ms | 7× GEMV launches + H2D/D2H 同步 |
+| full_attn GEMV (4×/layer × 5) | ~8 ms | 同 |
+| lm_head W16 GEMV on GPU | ~10.7 ms | cublas SGEMM 1.27GB fp32 |
+| gated_delta_recurrent CPU | ~5 ms | AVX2 per-head 串行 |
+| conv1d + residual + rmsnorm | ~10 ms | CPU |
+| 其他 (attn prefill, MTP) | ~10 ms | |
+| **合计 per token** | **~50 ms** | 19.8 tok/s |
 
-   → **对 4B 这种小模型, GPU 层 GEMV 比 CPU AVX2 慢**; lm_head (M=248320, 318MB resident) 上 GPU
-   才能勉强 24→15ms 提升 9ms
+## 剩余到 30 tok/s 还需要 (~33ms per token)
 
-## 真实瓶颈分布 (4B, M=1 decode)
+按影响力排序：
+1. **Fused 多 GEMV 一次发射**: 4 small (wqkv+wz+wb+wa) → 1 launch + 1 D2H  (节省 ~12ms)
+2. **gate/up 2→1 fused**: (节省 ~3-5ms)
+3. **gated_delta_recurrent 上 GPU**: 写一个 NVRTC kernel 按 head 并行
+4. **conv1d 上 GPU**
+5. **CUDA Graphs**: 整 forward capture (需要所有指针稳定，工程量大)
+6. **lm_head INT4 path**: 若 qlwc 把 lm_head 量化存储 (regenerate file) → 5ms
 
-```
-lm_head CPU  hal::gemm_int4   : 24ms ───────── (18%)
-gate+up+down GEMV (GPU JIT)    : 22ms ─────── (17%)  
-attn 4 GEMV (GPU JIT)          : 35ms ────── (27%)
-conv1d / gated_delta (CPU)     : 28ms ────   (22%)
-rmsnorm / residual / RoPE(CPU): 15ms   ────   (11%)
-其他                            :  8ms        (5%)
-─────────────────────────────────────────
-合计                          : 130ms        (7.5 tok/s)
-```
+完成 1-4 → ~70ms 节省 → ~21 tok/s；再加 5 (graphs) → ~30 tok/s；lm_head INT4 → ~45 tok/s.
 
-## 到 30 tok/s 还需要的 (3x)
+## 关键工程障碍
 
-| 优化 | 预期节省 | 难度 |
-|------|---------|------|
-| A. 让 GPU 跑 gate+up 一次发射 (shared x, M=2I) | 12ms | 中 |
-| B. lm_head GPU resident JIT path | 9ms | 已完成代码 (待测) |
-| C. 把 conv1d 整段 (depthwise) 搬到 GPU | 8-10ms | 高 (新 kernel) |
-| D. 把 gated_delta_recurrent 搬到 GPU (per-head) | 12-15ms | 高 |
-| E. Fused rmsnorm + matvec 在 GPU 内 | 5ms | 高 |
-| F. CUDA Graphs 整 forward | ~10ms 调度 | 高 (需设备内存驻留) |
-| G. spec/MTP 接受率 (248K vocab argmax 单测) | 已禁用 | 高 |
+- **4B 太小**: L2 cache 已捕获大部分 GEMV，GPU 优势消失。27B-A3B、35B-A3B 这种 active-param
+  小 + 总权重远超 L2 的模型，GPU 才真正有效。
+- **kernel 调优成本**: 自写 GEMV 在 M=1 大 N (lm_head 这种) 很难超过 cuBLAS SGEMM 10.7ms (80% peak)。
+- **CUDA Graphs 要求**: host 所有 op 序列确定、device pointers 稳定。当前 model code GEMV +
+  CPU 计算交错，graph 化需大幅重构（每 step GPU kernel 之间无 CPU 介入）。
 
-合计 B+C+D+F = **30-40ms** 节省 → 从 130 → 90-100ms = **11 tok/s**。要 ≥30 tok/s
-基本要所有项都做 + GPTQ 量化 lm_head (降到 ~80MB / 0.3ms) 或 MTP 接受率 ≥50%。
+## Server 验证
 
-## 建议优先级 (会话外)
+server (`llmoc_server_int4`) 在 hybrid_gpu 模式下：
+1. 自动 cuda::enable(gpu_vram_gb * 1 GiB)
+2. model->warm_gpu_int4_weights() 上传所有 layer + lm 到 VRAM
 
-1. **lm_head 强制 resident** 跑起来 (测 24→15ms): 已完成代码 `b3d1b8e`, 但需 GPU 路径接入 greedy decode
-2. **gate+up 一次发射** (新 API `try_gemm_int4_dual(x, Wg, Wu, yg, yu)`): shared x, 一次 H2D, 一次 D2H
-3. **gated_delta_recurrent GPU kernel**: 当前 CPU 28ms, 写 8x head × 32 lanes kernel
-4. **CUDA Graphs** 需要 forward pass 内全部指针驻设备 (大改造)
-5. **MTP 验证 + spec_k 路径**: 4B lm_head 走 GPU 后, draft/verify 才高效, 否则 1 步 24ms vs CPU 27.6ms
+bench tool (`bench_decode_tps`) 已同步加 enable + warmup 逻辑。两边数字一致。
 
-## 4B 之外的模型 (27B-A3B MoE) 上 GPU 更有意义
+## MoE 路径 (Task 4)
 
-- 4B dense: 大部分在 L2 cache 命中, GPU HBM 优势消失
-- 27B-A3B MoE: expert 权重不命中 L2 → GPU 大带宽有效
-- 118B-A16B MoE: 必须 GPU + 分层驻留 + 预测预取
-
-## 当前分支已具备的能力
-
-- ✅ JIT gemv_int4 (CUDA 驱动级)
-- ✅ 量化形态驻留 (saves 8x VRAM)
-- ✅ LRU 淘汰 (Task 3.1 done)
-- ✅ warm_gpu_int4 + lm_head 上卡开关
-- ⚠️ lm_head 在 forward_decode_greedy 仍走 CPU 路径 — 需要把 gemm_view 接入 (本会话)
+`src/exec/gpu/` 已有 ExpertSlotPool + GemmGpu::gemm_w16 走 cublas。
+MoE INT4 GEMV 走 try_gemm_int4 → 8 行/block kernel。LRU 已支持 budget 上限淘汰。
+未来要 ≥135B MoE：需 router-aware prefetch (last-layer + score-pred)，非本会话 scope。
