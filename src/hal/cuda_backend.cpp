@@ -137,8 +137,8 @@ std::unordered_map<const void*, Int4Resident> g_int4_cache;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
 std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunction 缓存(disable 时清空)
 
-// Skip lm_head / vocab-scale uploads (stay on CPU INT4).
-constexpr int kMaxGpuInt4Rows = 65536;
+// lm_head / vocab 大张量也允许上 GPU(VRAM 受 budget 约束); 大于 256K 行仍跳过以免单次分配过大。
+constexpr int kMaxGpuInt4Rows = 262144;
 
 #if defined(_WIN32)
 void* load_lib(const char* n) { return reinterpret_cast<void*>(LoadLibraryA(n)); }
