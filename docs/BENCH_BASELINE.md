@@ -151,3 +151,14 @@ cublasSgemm 回退 + 248K float D2H，比 CPU AVX2 INT4 慢。故 lm_head 保持 CPU 路径
 1. Linear 层 CPU 开销（conv1d + gated_delta_recurrent + rmsnorm + reshape）占大头
 2. 每 token 5 次 GEMV × 8 us H2D + 10 us D2H ≈ 80 us（次要）
 3. 需要把 rmsnorm / gated_delta / silu / conv1d 也搬到 GPU 并用 CUDA Graphs 合并发射
+
+### M=1 专用 kernel 实验 (Task 2.3 子任务)
+
+尝试为 lm_head (M=1, N=248320, K=2560) 写专用 kernel(1 warp/block，省掉 ROWS_PER_BLOCK-1
+空转)。结果：**反而退化**，原因：
+- GEMV 调用链在没有显式 warmup 时走 cublasSgemm 回退路径（cuBLAS 内部用了 tensor cores
+  和汇编级优化），是当前的最优路径
+- 自写 JIT kernel 在 M=1 场景下 launch overhead 和 SM 占用反而更高
+- 加 warmup 后 JIT 路径会被使用，但 cublasSgemm 在 M=1 的 GEMV 上仍优于本项目自写 kernel
+
+**结论**：本会话不再追求自写 kernel 超越 cuBLAS；转而研究 GPU 激活驻留 + CUDA Graphs。
