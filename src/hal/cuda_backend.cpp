@@ -12,6 +12,7 @@
 #include "common/log.h"
 #include "hal/int4_ops.h"
 #include "hal/quant_views.h"
+#include "weights/qlwc_store.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -106,6 +107,17 @@ struct CacheEntry {
   size_t bytes = 0;
 };
 
+// INT4 量化形态驻留条目: 权重按 packed uint8 + fp16 scales/zeros 上传, GEMV 时 kernel 内反量化。
+// bytes 计入 VRAM 用量。预算按量化后字节数, 比 FP32(M*K*4) 省 8x。
+struct Int4Resident {
+  void* d_qweight = nullptr;
+  void* d_scales = nullptr;
+  void* d_zeros = nullptr;
+  int M = 0, K = 0, ng = 0, gs = 0;
+  bool is_awq = true;
+  size_t bytes = 0;
+};
+
 Api g_api;
 std::mutex g_mu;
 bool g_probed = false;
@@ -121,6 +133,7 @@ int g_cap_k = 0;
 int g_cap_m = 0;
 int g_cap_n = 0;  // batch columns for X/Y
 std::unordered_map<const void*, CacheEntry> g_cache;
+std::unordered_map<const void*, Int4Resident> g_int4_cache;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
 std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunction 缓存(disable 时清空)
 
@@ -374,6 +387,72 @@ const float* ensure_int4_device(const qlwc::Int4View& W) {
   return reinterpret_cast<const float*>(dW);
 }
 
+// 上传 INT4 量化形态(qweight packed + fp16 scales + 可选 zeros)到 VRAM。
+// 预算按量化字节数: M*K/2(权重)+ M*ng*2(scales)+ M*ng*2(zeros, 若非空), 相比 FP32 省 ~8x。
+// key = W.qweight, 与 g_cache 共享生命周期(disable 一起清)。
+const Int4Resident* ensure_int4_resident(const qlwc::Int4View& W) {
+  if (!g_enabled || !W.qweight || !W.scales || W.M <= 0 || W.K <= 0) return nullptr;
+  if (W.M >= kMaxGpuInt4Rows) return nullptr;
+  auto it = g_int4_cache.find(W.qweight);
+  if (it != g_int4_cache.end()) {
+    if (it->second.M != W.M || it->second.K != W.K) return nullptr;
+    return &it->second;
+  }
+  const int gs = W.group_size > 0 ? W.group_size : 128;
+  const int ng = (W.K + gs - 1) / gs;
+  const bool is_awq = (W.zeros == nullptr) || (W.scheme == qlwc::Scheme::kAwqSym);
+  const size_t rb = (static_cast<size_t>(W.K) + 1) / 2;
+  const size_t nw = rb * static_cast<size_t>(W.M);
+  const size_t ns = static_cast<size_t>(W.M) * ng;
+  const size_t nz = is_awq ? 0 : ns;
+  const size_t total = nw + ns * sizeof(uint16_t) + nz * sizeof(uint16_t);
+  if (g_budget > 0 && g_used + total > g_budget) return nullptr;
+  void* dq = nullptr;
+  void* ds = nullptr;
+  void* dz = nullptr;
+  if (g_api.cudaMalloc(&dq, nw) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(dq, W.qweight, nw, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(dq);
+    return nullptr;
+  }
+  const size_t sz_bytes = ns * sizeof(uint16_t);
+  if (g_api.cudaMalloc(&ds, sz_bytes) != kCudaSuccess) {
+    g_api.cudaFree(dq);
+    return nullptr;
+  }
+  if (g_api.cudaMemcpy(ds, W.scales, sz_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(ds);
+    g_api.cudaFree(dq);
+    return nullptr;
+  }
+  if (!is_awq && W.zeros) {
+    if (g_api.cudaMalloc(&dz, sz_bytes) != kCudaSuccess) {
+      g_api.cudaFree(ds);
+      g_api.cudaFree(dq);
+      return nullptr;
+    }
+    if (g_api.cudaMemcpy(dz, W.zeros, sz_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(dz);
+      g_api.cudaFree(ds);
+      g_api.cudaFree(dq);
+      return nullptr;
+    }
+  }
+  Int4Resident e;
+  e.d_qweight = dq;
+  e.d_scales = ds;
+  e.d_zeros = dz;
+  e.M = W.M;
+  e.K = W.K;
+  e.ng = ng;
+  e.gs = gs;
+  e.is_awq = is_awq;
+  e.bytes = total;
+  g_int4_cache[W.qweight] = e;
+  g_used += total;
+  return &g_int4_cache[W.qweight];
+}
+
 const float* ensure_fp32_matrix(const void* key, int M, int K,
                                 const std::function<void(float*)>& fill) {
   if (!g_enabled || !key || M <= 0 || K <= 0) return nullptr;
@@ -519,6 +598,12 @@ void disable() {
     if (kv.second.d_W) g_api.cudaFree(kv.second.d_W);
   }
   g_cache.clear();
+  for (auto& kv : g_int4_cache) {
+    if (kv.second.d_qweight) g_api.cudaFree(kv.second.d_qweight);
+    if (kv.second.d_scales) g_api.cudaFree(kv.second.d_scales);
+    if (kv.second.d_zeros) g_api.cudaFree(kv.second.d_zeros);
+  }
+  g_int4_cache.clear();
   if (g_dx) g_api.cudaFree(g_dx);
   if (g_dy) g_api.cudaFree(g_dy);
   g_dx = g_dy = nullptr;
@@ -767,15 +852,67 @@ bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16) {
 
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
   if (!g_enabled || !x || !y) return false;
+  const Int4Resident* res = nullptr;
+  bool x_uploaded = false;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    res = ensure_int4_resident(W);
+    const bool use_jit = res && jit_available();
+    if (!use_jit) {
+      const float* dW = ensure_int4_device(W);
+      if (!dW) return false;
+      return gemm_dev(dW, x, y, W.M, W.K);
+    }
+    // 锁内: 准备 GPU 端输入(x H2D)。之后解锁再调 jit_gemv_int4(其内部 jit_compile 会再锁 g_mu, 不可重入)。
+    if (!ensure_xy(W.M, W.K, 1)) return false;
+    if (g_api.cudaMemcpy(g_dx, x, sizeof(float) * static_cast<size_t>(W.K),
+                         kCudaMemcpyH2D) != kCudaSuccess) return false;
+    x_uploaded = true;
+  }
+  if (!x_uploaded) return false;
+  const bool ok = jit_gemv_int4(static_cast<const uint8_t*>(res->d_qweight),
+                                static_cast<const uint16_t*>(res->d_scales),
+                                static_cast<const uint16_t*>(res->d_zeros),
+                                reinterpret_cast<const float*>(g_dx),
+                                reinterpret_cast<float*>(g_dy),
+                                res->M, res->K, res->ng, res->gs, res->is_awq);
+  if (!ok) return false;
   std::lock_guard<std::mutex> lock(g_mu);
-  const float* dW = ensure_int4_device(W);
-  if (!dW) return false;
-  return gemm_dev(dW, x, y, W.M, W.K);
+  return g_api.cudaMemcpy(y, g_dy, sizeof(float) * static_cast<size_t>(W.M),
+                          kCudaMemcpyD2H) == kCudaSuccess;
 }
 
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
   if (!g_enabled || !X || !Y || n <= 0) return false;
-  std::lock_guard<std::mutex> lock(g_mu);
+  if (n == 1) {
+    const Int4Resident* res = nullptr;
+    bool x_uploaded = false;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      res = ensure_int4_resident(W);
+      const bool use_jit = res && jit_available();
+      if (!use_jit) {
+        const float* dW = ensure_int4_device(W);
+        if (!dW) return false;
+        return gemm_dev(dW, X, Y, W.M, W.K);
+      }
+      if (!ensure_xy(W.M, W.K, 1)) return false;
+      if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(W.K),
+                           kCudaMemcpyH2D) != kCudaSuccess) return false;
+      x_uploaded = true;
+    }
+    if (!x_uploaded) return false;
+    const bool ok = jit_gemv_int4(static_cast<const uint8_t*>(res->d_qweight),
+                                  static_cast<const uint16_t*>(res->d_scales),
+                                  static_cast<const uint16_t*>(res->d_zeros),
+                                  reinterpret_cast<const float*>(g_dx),
+                                  reinterpret_cast<float*>(g_dy),
+                                  res->M, res->K, res->ng, res->gs, res->is_awq);
+    if (!ok) return false;
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(W.M),
+                            kCudaMemcpyD2H) == kCudaSuccess;
+  }
   const float* dW = ensure_int4_device(W);
   if (!dW) return false;
   return gemm_dev_batch(dW, X, n, Y, W.M, W.K);
@@ -784,6 +921,7 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
 bool prefetch_int4_weight(const qlwc::Int4View& W) {
   if (!g_enabled) return false;
   std::lock_guard<std::mutex> lock(g_mu);
+  if (ensure_int4_resident(W)) return true;
   return ensure_int4_device(W) != nullptr;
 }
 

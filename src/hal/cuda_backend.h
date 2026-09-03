@@ -58,6 +58,12 @@ bool jit_compile(const char* cuda_src, const char* kernel_name, void** out_fn);
 bool jit_launch(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
                 unsigned bz, unsigned shmem_bytes, void** params);
 
+// GPU 原生 INT4 dequant-GEMV(kernel 内按 group 反量化, 权重保持量化形态驻留 VRAM)。
+// 所有指针均为设备指针。is_awq=true: w=(q-7)*scale; false: w=q*scale+zero(zeros 不可为空)。
+// 返回 false 表示 JIT 不可用, 调用方回退 CPU。
+bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
+                   const float* d_x, float* d_y, int M, int K, int ng, int gs, bool is_awq);
+
 void log_status();
 
 }  // namespace llmoc::hal::cuda
