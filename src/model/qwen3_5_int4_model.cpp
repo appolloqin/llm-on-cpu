@@ -817,8 +817,7 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   prefix_logits_.clear();
   logits.resize(static_cast<size_t>(V));
   if (lm_is_int4_) {
-    bool gpu_ok = false;
-    if (hal::cuda::enabled()) {
+    bool gpu_ok = false;    if (hal::cuda::enabled()) {
       gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
     }
     if (!gpu_ok) {
@@ -834,18 +833,10 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
       hal::gemm_int4(h.data(), lm_int4_, logits.data());
     }
   } else {
-    // bf16/fp16 pass-through: 可选 GPU 上 warm (lm_pass_)
-    static bool diag_once = false;
-    if (!diag_once) { std::fprintf(stderr, "[diag-lm] int4=0 enabled=%d pass=%p\n",
-                                   hal::cuda::enabled() ? 1 : 0, (void*)lm_pass_); std::fflush(stderr);
-                     diag_once = true; }
-    if (hal::cuda::enabled() && lm_pass_) {
-      const bool g = hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
-                                             pass_wd_ == hal::WDtype::kF16);
-      static bool diag2 = false;
-      if (!diag2) { std::fprintf(stderr, "[diag-lm-w16] try_gemm_w16=%d\n", g ? 1 : 0); std::fflush(stderr);
-                    diag2 = true; }
-      if (!g) hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+    if (hal::cuda::enabled() && lm_pass_ &&
+        hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
+                                pass_wd_ == hal::WDtype::kF16)) {
+      /* GPU resident W16 cublas SGEMM */
     } else {
       hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
     }
@@ -872,8 +863,6 @@ bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
   if (hal::cuda::enabled()) {
     Int4Scratch::fit(sc.logits, lm_int4_.M);
     if (hal::cuda::try_gemm_int4(sc.last.data(), lm_int4_, sc.logits.data())) {
-      static bool info_once = false;
-      if (!info_once) { LOG_INFO("lm_head GPU path OK (resident JIT)"); info_once = true; }
       const float* lp = sc.logits.data();
       float best_val = lp[0];
       int best = 0;
@@ -885,6 +874,19 @@ bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
       prefix_hiddens_.clear();
       prefix_logits_.clear();
       return true;
+    } else if (lm_pass_) {
+      if (hal::cuda::try_gemm_w16(sc.last.data(), lm_pass_, sc.logits.data(), cfg_.vocab, H,
+                                  pass_wd_ == hal::WDtype::kF16)) {
+        const float* lp = sc.logits.data();
+        float best_val = lp[0];
+        int best = 0;
+        for (int i = 1; i < cfg_.vocab; ++i) {
+          if (lp[i] > best_val) { best_val = lp[i]; best = i; }
+        }
+        out_token = best;        last_logits_.assign(1, best_val);
+        prefix_hiddens_.clear();
+        prefix_logits_.clear();
+        return true;      }
     }
   }
 #if defined(LLMOC_ENABLE_AVX2)
