@@ -353,13 +353,26 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
     try_one(lp.wup);
     try_one(lp.wdown);
   }
-  // lm_head 量化形态上卡 (prefetch_int4_weight 走 resident → 走 try_gemm_int4 走 JIT gemv_int4, 单次 24ms→3ms)
-  if (lm_is_int4_) try_one(lm_int4_);
-  // embed 量化形态可选也上卡
-  if (emb_is_int4_) try_one(emb_int4_);
-  LOG_INFO("Qwen35Int4: warm_gpu_int4 ok=%d fail/budget=%d used=%.2fGiB / budget=%.2fGiB", n_ok,
-           n_fail, hal::cuda::vram_used() / double(1ull << 30),
-           hal::cuda::vram_budget() / double(1ull << 30));
+  // lm_head resident: INT4 走 ensure_int4_resident, BF16 pass-through 走 prefetch_w16 (FP32 → g_cache, M=K=vocab*hidden)
+  LOG_INFO("Qwen35Int4: warm_gpu_int4 layers=%d fail=%d used=%.2fGiB / budget=%.2fGiB (lm_int4=%d lm_pass=%d tie=%d)",
+           n_ok, n_fail, hal::cuda::vram_used() / double(1ull << 30),
+           hal::cuda::vram_budget() / double(1ull << 30), lm_is_int4_ ? 1 : 0,
+           lm_pass_ ? 1 : 0, cfg_.tie_embeddings ? 1 : 0);
+  if (lm_is_int4_) {
+    try_one(lm_int4_);
+  } else if (lm_pass_) {
+    const size_t mbytes = static_cast<size_t>(cfg_.vocab) * cfg_.hidden * 4;
+    if (hal::cuda::prefetch_w16(lm_pass_, cfg_.vocab, cfg_.hidden,
+                                pass_wd_ == hal::WDtype::kF16)) {
+      LOG_INFO("Qwen35Int4: lm_head W16 prefetch OK (%.2fGiB)", mbytes / double(1ull << 30));
+    } else {
+      LOG_INFO("Qwen35Int4: lm_head W16 prefetch FAILED (%.2fGiB needed; used=%.2fGiB budget=%.2fGiB)",
+               mbytes / double(1ull << 30), hal::cuda::vram_used() / double(1ull << 30),
+               hal::cuda::vram_budget() / double(1ull << 30));
+    }
+  }
+  // embed (tied 时跟 lm 同)
+  if (emb_is_int4_ && emb_int4_.qweight && emb_int4_.qweight != lm_int4_.qweight) try_one(emb_int4_);
   hal::cuda::log_status();
 }
 
@@ -804,8 +817,6 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   prefix_logits_.clear();
   logits.resize(static_cast<size_t>(V));
   if (lm_is_int4_) {
-    // 先尝试 GPU resident INT4 (warm_gpu_int4 把 lm_head 也上传 → try_gemm_int4 走 JIT gemv_int4
-    // M=248320 量化字节 ~318MB, K=2560 → ~3-5ms; 比 CPU AVX2 ~24ms 快 5-8x)
     bool gpu_ok = false;
     if (hal::cuda::enabled()) {
       gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
@@ -823,7 +834,21 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
       hal::gemm_int4(h.data(), lm_int4_, logits.data());
     }
   } else {
-    hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+    // bf16/fp16 pass-through: 可选 GPU 上 warm (lm_pass_)
+    static bool diag_once = false;
+    if (!diag_once) { std::fprintf(stderr, "[diag-lm] int4=0 enabled=%d pass=%p\n",
+                                   hal::cuda::enabled() ? 1 : 0, (void*)lm_pass_); std::fflush(stderr);
+                     diag_once = true; }
+    if (hal::cuda::enabled() && lm_pass_) {
+      const bool g = hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
+                                             pass_wd_ == hal::WDtype::kF16);
+      static bool diag2 = false;
+      if (!diag2) { std::fprintf(stderr, "[diag-lm-w16] try_gemm_w16=%d\n", g ? 1 : 0); std::fflush(stderr);
+                    diag2 = true; }
+      if (!g) hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+    } else {
+      hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+    }
   }
   last_logits_ = logits;
 
