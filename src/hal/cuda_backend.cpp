@@ -549,6 +549,8 @@ void* device_alloc(size_t bytes) {
 void device_free(void* p) {
   if (!p || !g_enabled) return;
   std::lock_guard<std::mutex> lock(g_mu);
+  // g_used is not tracked per-allocation, so we can't subtract here.
+  // This is a known limitation; activation buffers are small relative to weights.
   g_api.cudaFree(p);
 }
 
