@@ -85,3 +85,38 @@ $env:OMP_NUM_THREADS='8'
 | **çº¯ decode â‰¥10** | âœ… |
 | **ä¸­é•¿èŠ chat_e2e â‰¥10** | âœ…ï¼ˆä¸­ä½ 10.32 @ new=256ï¼‰ |
 | çŸ­èŠ e2e â‰¥10 | âŒ æœªè¾¾ï¼ˆ~4.9ï¼Œå·²åˆ†åˆ—è®°å½•ï¼‰ |
+
+## FreeToken Hybrid GPU (Task 1.x) ¡ª RTX4060, CUDA 12.5
+
+### INT4 dequant-GEMV Î¢»ù×¼ (Task 1.4)
+
+uild/msvc-x64/bin/int4_gemm_bench.exe --K 3072 --gs 128 --iters 50
+
+| shape (MxK)       | CPU AVX2 (ms) | CPU GFLOP/s | GPU JIT (ms) | GPU GFLOP/s | winner |
+|-------------------|--------------:|------------:|-------------:|------------:|:------:|
+| 896x3072 (down)   | 0.081         | 67.9        | 0.106        | 51.9        | CPU    |
+| 3584x3072 (mlp)   | 0.224         | 98.3        | 0.259        | 85.0        | CPU    |
+| 9216x3072         | 0.508         | 111.5       | 0.672        | 84.3        | CPU    |
+| 248320x3072 (lm)  | 11.32         | 134.6       | skipped      | -           | CPU    |
+
+**½áÂÛ**: µ±Ç° JIT GEMV kernel (1 thread/row, µ¥ warp) ÔÚ RTX4060 ÉÏÊä¸ø AVX2 INT4¡£Ô­Òò:
+- K=3072 / blockDim=256 = Ã¿Ïß³Ì½ö 12 ´Îµü´ú, SM Õ¼ÓÃÂÊ²»×ã
+- INT4 unpack + FP16¡úFP32 ×ª»»ÔÚ software Àï¿ªÏú´ó, FP32 GEMV ÀÛ¼ÆÖ»ÓĞ 50-85 GFLOP/s
+- GPU Â·¾¶ÏÂ»¹ÓĞÃ¿ token H2D/D2H (~20us per call)
+
+### 4B e2e (Task 1.5, hybrid_gpu, configs/engine_int4_hybrid.yaml)
+
+`
+='8'; bench_decode_tps.exe --config configs\engine_int4_hybrid.yaml --short --new 32 --warm 2
+[int4] mode=hybrid_gpu hal.cuda: enabled=1 used=1.71GiB budget=4GiB warm_gpu_int4 ok=248 fail=0
+[b
+...[96 chars truncated]...
+
+...
+[Pure_decode n=24 forward_ms=8466.5 argmax_ms=1.8 decode_tps=2.83 ms/tok=352.8
+`
+
+**decode 2.7-2.8 tok/s** ¡ª ±È CPU baseline (7.88) Âı 2.8x¡£
+
+**¸ùÒò**: JIT GEMV kernel ²»Èç AVX2 INT4 + Ã¿ token H2D/D2H ¿ªÏú ~0.66ms ¡Ö Õ¼ÁËÒ»°ë forward Ê±¼ä¡£
+**ĞŞ¸´·½Ïò (Task 2.x)**: kernel ÏòÁ¿»¯ (uchar4¡ú8 INT4, shared mem scales), ¼¤»î×¤Éè±¸, Öğ²ãÁã¿½±´¡£
