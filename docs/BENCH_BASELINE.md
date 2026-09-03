@@ -162,3 +162,25 @@ cublasSgemm 回退 + 248K float D2H，比 CPU AVX2 INT4 慢。故 lm_head 保持 CPU 路径
 - 加 warmup 后 JIT 路径会被使用，但 cublasSgemm 在 M=1 的 GEMV 上仍优于本项目自写 kernel
 
 **结论**：本会话不再追求自写 kernel 超越 cuBLAS；转而研究 GPU 激活驻留 + CUDA Graphs。
+
+### 4B hybrid_gpu 优化追踪 (会话 2026-09-03)
+
+| commit | 内容 | decode tok/s | lm_head |
+|--------|------|------------:|--------:|
+| 17ab3ca | 加 GEMV 时间采样 | 7.88 | CPU prefetch |
+| b3d1b9e | 放开 INT4 行上限 | 14 | lm_head resident OK but no warmup |
+| c6cf a72 | INT4 lm_head dispatch + bench 暖机 | 12.59 | 26-30ms (still CPU) |
+| 4cd835f | LRU 淘汰 | 13 | lm_head W16 path 失败 (4GiB < 2.4GiB needed) |
+| **bb07b03** | **lm_head W16 上传 + 7GiB 预算** | **19.8** | 10.7ms GPU |
+
+7.88 (CPU baseline) → **19.8 (hybrid_gpu)** = **2.5x speedup**。
+
+剩余瓶颈 (per token 68ms: linear=28ms + full=8ms + lm_head=10.7ms + misc=20ms):
+- linear_attn: 4 个 GEMV (wqkv/wz/wb/wa 同 x) — 4 个独立 launch + D2H, 融合 → 节省 ~10ms
+- gate+up 同样融合 → 节省 ~5ms
+- gated_delta_recurrent CPU (100KB×32 heads state) → ~5ms GPU kernel
+- conv1d causal + rmsnorm: 当前 CPU, 可上 GPU
+- argmax (logits[V] 取 max) 仍 CPU, 单线程 1MB ≈ 0.5ms
+
+下一步路线 → ≥30 tok/s 需 fused multi-GEMV + GDN 上 GPU + 简单 reduce kernel。
+
