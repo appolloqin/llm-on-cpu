@@ -9,9 +9,8 @@ namespace llmoc::sched {
 void Scheduler::start(model::Generator* gen) { gen_ = gen; }
 void Scheduler::stop() {}
 
-model::GenerateResult Scheduler::enqueue_sync(
-    const model::GenerateRequest& req,
-    const std::function<void(const std::string&)>& on_token) {
+model::GenerateResult Scheduler::enqueue_sync(const model::GenerateRequest& req,
+                                              const model::TokenSink& on_token) {
   if (!gen_) throw std::runtime_error("scheduler not started");
   {
     std::lock_guard<std::mutex> g(mu_);

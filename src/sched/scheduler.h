@@ -30,7 +30,7 @@ class Scheduler {
   void stop();
 
   model::GenerateResult enqueue_sync(const model::GenerateRequest& req,
-                                     const std::function<void(const std::string&)>& on_token = {});
+                                     const model::TokenSink& on_token = {});
 
   Metrics metrics() const;
 

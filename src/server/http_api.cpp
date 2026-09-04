@@ -49,6 +49,23 @@ bool parse_data_url_image(const std::string& url, std::vector<uint8_t>& out) {
   return !out.empty();
 }
 
+nlohmann::json token_logprob_to_json(const model::TokenLogprob& t) {
+  nlohmann::json top = nlohmann::json::array();
+  for (const auto& x : t.top_logprobs) {
+    top.push_back({{"token", x.token}, {"logprob", x.logprob}, {"bytes", x.bytes}});
+  }
+  return {{"token", t.token},
+          {"logprob", t.logprob},
+          {"bytes", t.bytes},
+          {"top_logprobs", std::move(top)}};
+}
+
+nlohmann::json logprobs_content_json(const std::vector<model::TokenLogprob>& lps) {
+  nlohmann::json content = nlohmann::json::array();
+  for (const auto& t : lps) content.push_back(token_logprob_to_json(t));
+  return {{"content", std::move(content)}};
+}
+
 model::ChatMessage parse_chat_message(const nlohmann::json& m) {
   model::ChatMessage msg;
   msg.role = m.value("role", "user");
@@ -368,6 +385,10 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
     greq.enable_thinking = body.value("enable_thinking", false);
     greq.mtp = body.value("mtp", cfg_.mtp);
     greq.spec_k = body.value("spec_k", cfg_.spec_k);
+    greq.logprobs = body.value("logprobs", false);
+    greq.top_logprobs = body.value("top_logprobs", 0);
+    if (greq.logprobs && greq.top_logprobs < 0) greq.top_logprobs = 0;
+    if (greq.top_logprobs > 20) greq.top_logprobs = 20;
     if (!body.contains("messages") || !body["messages"].is_array()) {
       res.status = 400;
       res.set_content(R"({"error":"messages required"})", "application/json");
@@ -385,29 +406,38 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
           [this, greq](size_t /*offset*/, httplib::DataSink& sink) mutable {
             try {
               const std::string id = "chatcmpl-llmoc";
-              auto on_tok = [&](const std::string& delta) {
+              auto on_tok = [&](const std::string& delta, const model::TokenLogprob* lp) {
+                nlohmann::json choice = {{"index", 0},
+                                         {"delta", {{"content", delta}}},
+                                         {"finish_reason", nullptr}};
+                if (lp) {
+                  choice["logprobs"] = {{"content", nlohmann::json::array({token_logprob_to_json(*lp)})}};
+                }
                 nlohmann::json chunk = {
                     {"id", id},
                     {"object", "chat.completion.chunk"},
-                    {"choices",
-                     {{{"index", 0},
-                       {"delta", {{"content", delta}}},
-                       {"finish_reason", nullptr}}}}};
+                    {"choices", nlohmann::json::array({std::move(choice)})}};
                 const std::string line = "data: " + chunk.dump() + "\n\n";
                 sink.write(line.data(), line.size());
               };
               auto result = sched_->enqueue_sync(greq, on_tok);
-              nlohmann::json done = {
-                  {"id", id},
-                  {"object", "chat.completion.chunk"},
-                  {"choices",
-                   {{{"index", 0}, {"delta", nlohmann::json::object()}, {"finish_reason", "stop"}}}}};
+              nlohmann::json done_choice = {{"index", 0},
+                                            {"delta", nlohmann::json::object()},
+                                            {"finish_reason", "stop"}};
+              nlohmann::json done = {{"id", id},
+                                     {"object", "chat.completion.chunk"},
+                                     {"choices", nlohmann::json::array({std::move(done_choice)})}};
+              if (greq.logprobs && result.perplexity > 0.0) {
+                done["usage"] = {{"prompt_tokens", result.prompt_tokens},
+                                 {"completion_tokens", result.completion_tokens},
+                                 {"total_tokens", result.prompt_tokens + result.completion_tokens},
+                                 {"perplexity", result.perplexity}};
+              }
               const std::string line = "data: " + done.dump() + "\n\n";
               sink.write(line.data(), line.size());
               const char* end = "data: [DONE]\n\n";
               sink.write(end, std::strlen(end));
               sink.done();
-              (void)result;
             } catch (const std::exception& e) {
               LOG_ERROR("chat stream failed: %s", e.what());
               nlohmann::json err = {{"error", e.what()}};
@@ -422,18 +452,20 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
 
     try {
       auto result = sched_->enqueue_sync(greq);
-      nlohmann::json resp = {
-          {"id", "chatcmpl-llmoc"},
-          {"object", "chat.completion"},
-          {"model", "default"},
-          {"choices",
-           {{{"index", 0},
-             {"message", {{"role", "assistant"}, {"content", result.text}}},
-             {"finish_reason", "stop"}}}},
-          {"usage",
-           {{"prompt_tokens", result.prompt_tokens},
-            {"completion_tokens", result.completion_tokens},
-            {"total_tokens", result.prompt_tokens + result.completion_tokens}}}};
+      nlohmann::json choice = {{"index", 0},
+                               {"message", {{"role", "assistant"}, {"content", result.text}}},
+                               {"finish_reason", "stop"},
+                               {"logprobs", nullptr}};
+      if (greq.logprobs) choice["logprobs"] = logprobs_content_json(result.logprobs);
+      nlohmann::json usage = {{"prompt_tokens", result.prompt_tokens},
+                              {"completion_tokens", result.completion_tokens},
+                              {"total_tokens", result.prompt_tokens + result.completion_tokens}};
+      if (greq.logprobs) usage["perplexity"] = result.perplexity;
+      nlohmann::json resp = {{"id", "chatcmpl-llmoc"},
+                             {"object", "chat.completion"},
+                             {"model", "default"},
+                             {"choices", nlohmann::json::array({std::move(choice)})},
+                             {"usage", std::move(usage)}};
       res.set_content(resp.dump(), "application/json");
     } catch (const std::exception& e) {
       LOG_ERROR("chat failed: %s", e.what());

@@ -868,6 +868,80 @@ extern "C" __global__ void gemv_int4(
   if (lane == 0) y[m] = acc;
 }
 
+// Prefill batch GEMM: Y[n,M] = X[n,K] @ W[M,K]^T with on-the-fly INT4 dequant.
+// grid.x = ceil(M / ROWS_PER_BLOCK), grid.y = n (one batch column per token).
+// Reuses warm INT4-resident weights — no FP32 weight cache required.
+extern "C" __global__ void gemm_int4(
+    const unsigned char* __restrict__ qweight,
+    const unsigned short* __restrict__ scales,
+    const unsigned short* __restrict__ zeros,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K, int n, int ng, int gs, int is_awq) {
+  const int b = blockIdx.y;
+  if (b < 0 || b >= n) return;
+  const float* x = X + (size_t)b * (size_t)K;
+  float* y = Y + (size_t)b * (size_t)M;
+  const int row0 = blockIdx.x * ROWS_PER_BLOCK;
+  const int tid = threadIdx.x;
+  const int rb = (K + 1) >> 1;
+  extern __shared__ unsigned short smem_buf[];
+  unsigned short* s_scales = smem_buf;
+  unsigned short* s_zeros = is_awq ? nullptr : smem_buf + ROWS_PER_BLOCK * ng;
+  for (int row_off = 0; row_off < ROWS_PER_BLOCK; ++row_off) {
+    const int m = row0 + row_off;
+    if (m >= M) break;
+    for (int g = tid; g < ng; g += blockDim.x) {
+      s_scales[row_off * ng + g] = scales[m * ng + g];
+    }
+    if (!is_awq) {
+      for (int g = tid; g < ng; g += blockDim.x) {
+        s_zeros[row_off * ng + g] = zeros[m * ng + g];
+      }
+    }
+  }
+  __syncthreads();
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  if (warp_id >= ROWS_PER_BLOCK) return;
+  const int m = row0 + warp_id;
+  if (m >= M) return;
+  const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
+  float acc = 0.f;
+  for (int k = lane * 8; k < K; k += 32 * 8) {
+    const int g = k / gs;
+    const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
+    const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
+    const int kp = k >> 1;
+    if (kp + 3 < rb) {
+      const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
+      const float x0 = x[k + 0], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
+      const float x4 = x[k + 4], x5 = x[k + 5], x6 = x[k + 6], x7 = x[k + 7];
+      const float w0 = ((float)((v.x & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w1 = ((float)((v.x >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w2 = ((float)((v.y & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w3 = ((float)((v.y >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w4 = ((float)((v.z & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w5 = ((float)((v.z >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w6 = ((float)((v.w & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w7 = ((float)((v.w >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      acc += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
+    } else {
+      for (int kk = k; kk < k + 8 && kk < K; ++kk) {
+        const int gg = kk / gs;
+        const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
+        const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
+        const unsigned char packed = qrow[kk >> 1];
+        const int qi = (kk & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+        const float w = ((float)qi - (is_awq ? 7 : 0)) * ss + (is_awq ? 0.f : zz);
+        acc += x[kk] * w;
+      }
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0) y[m] = acc;
+}
+
 // Fused multi-GEMV: up to 4 weight sets sharing same x/K/ng/gs/is_awq.
 // Grid covers sum(M_i) rows. Each warp handles 1 row, routes to correct task by row index.
 // Saves (nt-1) kernel launches + (nt-1) H2D(x) per call site.
@@ -1009,6 +1083,26 @@ bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
                     static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
 }
 
+bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
+                   const float* d_X, float* d_Y, int M, int K, int n, int ng, int gs, bool is_awq) {
+  if (!d_qweight || !d_scales || !d_X || !d_Y || M <= 0 || K <= 0 || n <= 0 || ng <= 0 || gs <= 0)
+    return false;
+  if (!is_awq && !d_zeros) return false;
+  if (n == 1)
+    return jit_gemv_int4(d_qweight, d_scales, d_zeros, d_X, d_Y, M, K, ng, gs, is_awq);
+  void* fn = get_jit_kernel(kGemvInt4Src, "gemm_int4");
+  if (!fn) return false;
+  int is_awq_i = is_awq ? 1 : 0;
+  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_X, &d_Y, &M, &K, &n, &ng, &gs, &is_awq_i};
+  constexpr int ROWS_PER_BLOCK = 8;
+  constexpr int BLOCK_DIM = ROWS_PER_BLOCK * 32;
+  const int blocks_x = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+  const unsigned shmem =
+      sizeof(unsigned short) * ROWS_PER_BLOCK * ng * (is_awq ? 1u : 2u);
+  return jit_launch(fn, static_cast<unsigned>(blocks_x), static_cast<unsigned>(n), 1,
+                    static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
+}
+
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {
   if (!g_enabled || !x || !W || !y || M <= 0 || K <= 0) return false;
   std::lock_guard<std::mutex> lock(g_mu);
@@ -1103,7 +1197,8 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
       }
       if (!ensure_xy(W.M, W.K, 1)) return false;
       if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(W.K),
-                           kCudaMemcpyH2D) != kCudaSuccess) return false;
+                           kCudaMemcpyH2D) != kCudaSuccess)
+        return false;
       x_uploaded = true;
     }
     if (!x_uploaded) return false;
@@ -1111,16 +1206,87 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
                                   static_cast<const uint16_t*>(res->d_scales),
                                   static_cast<const uint16_t*>(res->d_zeros),
                                   reinterpret_cast<const float*>(g_dx),
-                                  reinterpret_cast<float*>(g_dy),
-                                  res->M, res->K, res->ng, res->gs, res->is_awq);
+                                  reinterpret_cast<float*>(g_dy), res->M, res->K, res->ng,
+                                  res->gs, res->is_awq);
     if (!ok) return false;
     std::lock_guard<std::mutex> lock(g_mu);
     return g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(W.M),
                             kCudaMemcpyD2H) == kCudaSuccess;
   }
-  const float* dW = ensure_int4_device(W);
-  if (!dW) return false;
-  return gemm_dev_batch(dW, X, n, Y, W.M, W.K);
+
+  // Prefill n>1: prefer INT4-resident + JIT gemm_int4 (no FP32 weight clone).
+  // Chunk by scratch budget so n≈4k × large M 不会一次 cudaMalloc 失败。
+  {
+    const Int4Resident* res = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      res = ensure_int4_resident(W);
+    }
+    if (res && jit_available()) {
+      const int M = res->M;
+      const int K = res->K;
+      // 单次 scratch 上限 ~256MiB（X 与 Y 各算）
+      constexpr size_t kMaxFloats = 64ull << 20;
+      int chunk = n;
+      auto fits = [&](int c) {
+        return static_cast<size_t>(c) * static_cast<size_t>(K) <= kMaxFloats &&
+               static_cast<size_t>(c) * static_cast<size_t>(M) <= kMaxFloats;
+      };
+      while (chunk > 1 && !fits(chunk)) chunk = (chunk + 1) / 2;
+      if (chunk < 1) chunk = 1;
+
+      bool all_ok = true;
+      for (int b0 = 0; b0 < n && all_ok; b0 += chunk) {
+        const int c = chunk < (n - b0) ? chunk : (n - b0);
+        const float* Xp = X + static_cast<size_t>(b0) * K;
+        float* Yp = Y + static_cast<size_t>(b0) * M;
+        bool uploaded = false;
+        {
+          std::lock_guard<std::mutex> lock(g_mu);
+          if (!ensure_xy(M, K, c)) {
+            all_ok = false;
+            break;
+          }
+          if (g_api.cudaMemcpy(g_dx, Xp, sizeof(float) * static_cast<size_t>(c) * K,
+                               kCudaMemcpyH2D) != kCudaSuccess) {
+            all_ok = false;
+            break;
+          }
+          uploaded = true;
+        }
+        if (!uploaded) {
+          all_ok = false;
+          break;
+        }
+        const bool ok =
+            jit_gemm_int4(static_cast<const uint8_t*>(res->d_qweight),
+                          static_cast<const uint16_t*>(res->d_scales),
+                          static_cast<const uint16_t*>(res->d_zeros),
+                          reinterpret_cast<const float*>(g_dx), reinterpret_cast<float*>(g_dy), M,
+                          K, c, res->ng, res->gs, res->is_awq);
+        if (!ok) {
+          all_ok = false;
+          break;
+        }
+        std::lock_guard<std::mutex> lock(g_mu);
+        if (g_api.cudaMemcpy(Yp, g_dy, sizeof(float) * static_cast<size_t>(c) * M,
+                             kCudaMemcpyD2H) != kCudaSuccess) {
+          all_ok = false;
+          break;
+        }
+      }
+      if (all_ok) return true;
+      // JIT 失败则继续走 FP32/cuBLAS 回退
+    }
+  }
+
+  // Fallback: host dequant → FP32 VRAM → cublasSgemm（可能因预算不足失败）
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    const float* dW = ensure_int4_device(W);
+    if (!dW) return false;
+    return gemm_dev_batch(dW, X, n, Y, W.M, W.K);
+  }
 }
 
 // Fused multi-GEMV: up to 4 weight views sharing same x. One H2D + one kernel launch + N D2H.

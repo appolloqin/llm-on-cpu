@@ -29,7 +29,8 @@ size_t vram_budget();
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16);
 bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16);
 
-// INT4 → host FP32 dequant once → VRAM cache → cublasSgemm. Key = W.qweight.
+// INT4: prefer on-device dequant-GEMV/GEMM (quantized weights resident). Prefill batch (n>1)
+// uses JIT gemm_int4 on the same resident cache; FP32 dequant→cublas is fallback only.
 // Returns false → caller must use CPU gemm_int4. Skips vocab-scale M (lm_head).
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y);
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);

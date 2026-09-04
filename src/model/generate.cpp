@@ -1,6 +1,7 @@
 // llm-on-cpu :: model/generate.cpp
 #include "model/generate.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -93,6 +95,63 @@ int32_t sample_token(const std::vector<float>& logits, float temperature) {
     if (r <= c) return static_cast<int32_t>(i);
   }
   return static_cast<int32_t>(p.size() - 1);
+}
+
+std::vector<int> token_utf8_bytes(const std::string& s) {
+  std::vector<int> b;
+  b.reserve(s.size());
+  for (unsigned char c : s) b.push_back(static_cast<int>(c));
+  return b;
+}
+
+TokenLogprob make_token_logprob(const std::vector<float>& logits, int32_t id, int top_k,
+                                HfTokenizer* tok) {
+  TokenLogprob out;
+  if (logits.empty() || id < 0 || static_cast<size_t>(id) >= logits.size()) {
+    out.token = tok ? tok->decode({id}, true) : "";
+    out.bytes = token_utf8_bytes(out.token);
+    out.logprob = -1e30f;
+    return out;
+  }
+  float maxv = -std::numeric_limits<float>::infinity();
+  for (float x : logits) {
+    if (std::isfinite(x) && x > maxv) maxv = x;
+  }
+  if (!std::isfinite(maxv)) {
+    out.token = tok ? tok->decode({id}, true) : "";
+    out.bytes = token_utf8_bytes(out.token);
+    out.logprob = -1e30f;
+    return out;
+  }
+  double sum = 0.0;
+  for (float x : logits) {
+    if (!std::isfinite(x)) continue;
+    sum += std::exp(static_cast<double>(x - maxv));
+  }
+  const float log_z = maxv + static_cast<float>(std::log(sum > 0.0 ? sum : 1.0));
+  out.logprob = logits[static_cast<size_t>(id)] - log_z;
+  out.token = tok ? tok->decode({id}, true) : "";
+  out.bytes = token_utf8_bytes(out.token);
+
+  if (top_k > 0) {
+    const int n = static_cast<int>(logits.size());
+    const int k = std::min(top_k, n);
+    std::vector<int> idx(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) idx[static_cast<size_t>(i)] = i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) {
+      return logits[static_cast<size_t>(a)] > logits[static_cast<size_t>(b)];
+    });
+    out.top_logprobs.reserve(static_cast<size_t>(k));
+    for (int i = 0; i < k; ++i) {
+      const int tid = idx[static_cast<size_t>(i)];
+      TopLogprob t;
+      t.token = tok ? tok->decode({tid}, true) : "";
+      t.bytes = token_utf8_bytes(t.token);
+      t.logprob = logits[static_cast<size_t>(tid)] - log_z;
+      out.top_logprobs.push_back(std::move(t));
+    }
+  }
+  return out;
 }
 
 size_t utf8_valid_prefix_len(const std::string& s) {
@@ -213,8 +272,7 @@ void Generator::init(ICausalLM* model, HfTokenizer* tok, int max_seq) {
   max_seq_ = max_seq;
 }
 
-GenerateResult Generator::generate(const GenerateRequest& req,
-                                   const std::function<void(const std::string& delta)>& on_token) {
+GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& on_token) {
   if (!model_ || !tok_) throw std::runtime_error("Generator not initialized");
   const auto wall0 = Clock::now();
 
@@ -289,39 +347,62 @@ GenerateResult Generator::generate(const GenerateRequest& req,
 
   const int32_t eos = tok_->im_end_id() >= 0 ? tok_->im_end_id() : tok_->eos_id();
 
-  const bool want_mtp = mtp_wanted(req.mtp) && req.spec_k > 0;
+  // logprobs 需要逐步真实 logits；关闭 MTP 投机以免 logprob 与采纳路径错位
+  const bool want_mtp = !greq.logprobs && mtp_wanted(req.mtp) && req.spec_k > 0;
   bool logged_mtp_auto_skip = false;
-  const bool use_mtp = resolve_use_mtp(model_, req, &logged_mtp_auto_skip);
-  if (want_mtp && !model_->has_mtp()) {
+  GenerateRequest mtp_req = greq;
+  if (greq.logprobs) mtp_req.mtp = "false";
+  const bool use_mtp = resolve_use_mtp(model_, mtp_req, &logged_mtp_auto_skip);
+  if (greq.logprobs && mtp_wanted(req.mtp)) {
+    LOG_INFO("mtp disabled: logprobs=true requires stepwise logits");
+  } else if (want_mtp && !model_->has_mtp()) {
     LOG_INFO("mtp disabled: model has no MTP weights (mode=%s)", req.mtp.c_str());
+  }
+
+  if (greq.logprobs) {
+    if (greq.top_logprobs < 0) greq.top_logprobs = 0;
+    if (greq.top_logprobs > 20) greq.top_logprobs = 20;
   }
 
   std::string utf8_carry;
   int ws_run = 0;
-  auto emit_one = [&](int32_t next) -> bool {
+  auto emit_one = [&](int32_t next, const std::vector<float>* logits_for_lp) -> bool {
     if (next == eos || (tok_->eos_id() >= 0 && next == tok_->eos_id())) return false;
     out.token_ids.push_back(next);
     const std::string piece = tok_->decode({next}, true);
     out.text += piece;
+
+    const TokenLogprob* lp_ptr = nullptr;
+    if (greq.logprobs && logits_for_lp) {
+      out.logprobs.push_back(
+          make_token_logprob(*logits_for_lp, next, greq.top_logprobs, tok_));
+      lp_ptr = &out.logprobs.back();
+    }
+
     if (only_ws_piece(piece)) {
       if (++ws_run >= 8) return false;
     } else {
       ws_run = 0;
     }
     if (on_token) {
-      utf8_carry += piece;
-      size_t good = utf8_valid_prefix_len(utf8_carry);
-      if (good) {
-        on_token(utf8_carry.substr(0, good));
-        utf8_carry.erase(0, good);
-      }
-      while (utf8_carry.size() > 3) {
-        on_token("\xEF\xBF\xBD");
-        utf8_carry.erase(0, 1);
-        good = utf8_valid_prefix_len(utf8_carry);
+      if (greq.logprobs) {
+        // 按 token 对齐推流，便于挂 logprobs
+        on_token(sanitize_utf8(piece), lp_ptr);
+      } else {
+        utf8_carry += piece;
+        size_t good = utf8_valid_prefix_len(utf8_carry);
         if (good) {
-          on_token(utf8_carry.substr(0, good));
+          on_token(utf8_carry.substr(0, good), nullptr);
           utf8_carry.erase(0, good);
+        }
+        while (utf8_carry.size() > 3) {
+          on_token("\xEF\xBF\xBD", nullptr);
+          utf8_carry.erase(0, 1);
+          good = utf8_valid_prefix_len(utf8_carry);
+          if (good) {
+            on_token(utf8_carry.substr(0, good), nullptr);
+            utf8_carry.erase(0, good);
+          }
         }
       }
     }
@@ -341,7 +422,7 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       const int32_t greedy0 = sample_token(logits, draft_temp);
       std::vector<int32_t> drafts;
       if (!model_->draft_propose(cache.tokens, req.spec_k, drafts, greedy0) || drafts.empty()) {
-        if (!emit_one(greedy0)) break;
+        if (!emit_one(greedy0, &logits)) break;
         cache.tokens.push_back(greedy0);
         const auto tf0 = Clock::now();
         model_->forward({greedy0}, cache, logits, false);
@@ -372,31 +453,30 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       }
 
       if (accepted < k) {
-        // 截断 KV 到采纳前缀，复用 all_logits / 位置 hidden（避免二次 full forward）
         cache.restore(snap);
         for (int li = 0; li < cache.n_layers(); ++li)
           cache.layer(li).seq = snap.seq[static_cast<size_t>(li)] + accepted;
         logits.assign(all_logits.begin() + static_cast<size_t>(accepted - 1) * V,
                       all_logits.begin() + static_cast<size_t>(accepted) * V);
-        model_->commit_prefix_state(accepted - 1);  // last_hidden/logits from forward_all
+        model_->commit_prefix_state(accepted - 1);
       } else {
         logits.assign(all_logits.begin() + static_cast<size_t>(k - 1) * V, all_logits.end());
       }
 
       bool stop = false;
       for (int i = 0; i < accepted; ++i) {
+        // MTP 草稿步无逐步 logits；无 logprobs 时走此路径
         cache.tokens.push_back(drafts[static_cast<size_t>(i)]);
         ++out.mtp_draft_accepted;
-        if (!emit_one(drafts[static_cast<size_t>(i)])) {
+        if (!emit_one(drafts[static_cast<size_t>(i)], nullptr)) {
           stop = true;
           break;
         }
       }
       if (stop) break;
 
-      // 免费 next：来自最后一个采纳位置的 logits
       const int32_t next = sample_token(logits, req.temperature);
-      if (!emit_one(next)) break;
+      if (!emit_one(next, &logits)) break;
       model_->forward({next}, cache, logits, false);
       cache.tokens.push_back(next);
       ++decode_steps;
@@ -408,9 +488,8 @@ GenerateResult Generator::generate(const GenerateRequest& req,
       continue;
     }
 
-    // 先 emit 再 forward：prefill 后立即流出首 token；fwd_ms 仍只计 forward
     const int32_t next = sample_token(logits, req.temperature);
-    if (!emit_one(next)) break;
+    if (!emit_one(next, &logits)) break;
     cache.tokens.push_back(next);
     const auto tf0 = Clock::now();
     model_->forward({next}, cache, logits, false);
@@ -438,13 +517,19 @@ GenerateResult Generator::generate(const GenerateRequest& req,
         ws = true;
     if (!ws) break;
     out.token_ids.pop_back();
+    if (!out.logprobs.empty()) out.logprobs.pop_back();
   }
   out.text.clear();
   for (int32_t id : out.token_ids) out.text += tok_->decode({id}, true);
-  if (on_token && !utf8_carry.empty()) on_token(sanitize_utf8(utf8_carry));
+  if (on_token && !utf8_carry.empty()) on_token(sanitize_utf8(utf8_carry), nullptr);
   out.text = sanitize_utf8(out.text);
   if (!req.enable_thinking) out.text = strip_qwen_think(out.text);
   out.completion_tokens = static_cast<int>(out.token_ids.size());
+  if (!out.logprobs.empty()) {
+    double sum = 0.0;
+    for (const auto& t : out.logprobs) sum += static_cast<double>(t.logprob);
+    out.perplexity = std::exp(-sum / static_cast<double>(out.logprobs.size()));
+  }
   radix_.insert(cache.tokens, static_cast<int>(cache.tokens.size()));
   model_->clear_vision_embeds();
 
