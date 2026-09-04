@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "common/log.h"
+#include "hal/cuda_backend.h"
 
 namespace llmoc::model {
 
@@ -236,8 +237,11 @@ void MoeModel::attn_layer(int layer, float* x, SessionCache& cache, int pos_star
                     Lkv.v.data() + (static_cast<size_t>(h) * cache.max_seq() + t) * hd,
                     sizeof(float) * hd);
       }
-    hal::attn_prefill(qq.data(), kpf.data(), vpf.data(), attn_heads.data(), n_tok, nh, nkv, hd,
-                      scale);
+    if (!hal::cuda::try_attn_prefill(qq.data(), kpf.data(), vpf.data(), attn_heads.data(), n_tok, nh,
+                                     nkv, hd, scale)) {
+      hal::attn_prefill(qq.data(), kpf.data(), vpf.data(), attn_heads.data(), n_tok, nh, nkv, hd,
+                        scale);
+    }
   } else {
     for (int t = 0; t < n_tok; ++t)
       hal::attn_decode_one(qq.data() + t * nh * hd, Lkv.k.data(), Lkv.v.data(),

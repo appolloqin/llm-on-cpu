@@ -49,12 +49,57 @@ bool parse_data_url_image(const std::string& url, std::vector<uint8_t>& out) {
   return !out.empty();
 }
 
+std::string json_safe_utf8(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  size_t i = 0;
+  while (i < s.size()) {
+    const auto c = static_cast<unsigned char>(s[i]);
+    size_t n = 0;
+    if (c < 0x80)
+      n = 1;
+    else if ((c >> 5) == 0x6)
+      n = 2;
+    else if ((c >> 4) == 0xE)
+      n = 3;
+    else if ((c >> 3) == 0x1E)
+      n = 4;
+    else {
+      out += "\xEF\xBF\xBD";
+      ++i;
+      continue;
+    }
+    if (i + n > s.size()) {
+      out += "\xEF\xBF\xBD";
+      ++i;
+      continue;
+    }
+    bool ok = true;
+    for (size_t k = 1; k < n; ++k) {
+      if ((static_cast<unsigned char>(s[i + k]) >> 6) != 0x2) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) {
+      out += "\xEF\xBF\xBD";
+      ++i;
+      continue;
+    }
+    out.append(s, i, n);
+    i += n;
+  }
+  return out;
+}
+
 nlohmann::json token_logprob_to_json(const model::TokenLogprob& t) {
   nlohmann::json top = nlohmann::json::array();
   for (const auto& x : t.top_logprobs) {
-    top.push_back({{"token", x.token}, {"logprob", x.logprob}, {"bytes", x.bytes}});
+    top.push_back({{"token", json_safe_utf8(x.token)},
+                   {"logprob", x.logprob},
+                   {"bytes", x.bytes}});
   }
-  return {{"token", t.token},
+  return {{"token", json_safe_utf8(t.token)},
           {"logprob", t.logprob},
           {"bytes", t.bytes},
           {"top_logprobs", std::move(top)}};
@@ -417,7 +462,9 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
                     {"id", id},
                     {"object", "chat.completion.chunk"},
                     {"choices", nlohmann::json::array({std::move(choice)})}};
-                const std::string line = "data: " + chunk.dump() + "\n\n";
+                const std::string line =
+                    "data: " +
+                    chunk.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n\n";
                 sink.write(line.data(), line.size());
               };
               auto result = sched_->enqueue_sync(greq, on_tok);
@@ -466,7 +513,8 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
                              {"model", "default"},
                              {"choices", nlohmann::json::array({std::move(choice)})},
                              {"usage", std::move(usage)}};
-      res.set_content(resp.dump(), "application/json");
+      res.set_content(resp.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                      "application/json");
     } catch (const std::exception& e) {
       LOG_ERROR("chat failed: %s", e.what());
       res.status = 500;

@@ -52,6 +52,11 @@ void device_free(void* p);
 bool h2d(void* dst, const void* src, size_t bytes);
 bool d2h(void* dst, const void* src, size_t bytes);
 
+// Prefill causal attention on GPU (hybrid/pure_gpu). false → caller uses CPU attn_prefill.
+// q/k/v/out layouts match hal::attn_prefill. No-op false when !enabled().
+bool try_attn_prefill(const float* q, const float* k, const float* v, float* out, int seq,
+                      int n_heads, int n_kv_heads, int head_dim, float scale);
+
 // GPU gated_delta_recurrent: state persists on device. Returns false → CPU fallback.
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out,

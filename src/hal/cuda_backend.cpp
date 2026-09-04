@@ -144,6 +144,16 @@ std::unordered_map<const float*, float*> g_gdn_state;
 float* g_gdn_buf = nullptr;   // device scratch for q/k/v/g/beta/out uploads
 size_t g_gdn_buf_cap = 0;
 
+// Prefill attention scratch (host↔device per call; only used when cuda enabled)
+void* g_attn_q = nullptr;
+void* g_attn_k = nullptr;
+void* g_attn_v = nullptr;
+void* g_attn_o = nullptr;
+size_t g_attn_q_bytes = 0;
+size_t g_attn_k_bytes = 0;
+size_t g_attn_v_bytes = 0;
+size_t g_attn_o_bytes = 0;
+
 // 累计性能采样: 用于诊断 GEMV 路径瓶颈。disable 时清零。
 double g_prof_h2d_us = 0.0;
 double g_prof_kernel_us = 0.0;
@@ -645,6 +655,12 @@ void disable() {
   if (g_gdn_buf) g_api.cudaFree(g_gdn_buf);
   g_gdn_buf = nullptr;
   g_gdn_buf_cap = 0;
+  if (g_attn_q) g_api.cudaFree(g_attn_q);
+  if (g_attn_k) g_api.cudaFree(g_attn_k);
+  if (g_attn_v) g_api.cudaFree(g_attn_v);
+  if (g_attn_o) g_api.cudaFree(g_attn_o);
+  g_attn_q = g_attn_k = g_attn_v = g_attn_o = nullptr;
+  g_attn_q_bytes = g_attn_k_bytes = g_attn_v_bytes = g_attn_o_bytes = 0;
   g_prof_h2d_us = g_prof_kernel_us = g_prof_d2h_us = 0.0;
   g_prof_calls = 0;
   if (g_dx) g_api.cudaFree(g_dx);
@@ -869,8 +885,9 @@ extern "C" __global__ void gemv_int4(
 }
 
 // Prefill batch GEMM: Y[n,M] = X[n,K] @ W[M,K]^T with on-the-fly INT4 dequant.
-// grid.x = ceil(M / ROWS_PER_BLOCK), grid.y = n (one batch column per token).
-// Reuses warm INT4-resident weights — no FP32 weight cache required.
+// grid.x = ceil(M / ROWS_PER_BLOCK). Each warp owns one output row and tiles over
+// batch (BT=8): dequantized weights are reused across the batch tile (far fewer
+// qweight reads than launching one gemv per token).
 extern "C" __global__ void gemm_int4(
     const unsigned char* __restrict__ qweight,
     const unsigned short* __restrict__ scales,
@@ -878,10 +895,6 @@ extern "C" __global__ void gemm_int4(
     const float* __restrict__ X,
     float* __restrict__ Y,
     int M, int K, int n, int ng, int gs, int is_awq) {
-  const int b = blockIdx.y;
-  if (b < 0 || b >= n) return;
-  const float* x = X + (size_t)b * (size_t)K;
-  float* y = Y + (size_t)b * (size_t)M;
   const int row0 = blockIdx.x * ROWS_PER_BLOCK;
   const int tid = threadIdx.x;
   const int rb = (K + 1) >> 1;
@@ -907,39 +920,90 @@ extern "C" __global__ void gemm_int4(
   const int m = row0 + warp_id;
   if (m >= M) return;
   const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
-  float acc = 0.f;
-  for (int k = lane * 8; k < K; k += 32 * 8) {
-    const int g = k / gs;
-    const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
-    const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
-    const int kp = k >> 1;
-    if (kp + 3 < rb) {
-      const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
-      const float x0 = x[k + 0], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
-      const float x4 = x[k + 4], x5 = x[k + 5], x6 = x[k + 6], x7 = x[k + 7];
-      const float w0 = ((float)((v.x & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w1 = ((float)((v.x >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w2 = ((float)((v.y & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w3 = ((float)((v.y >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w4 = ((float)((v.z & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w5 = ((float)((v.z >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w6 = ((float)((v.w & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w7 = ((float)((v.w >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      acc += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
-    } else {
-      for (int kk = k; kk < k + 8 && kk < K; ++kk) {
-        const int gg = kk / gs;
-        const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
-        const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
-        const unsigned char packed = qrow[kk >> 1];
-        const int qi = (kk & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
-        const float w = ((float)qi - (is_awq ? 7 : 0)) * ss + (is_awq ? 0.f : zz);
-        acc += x[kk] * w;
+  const int off0 = is_awq ? 7 : 0;
+  constexpr int BT = 8;
+  for (int b0 = 0; b0 < n; b0 += BT) {
+    const int bn = (b0 + BT <= n) ? BT : (n - b0);
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+    float acc4 = 0.f, acc5 = 0.f, acc6 = 0.f, acc7 = 0.f;
+    for (int k = lane * 8; k < K; k += 32 * 8) {
+      const int g = k / gs;
+      const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
+      const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
+      const int kp = k >> 1;
+      float w0, w1, w2, w3, w4, w5, w6, w7;
+      if (kp + 3 < rb) {
+        const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
+        w0 = ((float)((v.x & 0xF) - off0)) * s + z;
+        w1 = ((float)((v.x >> 4) - off0)) * s + z;
+        w2 = ((float)((v.y & 0xF) - off0)) * s + z;
+        w3 = ((float)((v.y >> 4) - off0)) * s + z;
+        w4 = ((float)((v.z & 0xF) - off0)) * s + z;
+        w5 = ((float)((v.z >> 4) - off0)) * s + z;
+        w6 = ((float)((v.w & 0xF) - off0)) * s + z;
+        w7 = ((float)((v.w >> 4) - off0)) * s + z;
+      } else {
+        w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 0.f;
+        for (int t = 0; t < 8; ++t) {
+          const int kk = k + t;
+          if (kk >= K) break;
+          const int gg = kk / gs;
+          const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
+          const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
+          const unsigned char packed = qrow[kk >> 1];
+          const int qi = (kk & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+          const float w = ((float)(qi - off0)) * ss + zz;
+          if (t == 0) w0 = w; else if (t == 1) w1 = w; else if (t == 2) w2 = w;
+          else if (t == 3) w3 = w; else if (t == 4) w4 = w; else if (t == 5) w5 = w;
+          else if (t == 6) w6 = w; else w7 = w;
+        }
+      }
+      // Reuse the 8 weights across up to BT batch rows
+      for (int bi = 0; bi < bn; ++bi) {
+        const float* x = X + (size_t)(b0 + bi) * (size_t)K;
+        float partial = 0.f;
+        if (k + 7 < K) {
+          partial = x[k]*w0 + x[k+1]*w1 + x[k+2]*w2 + x[k+3]*w3
+                  + x[k+4]*w4 + x[k+5]*w5 + x[k+6]*w6 + x[k+7]*w7;
+        } else {
+          if (k + 0 < K) partial += x[k + 0] * w0;
+          if (k + 1 < K) partial += x[k + 1] * w1;
+          if (k + 2 < K) partial += x[k + 2] * w2;
+          if (k + 3 < K) partial += x[k + 3] * w3;
+          if (k + 4 < K) partial += x[k + 4] * w4;
+          if (k + 5 < K) partial += x[k + 5] * w5;
+          if (k + 6 < K) partial += x[k + 6] * w6;
+          if (k + 7 < K) partial += x[k + 7] * w7;
+        }
+        if (bi == 0) acc0 += partial;
+        else if (bi == 1) acc1 += partial;
+        else if (bi == 2) acc2 += partial;
+        else if (bi == 3) acc3 += partial;
+        else if (bi == 4) acc4 += partial;
+        else if (bi == 5) acc5 += partial;
+        else if (bi == 6) acc6 += partial;
+        else acc7 += partial;
       }
     }
+    for (int off = 16; off > 0; off >>= 1) acc0 += __shfl_down_sync(0xffffffffu, acc0, off);
+    for (int off = 16; off > 0; off >>= 1) acc1 += __shfl_down_sync(0xffffffffu, acc1, off);
+    for (int off = 16; off > 0; off >>= 1) acc2 += __shfl_down_sync(0xffffffffu, acc2, off);
+    for (int off = 16; off > 0; off >>= 1) acc3 += __shfl_down_sync(0xffffffffu, acc3, off);
+    for (int off = 16; off > 0; off >>= 1) acc4 += __shfl_down_sync(0xffffffffu, acc4, off);
+    for (int off = 16; off > 0; off >>= 1) acc5 += __shfl_down_sync(0xffffffffu, acc5, off);
+    for (int off = 16; off > 0; off >>= 1) acc6 += __shfl_down_sync(0xffffffffu, acc6, off);
+    for (int off = 16; off > 0; off >>= 1) acc7 += __shfl_down_sync(0xffffffffu, acc7, off);
+    if (lane == 0) {
+      if (bn > 0) Y[(size_t)(b0 + 0) * (size_t)M + m] = acc0;
+      if (bn > 1) Y[(size_t)(b0 + 1) * (size_t)M + m] = acc1;
+      if (bn > 2) Y[(size_t)(b0 + 2) * (size_t)M + m] = acc2;
+      if (bn > 3) Y[(size_t)(b0 + 3) * (size_t)M + m] = acc3;
+      if (bn > 4) Y[(size_t)(b0 + 4) * (size_t)M + m] = acc4;
+      if (bn > 5) Y[(size_t)(b0 + 5) * (size_t)M + m] = acc5;
+      if (bn > 6) Y[(size_t)(b0 + 6) * (size_t)M + m] = acc6;
+      if (bn > 7) Y[(size_t)(b0 + 7) * (size_t)M + m] = acc7;
+    }
   }
-  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
-  if (lane == 0) y[m] = acc;
 }
 
 // Fused multi-GEMV: up to 4 weight sets sharing same x/K/ng/gs/is_awq.
@@ -1053,6 +1117,51 @@ extern "C" __global__ void gated_delta_kernel(
 }
 )CUDA";
 
+// Prefill causal attention (GPU modes only). Validated vs CPU in prefill_ops_bench (~13x @1064).
+const char* kAttnPrefillSrc = R"CUDA(
+extern "C" __global__ void attn_prefill_naive(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, int seq, int n_heads, int n_kv, int hd, float scale) {
+  const int tq = blockIdx.x;
+  const int h = blockIdx.y;
+  if (tq >= seq || h >= n_heads) return;
+  const int g = n_heads / n_kv;
+  const int hkv = h / g;
+  const int tid = threadIdx.x;
+  extern __shared__ float smem[];
+  float* scores = smem;
+  const float* qh = q + ((size_t)tq * n_heads + h) * hd;
+  for (int tk = tid; tk <= tq; tk += blockDim.x) {
+    const float* kt = k + ((size_t)tk * n_kv + hkv) * hd;
+    float dot = 0.f;
+    for (int d = 0; d < hd; ++d) dot += qh[d] * kt[d];
+    scores[tk] = dot * scale;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float m = -1e30f;
+    for (int tk = 0; tk <= tq; ++tk) m = fmaxf(m, scores[tk]);
+    float sum = 0.f;
+    for (int tk = 0; tk <= tq; ++tk) {
+      scores[tk] = expf(scores[tk] - m);
+      sum += scores[tk];
+    }
+    const float inv = 1.f / sum;
+    for (int tk = 0; tk <= tq; ++tk) scores[tk] *= inv;
+  }
+  __syncthreads();
+  float* oh = out + ((size_t)tq * n_heads + h) * hd;
+  for (int d = tid; d < hd; d += blockDim.x) {
+    float acc = 0.f;
+    for (int tk = 0; tk <= tq; ++tk) {
+      const float* vt = v + ((size_t)tk * n_kv + hkv) * hd;
+      acc += scores[tk] * vt[d];
+    }
+    oh[d] = acc;
+  }
+}
+)CUDA";
+
 // kernel 名→句柄缓存(避免每 token 重编译; 与 g_jit_kernels 共享生命周期, disable 时清空)
 void* get_jit_kernel(const char* src, const char* name) {
   const auto it = g_jit_kernels.find(name);
@@ -1099,7 +1208,7 @@ bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
   const int blocks_x = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
   const unsigned shmem =
       sizeof(unsigned short) * ROWS_PER_BLOCK * ng * (is_awq ? 1u : 2u);
-  return jit_launch(fn, static_cast<unsigned>(blocks_x), static_cast<unsigned>(n), 1,
+  return jit_launch(fn, static_cast<unsigned>(blocks_x), 1, 1,
                     static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
 }
 
@@ -1214,79 +1323,70 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
                             kCudaMemcpyD2H) == kCudaSuccess;
   }
 
-  // Prefill n>1: prefer INT4-resident + JIT gemm_int4 (no FP32 weight clone).
-  // Chunk by scratch budget so n≈4k × large M 不会一次 cudaMalloc 失败。
-  {
+  // n>1 策略：
+  // - 短 prefill：cuBLAS SGEMM（小 batch 远快于逐 token 风格的 JIT gemm_int4）
+  // - 长 prefill：优先 INT4 resident JIT（避免再克隆 FP32 权重导致 OOM→回落 CPU）
+  constexpr int kLongPrefillN = 64;
+
+  auto try_int4_jit_batch = [&]() -> bool {
     const Int4Resident* res = nullptr;
     {
       std::lock_guard<std::mutex> lock(g_mu);
       res = ensure_int4_resident(W);
     }
-    if (res && jit_available()) {
-      const int M = res->M;
-      const int K = res->K;
-      // 单次 scratch 上限 ~256MiB（X 与 Y 各算）
-      constexpr size_t kMaxFloats = 64ull << 20;
-      int chunk = n;
-      auto fits = [&](int c) {
-        return static_cast<size_t>(c) * static_cast<size_t>(K) <= kMaxFloats &&
-               static_cast<size_t>(c) * static_cast<size_t>(M) <= kMaxFloats;
-      };
-      while (chunk > 1 && !fits(chunk)) chunk = (chunk + 1) / 2;
-      if (chunk < 1) chunk = 1;
+    if (!res || !jit_available()) return false;
+    const int M = res->M;
+    const int K = res->K;
+    constexpr size_t kMaxFloats = 64ull << 20;  // ~256MiB per X/Y buffer
+    int chunk = n;
+    auto fits = [&](int c) {
+      return static_cast<size_t>(c) * static_cast<size_t>(K) <= kMaxFloats &&
+             static_cast<size_t>(c) * static_cast<size_t>(M) <= kMaxFloats;
+    };
+    while (chunk > 1 && !fits(chunk)) chunk = (chunk + 1) / 2;
+    if (chunk < 1) chunk = 1;
 
-      bool all_ok = true;
-      for (int b0 = 0; b0 < n && all_ok; b0 += chunk) {
-        const int c = chunk < (n - b0) ? chunk : (n - b0);
-        const float* Xp = X + static_cast<size_t>(b0) * K;
-        float* Yp = Y + static_cast<size_t>(b0) * M;
-        bool uploaded = false;
-        {
-          std::lock_guard<std::mutex> lock(g_mu);
-          if (!ensure_xy(M, K, c)) {
-            all_ok = false;
-            break;
-          }
-          if (g_api.cudaMemcpy(g_dx, Xp, sizeof(float) * static_cast<size_t>(c) * K,
-                               kCudaMemcpyH2D) != kCudaSuccess) {
-            all_ok = false;
-            break;
-          }
-          uploaded = true;
-        }
-        if (!uploaded) {
-          all_ok = false;
-          break;
-        }
-        const bool ok =
-            jit_gemm_int4(static_cast<const uint8_t*>(res->d_qweight),
-                          static_cast<const uint16_t*>(res->d_scales),
-                          static_cast<const uint16_t*>(res->d_zeros),
-                          reinterpret_cast<const float*>(g_dx), reinterpret_cast<float*>(g_dy), M,
-                          K, c, res->ng, res->gs, res->is_awq);
-        if (!ok) {
-          all_ok = false;
-          break;
-        }
+    for (int b0 = 0; b0 < n; b0 += chunk) {
+      const int c = chunk < (n - b0) ? chunk : (n - b0);
+      const float* Xp = X + static_cast<size_t>(b0) * K;
+      float* Yp = Y + static_cast<size_t>(b0) * M;
+      {
         std::lock_guard<std::mutex> lock(g_mu);
-        if (g_api.cudaMemcpy(Yp, g_dy, sizeof(float) * static_cast<size_t>(c) * M,
-                             kCudaMemcpyD2H) != kCudaSuccess) {
-          all_ok = false;
-          break;
-        }
+        if (!ensure_xy(M, K, c)) return false;
+        if (g_api.cudaMemcpy(g_dx, Xp, sizeof(float) * static_cast<size_t>(c) * K,
+                             kCudaMemcpyH2D) != kCudaSuccess)
+          return false;
       }
-      if (all_ok) return true;
-      // JIT 失败则继续走 FP32/cuBLAS 回退
+      if (!jit_gemm_int4(static_cast<const uint8_t*>(res->d_qweight),
+                         static_cast<const uint16_t*>(res->d_scales),
+                         static_cast<const uint16_t*>(res->d_zeros),
+                         reinterpret_cast<const float*>(g_dx), reinterpret_cast<float*>(g_dy), M,
+                         K, c, res->ng, res->gs, res->is_awq))
+        return false;
+      std::lock_guard<std::mutex> lock(g_mu);
+      if (g_api.cudaMemcpy(Yp, g_dy, sizeof(float) * static_cast<size_t>(c) * M,
+                           kCudaMemcpyD2H) != kCudaSuccess)
+        return false;
     }
-  }
+    return true;
+  };
 
-  // Fallback: host dequant → FP32 VRAM → cublasSgemm（可能因预算不足失败）
-  {
+  auto try_cublas_fp32_batch = [&]() -> bool {
     std::lock_guard<std::mutex> lock(g_mu);
     const float* dW = ensure_int4_device(W);
     if (!dW) return false;
     return gemm_dev_batch(dW, X, n, Y, W.M, W.K);
+  };
+
+  if (n >= kLongPrefillN) {
+    if (try_int4_jit_batch()) return true;
+    if (try_cublas_fp32_batch()) return true;
+    return false;
   }
+  // 短序列：先 cuBLAS，再 INT4 JIT（显存不够装 FP32 副本时）
+  if (try_cublas_fp32_batch()) return true;
+  if (try_int4_jit_batch()) return true;
+  return false;
 }
 
 // Fused multi-GEMV: up to 4 weight views sharing same x. One H2D + one kernel launch + N D2H.
@@ -1359,6 +1459,65 @@ bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float*
 
 // GPU gated_delta_recurrent: state persists on device between calls.
 // q/k: [n_heads, dk], v: [n_heads, dv], g/beta: [n_heads], state: [n_heads, dk, dv], out: [n_heads, dv]
+bool try_attn_prefill(const float* q, const float* k, const float* v, float* out, int seq,
+                      int n_heads, int n_kv_heads, int head_dim, float scale) {
+  if (!g_enabled || !q || !k || !v || !out) return false;
+  {
+    const char* e = std::getenv("LLMOC_GPU_ATTN");
+    if (e && e[0] == '0') return false;  // A/B: force CPU attn
+  }
+  if (seq <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0) return false;
+  if (n_heads % n_kv_heads != 0) return false;
+  if (!jit_available()) return false;
+  // scores[seq] in shared memory; default limit ~48KiB
+  const size_t shmem = sizeof(float) * static_cast<size_t>(seq);
+  if (shmem > 48ull * 1024ull) return false;
+
+  void* fn = get_jit_kernel(kAttnPrefillSrc, "attn_prefill_naive");
+  if (!fn) return false;
+
+  const size_t qb = sizeof(float) * static_cast<size_t>(seq) * n_heads * head_dim;
+  const size_t kb = sizeof(float) * static_cast<size_t>(seq) * n_kv_heads * head_dim;
+  const size_t vb = kb;
+  const size_t ob = qb;
+
+  auto ensure_buf = [&](void*& p, size_t& cap, size_t need) -> bool {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (need <= cap && p) return true;
+    if (p) {
+      g_api.cudaFree(p);
+      p = nullptr;
+      cap = 0;
+    }
+    if (g_api.cudaMalloc(&p, need) != kCudaSuccess) {
+      p = nullptr;
+      return false;
+    }
+    cap = need;
+    return true;
+  };
+  if (!ensure_buf(g_attn_q, g_attn_q_bytes, qb)) return false;
+  if (!ensure_buf(g_attn_k, g_attn_k_bytes, kb)) return false;
+  if (!ensure_buf(g_attn_v, g_attn_v_bytes, vb)) return false;
+  if (!ensure_buf(g_attn_o, g_attn_o_bytes, ob)) return false;
+
+  if (!h2d(g_attn_q, q, qb)) return false;
+  if (!h2d(g_attn_k, k, kb)) return false;
+  if (!h2d(g_attn_v, v, vb)) return false;
+
+  float scale_mut = scale;
+  int seq_i = seq, nh = n_heads, nkv = n_kv_heads, hd = head_dim;
+  void* dq = g_attn_q;
+  void* dk = g_attn_k;
+  void* dv = g_attn_v;
+  void* dout = g_attn_o;
+  void* params[] = {&dq, &dk, &dv, &dout, &seq_i, &nh, &nkv, &hd, &scale_mut};
+  if (!jit_launch(fn, static_cast<unsigned>(seq), static_cast<unsigned>(n_heads), 1, 256, 1, 1,
+                  static_cast<unsigned>(shmem), params))
+    return false;
+  return d2h(out, g_attn_o, ob);
+}
+
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out,
                          int n_heads, int dk, int dv) {

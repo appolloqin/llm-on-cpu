@@ -104,56 +104,6 @@ std::vector<int> token_utf8_bytes(const std::string& s) {
   return b;
 }
 
-TokenLogprob make_token_logprob(const std::vector<float>& logits, int32_t id, int top_k,
-                                HfTokenizer* tok) {
-  TokenLogprob out;
-  if (logits.empty() || id < 0 || static_cast<size_t>(id) >= logits.size()) {
-    out.token = tok ? tok->decode({id}, true) : "";
-    out.bytes = token_utf8_bytes(out.token);
-    out.logprob = -1e30f;
-    return out;
-  }
-  float maxv = -std::numeric_limits<float>::infinity();
-  for (float x : logits) {
-    if (std::isfinite(x) && x > maxv) maxv = x;
-  }
-  if (!std::isfinite(maxv)) {
-    out.token = tok ? tok->decode({id}, true) : "";
-    out.bytes = token_utf8_bytes(out.token);
-    out.logprob = -1e30f;
-    return out;
-  }
-  double sum = 0.0;
-  for (float x : logits) {
-    if (!std::isfinite(x)) continue;
-    sum += std::exp(static_cast<double>(x - maxv));
-  }
-  const float log_z = maxv + static_cast<float>(std::log(sum > 0.0 ? sum : 1.0));
-  out.logprob = logits[static_cast<size_t>(id)] - log_z;
-  out.token = tok ? tok->decode({id}, true) : "";
-  out.bytes = token_utf8_bytes(out.token);
-
-  if (top_k > 0) {
-    const int n = static_cast<int>(logits.size());
-    const int k = std::min(top_k, n);
-    std::vector<int> idx(static_cast<size_t>(n));
-    for (int i = 0; i < n; ++i) idx[static_cast<size_t>(i)] = i;
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) {
-      return logits[static_cast<size_t>(a)] > logits[static_cast<size_t>(b)];
-    });
-    out.top_logprobs.reserve(static_cast<size_t>(k));
-    for (int i = 0; i < k; ++i) {
-      const int tid = idx[static_cast<size_t>(i)];
-      TopLogprob t;
-      t.token = tok ? tok->decode({tid}, true) : "";
-      t.bytes = token_utf8_bytes(t.token);
-      t.logprob = logits[static_cast<size_t>(tid)] - log_z;
-      out.top_logprobs.push_back(std::move(t));
-    }
-  }
-  return out;
-}
-
 size_t utf8_valid_prefix_len(const std::string& s) {
   size_t i = 0;
   while (i < s.size()) {
@@ -187,6 +137,57 @@ std::string sanitize_utf8(const std::string& s) {
     if (i < s.size()) {
       out += "\xEF\xBF\xBD";
       ++i;
+    }
+  }
+  return out;
+}
+
+TokenLogprob make_token_logprob(const std::vector<float>& logits, int32_t id, int top_k,
+                                HfTokenizer* tok) {
+  TokenLogprob out;
+  auto fill_token = [&](int32_t tid, std::string& token, std::vector<int>& bytes) {
+    const std::string raw = tok ? tok->decode({tid}, true) : "";
+    bytes = token_utf8_bytes(raw);          // 原始字节（可含半截 UTF-8）
+    token = sanitize_utf8(raw);             // JSON 安全展示串
+  };
+  if (logits.empty() || id < 0 || static_cast<size_t>(id) >= logits.size()) {
+    fill_token(id, out.token, out.bytes);
+    out.logprob = -1e30f;
+    return out;
+  }
+  float maxv = -std::numeric_limits<float>::infinity();
+  for (float x : logits) {
+    if (std::isfinite(x) && x > maxv) maxv = x;
+  }
+  if (!std::isfinite(maxv)) {
+    fill_token(id, out.token, out.bytes);
+    out.logprob = -1e30f;
+    return out;
+  }
+  double sum = 0.0;
+  for (float x : logits) {
+    if (!std::isfinite(x)) continue;
+    sum += std::exp(static_cast<double>(x - maxv));
+  }
+  const float log_z = maxv + static_cast<float>(std::log(sum > 0.0 ? sum : 1.0));
+  out.logprob = logits[static_cast<size_t>(id)] - log_z;
+  fill_token(id, out.token, out.bytes);
+
+  if (top_k > 0) {
+    const int n = static_cast<int>(logits.size());
+    const int k = std::min(top_k, n);
+    std::vector<int> idx(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) idx[static_cast<size_t>(i)] = i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) {
+      return logits[static_cast<size_t>(a)] > logits[static_cast<size_t>(b)];
+    });
+    out.top_logprobs.reserve(static_cast<size_t>(k));
+    for (int i = 0; i < k; ++i) {
+      const int tid = idx[static_cast<size_t>(i)];
+      TopLogprob t;
+      fill_token(tid, t.token, t.bytes);
+      t.logprob = logits[static_cast<size_t>(tid)] - log_z;
+      out.top_logprobs.push_back(std::move(t));
     }
   }
   return out;

@@ -22,12 +22,15 @@ int main(int argc, char** argv) {
   std::string cfg_path = "configs/engine_int4.yaml";
   int neu = 256;
   int warm = 1;
+  int prompt_tokens_target = 0;  // >0: pad user text until chat prompt ≈ this many tokens
   std::string user_msg = "Write a detailed explanation of binary search with examples.";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
     else if (!std::strcmp(argv[i], "--new") && i + 1 < argc) neu = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--warm") && i + 1 < argc) warm = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--prompt") && i + 1 < argc) user_msg = argv[++i];
+    else if (!std::strcmp(argv[i], "--prompt-tokens") && i + 1 < argc)
+      prompt_tokens_target = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--short")) user_msg = "hi";
   }
 
@@ -36,6 +39,23 @@ int main(int argc, char** argv) {
   const std::string tok_dir = cfg.resolve_tokenizer_dir();
   llmoc::model::HfTokenizer tok;
   tok.load(tok_dir + "/tokenizer.json");
+
+  if (prompt_tokens_target > 0) {
+    // Grow a repetitive body until apply_chat_template-ish length reaches target.
+    // Matches server prompt shape used by Generator (im_start/user/.../assistant).
+    auto approx_prompt_n = [&](const std::string& body) {
+      const std::string full = "<|im_start|>user\n" + body +
+                               "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+      return static_cast<int>(tok.encode(full).size());
+    };
+    std::string body = user_msg + "\n";
+    const std::string pad = "The quick brown fox jumps over the lazy dog. ";
+    int guard = 0;
+    while (approx_prompt_n(body) < prompt_tokens_target && guard++ < 200000) body += pad;
+    user_msg = std::move(body);
+    std::printf("[bench_decode_tps] padded prompt_tokens≈%d (target=%d)\n",
+                approx_prompt_n(user_msg), prompt_tokens_target);
+  }
 
   std::unique_ptr<llmoc::model::ICausalLM> model;
   llmoc::wt::WeightManager wm;

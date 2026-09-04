@@ -249,8 +249,11 @@ void Qwen35Model::layer_forward(int layer, float* x, SessionCache& cache, int po
                       Lkv.v.data() + (static_cast<size_t>(h) * cache.max_seq() + t) * hd,
                       sizeof(float) * hd);
         }
-      hal::attn_prefill(qq.data(), kpf.data(), vpf.data(), attn_heads.data(), n_tok, nh, nkv, hd,
-                        scale);
+      if (!hal::cuda::try_attn_prefill(qq.data(), kpf.data(), vpf.data(), attn_heads.data(), n_tok,
+                                       nh, nkv, hd, scale)) {
+        hal::attn_prefill(qq.data(), kpf.data(), vpf.data(), attn_heads.data(), n_tok, nh, nkv, hd,
+                          scale);
+      }
     } else {
       for (int t = 0; t < n_tok; ++t) {
         const int seq_len = Lkv.seq + t + 1;

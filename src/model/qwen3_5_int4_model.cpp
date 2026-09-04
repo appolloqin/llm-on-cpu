@@ -597,8 +597,11 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
                       Lkv.v.data() + (static_cast<size_t>(h) * cache.max_seq() + t) * hd,
                       sizeof(float) * hd);
         }
-       hal::attn_prefill(sc.qq.data(), sc.kpf.data(), sc.vpf.data(), sc.attn_heads.data(), n_tok, nh,
-                        nkv, hd, scale);
+      if (!hal::cuda::try_attn_prefill(sc.qq.data(), sc.kpf.data(), sc.vpf.data(),
+                                       sc.attn_heads.data(), n_tok, nh, nkv, hd, scale)) {
+        hal::attn_prefill(sc.qq.data(), sc.kpf.data(), sc.vpf.data(), sc.attn_heads.data(), n_tok,
+                          nh, nkv, hd, scale);
+      }
     } else {
       for (int t = 0; t < n_tok; ++t) {
         const int seq_len = Lkv.seq + t + 1;
@@ -818,7 +821,7 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
     return e && e[0] == '1';
   }();
   using Clock = std::chrono::steady_clock;
-  const auto t0 = kProf && n == 1 && !is_prefill ? Clock::now() : Clock::time_point{};
+  const auto t0 = kProf ? Clock::now() : Clock::time_point{};
 
   std::vector<float> h(H);
   double ms_lin = 0, ms_full = 0;
@@ -826,7 +829,7 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
                     kProf ? &ms_full : nullptr);
 
   Clock::time_point t_head0;
-  if (kProf && n == 1 && !is_prefill) t_head0 = Clock::now();
+  if (kProf) t_head0 = Clock::now();
 
   prefix_hiddens_.clear();
   prefix_logits_.clear();
@@ -858,12 +861,14 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   }
   last_logits_ = logits;
 
-  if (kProf && n == 1 && !is_prefill) {
+  if (kProf) {
     const auto t1 = Clock::now();
     const double ms_head = std::chrono::duration<double, std::milli>(t1 - t_head0).count();
     const double ms_tot = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::fprintf(stderr, "[profile] layers_linear=%.1f layers_full=%.1f lm_head=%.1f total=%.1f ms\n",
-                 ms_lin, ms_full, ms_head, ms_tot);
+    std::fprintf(stderr,
+                 "[profile] n=%d prefill=%d layers_linear=%.1f layers_full=%.1f lm_head=%.1f "
+                 "total=%.1f ms\n",
+                 n, is_prefill ? 1 : 0, ms_lin, ms_full, ms_head, ms_tot);
   }
 }
 
