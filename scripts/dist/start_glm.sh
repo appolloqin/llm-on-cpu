@@ -15,6 +15,14 @@ if [[ ! -f "$CFG" ]]; then
   echo "ERROR: config not found: $CFG" >&2
   exit 1
 fi
+if grep -q 'nvfp4\.glmq' "$CFG" 2>/dev/null && [[ ! -f models/GLM-5.3-Flash.nvfp4.glmq ]]; then
+  echo "ERROR: models/GLM-5.3-Flash.nvfp4.glmq missing — run ./download_glm.sh first" >&2
+  exit 1
+fi
+if grep -q 'awq\.glmq' "$CFG" 2>/dev/null && [[ ! -f models/GLM-5.3-Flash.awq.glmq ]]; then
+  echo "ERROR: models/GLM-5.3-Flash.awq.glmq missing — run ./download_glm.sh --awq first" >&2
+  exit 1
+fi
 echo "Starting GLM server with $CFG"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-32}"
 echo "OMP_NUM_THREADS=$OMP_NUM_THREADS"

@@ -4,8 +4,26 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace llmoc::glm {
+namespace {
+
+constexpr size_t kHeaderBytes = sizeof(GlmqFileHeader);
+
+}  // namespace
 
 bool write_glmq_file(const std::string& path, const GlmqFileHeader& hdr_in,
                      const std::vector<GlmqTensorRec>& catalog, const std::vector<uint8_t>& data) {
@@ -27,45 +45,171 @@ bool write_glmq_file(const std::string& path, const GlmqFileHeader& hdr_in,
   return static_cast<bool>(out);
 }
 
-void GlmWeightStore::open(const std::string& path, QuantKind expect) {
+void GlmWeightStore::close() {
   open_ = false;
-  blob_.clear();
   catalog_.clear();
   index_.clear();
-  std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error("glm: cannot open weights: " + path);
-  in.read(reinterpret_cast<char*>(&hdr_), sizeof(hdr_));
-  if (!in || !is_glmq_magic(hdr_.magic))
-    throw std::runtime_error("glm: bad GLMQ magic (run tools/glm/* to build .glmq)");
+  data_base_ = nullptr;
+  data_bytes_ = 0;
+  owned_blob_.clear();
+  owned_blob_.shrink_to_fit();
+
+#if defined(_WIN32)
+  if (map_view_) {
+    UnmapViewOfFile(map_view_);
+    map_view_ = nullptr;
+  }
+  if (win_mapping_) {
+    CloseHandle(static_cast<HANDLE>(win_mapping_));
+    win_mapping_ = nullptr;
+  }
+  if (win_file_) {
+    CloseHandle(static_cast<HANDLE>(win_file_));
+    win_file_ = nullptr;
+  }
+#else
+  if (map_view_ && map_view_ != MAP_FAILED) {
+    munmap(map_view_, map_bytes_);
+    map_view_ = nullptr;
+  }
+  if (map_fd_ >= 0) {
+    ::close(map_fd_);
+    map_fd_ = -1;
+  }
+#endif
+  map_bytes_ = 0;
+  hdr_ = {};
+}
+
+void GlmWeightStore::open(const std::string& path, QuantKind expect) {
+  close();
+  (void)expect;
+
+  // Prefer mmap so NVFP4/AWQ MoE packs (tens–100+ GiB) do not need full RAM.
+  bool mapped = false;
+  size_t file_size = 0;
+
+#if defined(_WIN32)
+  HANDLE hf = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                          FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, nullptr);
+  if (hf != INVALID_HANDLE_VALUE) {
+    LARGE_INTEGER sz{};
+    if (GetFileSizeEx(hf, &sz) && sz.QuadPart > 0) {
+      file_size = static_cast<size_t>(sz.QuadPart);
+      HANDLE hm = CreateFileMappingA(hf, nullptr, PAGE_READONLY, 0, 0, nullptr);
+      if (hm) {
+        void* view = MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+        if (view) {
+          win_file_ = hf;
+          win_mapping_ = hm;
+          map_view_ = view;
+          map_bytes_ = file_size;
+          mapped = true;
+        } else {
+          CloseHandle(hm);
+          CloseHandle(hf);
+        }
+      } else {
+        CloseHandle(hf);
+      }
+    } else {
+      CloseHandle(hf);
+    }
+  }
+#else
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd >= 0) {
+    struct stat st {};
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+      file_size = static_cast<size_t>(st.st_size);
+      void* view = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (view != MAP_FAILED) {
+#ifdef MADV_WILLNEED
+        // Do not madvise WILLNEED for whole MoE — would thrash. SEQUENTIAL/RANDOM optional.
+        madvise(view, file_size, MADV_RANDOM);
+#endif
+        map_fd_ = fd;
+        map_view_ = view;
+        map_bytes_ = file_size;
+        mapped = true;
+      } else {
+        ::close(fd);
+      }
+    } else {
+      ::close(fd);
+    }
+  }
+#endif
+
+  if (mapped) {
+    if (map_bytes_ < kHeaderBytes)
+      throw std::runtime_error("glm: GLMQ file too small: " + path);
+    std::memcpy(&hdr_, map_view_, kHeaderBytes);
+  } else {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("glm: cannot open weights: " + path);
+    in.read(reinterpret_cast<char*>(&hdr_), sizeof(hdr_));
+    if (!in) throw std::runtime_error("glm: short GLMQ header: " + path);
+  }
+
+  if (!is_glmq_magic(hdr_.magic))
+    throw std::runtime_error("glm: bad GLMQ magic (run tools/glm/* to build .glmq): " + path);
   if (hdr_.version < 1 || hdr_.version > kGlmqVersion)
-    throw std::runtime_error("glm: unsupported GLMQ version");
+    throw std::runtime_error("glm: unsupported GLMQ version in " + path);
 
   const auto q = static_cast<GlmqQuant>(hdr_.quant);
   if (q == GlmqQuant::kAwqInt4) quant_ = QuantKind::kAwqInt4;
   else if (q == GlmqQuant::kNvfp4) quant_ = QuantKind::kNvfp4;
   else quant_ = QuantKind::kBf16;
 
-  // reserved[0..3] stores AWQ group_size when non-zero
   uint32_t gs = 0;
   std::memcpy(&gs, hdr_.reserved, 4);
   if (gs > 0) awq_group_size_ = static_cast<int>(gs);
 
-  // expect=Bf16 means "any" for loaders that only need presence
-  if (expect != QuantKind::kBf16 && quant_ != expect &&
-      !(expect == QuantKind::kAwqInt4 && quant_ == QuantKind::kBf16)) {
-    // Allow BF16 file when config says awq during development of graph
+  const size_t cat_bytes = static_cast<size_t>(hdr_.catalog_bytes);
+  const size_t data_off = kHeaderBytes + cat_bytes;
+  const size_t need = data_off + static_cast<size_t>(hdr_.data_bytes);
+  if (mapped && map_bytes_ < need) {
+    throw std::runtime_error("glm: truncated GLMQ (mmap size < header+catalog+data): " + path);
   }
 
   catalog_.resize(hdr_.n_tensors);
   if (hdr_.n_tensors) {
-    in.read(reinterpret_cast<char*>(catalog_.data()),
-            static_cast<std::streamsize>(sizeof(GlmqTensorRec) * hdr_.n_tensors));
+    if (cat_bytes < sizeof(GlmqTensorRec) * hdr_.n_tensors)
+      throw std::runtime_error("glm: catalog_bytes too small: " + path);
+    if (mapped) {
+      std::memcpy(catalog_.data(), static_cast<const uint8_t*>(map_view_) + kHeaderBytes,
+                  sizeof(GlmqTensorRec) * hdr_.n_tensors);
+    } else {
+      std::ifstream in(path, std::ios::binary);
+      in.seekg(static_cast<std::streamoff>(kHeaderBytes));
+      in.read(reinterpret_cast<char*>(catalog_.data()),
+              static_cast<std::streamsize>(sizeof(GlmqTensorRec) * hdr_.n_tensors));
+      if (!in) throw std::runtime_error("glm: short GLMQ catalog: " + path);
+    }
   }
-  blob_.resize(static_cast<size_t>(hdr_.data_bytes));
-  if (hdr_.data_bytes) {
-    in.read(reinterpret_cast<char*>(blob_.data()), static_cast<std::streamsize>(hdr_.data_bytes));
+
+  data_bytes_ = static_cast<size_t>(hdr_.data_bytes);
+  if (mapped) {
+    data_base_ = static_cast<const uint8_t*>(map_view_) + data_off;
+  } else {
+    // Fallback: full copy (only for tiny packs / environments without mmap).
+    if (data_bytes_ > (size_t{1} << 30)) {
+      throw std::runtime_error(
+          "glm: cannot mmap " + path + " and file is >1GiB — refusing RAM load. "
+          "Check path/permissions; NVFP4 MoE must be memory-mapped.");
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("glm: cannot reopen weights: " + path);
+    in.seekg(static_cast<std::streamoff>(data_off));
+    owned_blob_.resize(data_bytes_);
+    if (data_bytes_) {
+      in.read(reinterpret_cast<char*>(owned_blob_.data()),
+              static_cast<std::streamsize>(data_bytes_));
+      if (!in) throw std::runtime_error("glm: truncated GLMQ payload: " + path);
+    }
+    data_base_ = owned_blob_.data();
   }
-  if (!in) throw std::runtime_error("glm: truncated GLMQ file");
 
   for (size_t i = 0; i < catalog_.size(); ++i) index_[catalog_[i].name] = i;
   open_ = true;
@@ -78,8 +222,9 @@ const GlmqTensorRec* GlmWeightStore::find(const std::string& name) const {
 }
 
 const uint8_t* GlmWeightStore::data_of(const GlmqTensorRec& t) const {
-  if (t.offset + t.nbytes > blob_.size()) throw std::runtime_error("glm: tensor OOB");
-  return blob_.data() + static_cast<size_t>(t.offset);
+  if (!data_base_) throw std::runtime_error("glm: store not open");
+  if (t.offset + t.nbytes > data_bytes_) throw std::runtime_error("glm: tensor OOB");
+  return data_base_ + static_cast<size_t>(t.offset);
 }
 
 const uint16_t* GlmWeightStore::bf16(const std::string& name) const {

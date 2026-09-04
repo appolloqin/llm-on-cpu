@@ -96,28 +96,34 @@ mkdir -p "${STAGE}/models/recipes"
 [[ -f models/recipes/glm53_flash.json ]] && cp models/recipes/glm53_flash.json "${STAGE}/models/recipes/"
 [[ -f models/recipes/qwen3_5.json ]] && cp models/recipes/qwen3_5.json "${STAGE}/models/recipes/"
 
-cp scripts/dist/download_bf16.cmd scripts/dist/download_int4.cmd \
-   scripts/dist/download_glm.cmd \
-   scripts/dist/download_ds.cmd scripts/dist/download_kimi.cmd \
-   scripts/dist/start_bf16.cmd scripts/dist/start_int4.cmd \
-   scripts/dist/start_glm.cmd \
-   scripts/dist/start_ds.cmd scripts/dist/start_kimi.cmd "${STAGE}/"
-cp scripts/dist/download_bf16.sh scripts/dist/download_int4.sh \
-   scripts/dist/download_glm.sh \
-   scripts/dist/download_ds.sh scripts/dist/download_kimi.sh \
-   scripts/dist/start_bf16.sh scripts/dist/start_int4.sh \
-   scripts/dist/start_glm.sh \
-   scripts/dist/start_ds.sh scripts/dist/start_kimi.sh "${STAGE}/"
-chmod +x "${STAGE}/download_bf16.sh" "${STAGE}/download_int4.sh" \
-         "${STAGE}/download_glm.sh" \
-         "${STAGE}/download_ds.sh" "${STAGE}/download_kimi.sh" \
-         "${STAGE}/start_bf16.sh" "${STAGE}/start_int4.sh" \
-         "${STAGE}/start_glm.sh" \
-         "${STAGE}/start_ds.sh" "${STAGE}/start_kimi.sh" || true
+# 只打目标平台启动/下载脚本：Windows → .cmd；Linux/macOS → .sh
+# PLATFORM_ID 形如 windows-x64 / linux-x64 / macos-arm64 / darwin-arm64
+is_windows=0
+case "${PLATFORM_ID}" in
+  windows*|win*|msvc*) is_windows=1 ;;
+esac
+
+SCRIPTS=(
+  download_bf16 download_int4 download_glm download_ds download_kimi
+  start_bf16 start_int4 start_glm start_ds start_kimi
+)
+
+if [[ "$is_windows" -eq 1 ]]; then
+  for s in "${SCRIPTS[@]}"; do
+    cp "scripts/dist/${s}.cmd" "${STAGE}/"
+  done
+else
+  for s in "${SCRIPTS[@]}"; do
+    cp "scripts/dist/${s}.sh" "${STAGE}/"
+    chmod +x "${STAGE}/${s}.sh" || true
+  done
+fi
+
 # 空 models 占位，避免用户找不到目录
 : > "${STAGE}/models/.gitkeep"
 
-cat > "${STAGE}/RUN.txt" <<EOF
+if [[ "$is_windows" -eq 1 ]]; then
+  cat > "${STAGE}/RUN.txt" <<EOF
 llm-on-cpu application package (${PLATFORM_ID})
 version: ${VER}
 
@@ -131,32 +137,27 @@ download_* = auto pipeline (skip steps already done):
   Force redo: --force / --force-download / --force-convert / --force-int4 / --force-quant
 
 -- INT4 (recommended) --
-  Windows:     download_int4.cmd
-               start_int4.cmd
-               start_int4.cmd configs\\engine_int4_mtp.yaml
-  Linux/macOS: ./download_int4.sh && ./start_int4.sh
-  Modes:       configs/engine_int4.yaml — pure_cpu|hybrid_gpu|pure_gpu|auto|layer_stream
-               GPU: tiers.gpu_vram_gb ; layer_stream: see yaml block / docs/DESIGN_LAYER_STREAM.md
+  download_int4.cmd
+  start_int4.cmd
+  start_int4.cmd configs\\engine_int4_mtp.yaml
+  Modes: configs/engine_int4.yaml — pure_cpu|hybrid_gpu|pure_gpu|auto|layer_stream
+         GPU: tiers.gpu_vram_gb ; layer_stream: see yaml block / docs/DESIGN_LAYER_STREAM.md
 
 -- BF16 (unquantized) --
-  Windows:     download_bf16.cmd && start_bf16.cmd
-  Linux/macOS: ./download_bf16.sh && ./start_bf16.sh
+  download_bf16.cmd && start_bf16.cmd
 
 -- GLM-5.3-Flash --
-  Windows:     download_glm.cmd && start_glm.cmd
-               start_glm.cmd configs\\engine_glm_int4.yaml
-  Linux/macOS: ./download_glm.sh && ./start_glm.sh
-  Docs:        docs/MODEL_GLM53_FLASH.md
+  download_glm.cmd && start_glm.cmd
+  start_glm.cmd configs\\engine_glm_int4.yaml
+  Docs: docs/MODEL_GLM53_FLASH.md
 
 -- DeepSeek stub (DS-STUB-v0, smoke only) --
-  Windows:     download_ds.cmd && start_ds.cmd
-  Linux/macOS: ./download_ds.sh && ./start_ds.sh
-  Port:        15086 (configs/engine_ds_nvfp4.yaml)
+  download_ds.cmd && start_ds.cmd
+  Port: 15086 (configs/engine_ds_nvfp4.yaml)
 
 -- Kimi stub (Kimi-STUB-v0, smoke only) --
-  Windows:     download_kimi.cmd && start_kimi.cmd
-  Linux/macOS: ./download_kimi.sh && ./start_kimi.sh
-  Port:        15087 ; single-card pure_gpu auto → layer_stream
+  download_kimi.cmd && start_kimi.cmd
+  Port: 15087 ; single-card pure_gpu auto → layer_stream
 
 Optional: download_*.cmd --model org/name  (then edit configs)
 
@@ -169,6 +170,54 @@ Notes:
 - Server uses plain HTTP only (no OpenSSL DLL required).
 - See docs/USAGE.md for details.
 EOF
+else
+  cat > "${STAGE}/RUN.txt" <<EOF
+llm-on-cpu application package (${PLATFORM_ID})
+version: ${VER}
+
+Need: Node.js >= 18 on PATH (for Qwen/GLM download_* only).
+
+download_* = auto pipeline (skip steps already done):
+  detect HF shards / good LWC / good QLWC / GLMQ -> download -> convert -> verify -> prune
+  INT4 also quantizes and removes mid .lwc
+  GLM default: LibertAIDAI/GLM-5.3-Flash-NVFP4 → nvfp4.glmq; optional --awq for AWQ path
+  DS/Kimi: write tiny STUB weights via make_fake_* (not real model download)
+  Force redo: --force / --force-download / --force-convert / --force-int4 / --force-quant
+
+-- INT4 (recommended) --
+  ./download_int4.sh
+  ./start_int4.sh
+  ./start_int4.sh configs/engine_int4_mtp.yaml
+  Modes: configs/engine_int4.yaml — pure_cpu|hybrid_gpu|pure_gpu|auto|layer_stream
+         GPU: tiers.gpu_vram_gb ; layer_stream: see yaml block / docs/DESIGN_LAYER_STREAM.md
+
+-- BF16 (unquantized) --
+  ./download_bf16.sh && ./start_bf16.sh
+
+-- GLM-5.3-Flash --
+  ./download_glm.sh && ./start_glm.sh
+  ./start_glm.sh configs/engine_glm_int4.yaml
+  Docs: docs/MODEL_GLM53_FLASH.md
+
+-- DeepSeek stub (DS-STUB-v0, smoke only) --
+  ./download_ds.sh && ./start_ds.sh
+  Port: 15086 (configs/engine_ds_nvfp4.yaml)
+
+-- Kimi stub (Kimi-STUB-v0, smoke only) --
+  ./download_kimi.sh && ./start_kimi.sh
+  Port: 15087 ; single-card pure_gpu auto → layer_stream
+
+Optional: ./download_*.sh --model org/name  (then edit configs)
+
+Open http://127.0.0.1:15085/ (INT4/BF16/GLM default)
+
+Notes:
+- Weights are NOT in the zip; run download_* once (large / slow) except DS/Kimi stubs.
+- Logs: logs/llmoc-YYYY-MM-DD.log (set LLMOC_LOG_DIR to change; LLMOC_PROFILE=1 for layer timing).
+- Server uses plain HTTP only (no OpenSSL required).
+- See docs/USAGE.md for details.
+EOF
+fi
 
 ZIP_PATH="${DIST}/llm-on-cpu-${VER}-${PLATFORM_ID}.zip"
 rm -f "${ZIP_PATH}"

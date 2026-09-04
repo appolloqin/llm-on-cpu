@@ -317,8 +317,9 @@ void GlmFlashModel::load(const GlmEngineConfig& cfg) {
   if (pc.slot_bytes < (8ull << 20)) pc.slot_bytes = 64ull << 20;
   prefetch_.configure(pc);
 
+  load_error_.clear();
   try {
-    store_.open(cfg.model_path, QuantKind::kBf16);
+    store_.open(cfg.model_path, cfg.quant);
     apply_geometry_from_header();
     load_meta_sidecar(cfg.model_path);
     quant_ = store_.quant();
@@ -328,13 +329,15 @@ void GlmFlashModel::load(const GlmEngineConfig& cfg) {
     bind_expert_hosts();
   } catch (const std::exception& e) {
     weights_ready_ = false;
+    load_error_ = e.what();
     meta_.hidden = 4096;
     meta_.layers = 45;
     meta_.vocab = 154880;
     meta_.n_kv = 64;
     meta_.head_dim = 256;
-    LOG_WARN("glm: weights not loaded (%s) — server can start; chat will fail until .glmq ready",
-             e.what());
+    LOG_WARN("glm: weights not loaded — %s", e.what());
+    LOG_WARN("glm: expected path=%s (run download_glm / tools/glm; check file exists)",
+             cfg.model_path.c_str());
     try {
       setup_exec_backend(cfg);
     } catch (...) {
@@ -351,7 +354,9 @@ void GlmFlashModel::load(const GlmEngineConfig& cfg) {
 
 void GlmFlashModel::load_strict(const GlmEngineConfig& cfg) {
   load(cfg);
-  if (!weights_ready_) throw std::runtime_error("glm: load_strict failed");
+  if (!weights_ready_)
+    throw std::runtime_error(std::string("glm: load_strict failed") +
+                             (load_error_.empty() ? "" : (": " + load_error_)));
 }
 
 void GlmFlashModel::init_cache(model::SessionCache& cache, int max_seq) const {
@@ -761,7 +766,9 @@ void GlmFlashModel::forward(const std::vector<int32_t>& tokens, model::SessionCa
                             std::vector<float>& logits, bool is_prefill) {
   if (!weights_ready_) {
     throw std::runtime_error(
-        "glm: no GLMQ weights — build with tools/glm/make_fake_glmq or convert. "
+        std::string("glm: no GLMQ weights") +
+        (load_error_.empty() ? "" : (": " + load_error_)) +
+        " — check models/*.glmq exists and matches configs/engine_glm_*.yaml model.path. "
         "See docs/MODEL_GLM53_FLASH.md");
   }
   if (tokens.empty()) {

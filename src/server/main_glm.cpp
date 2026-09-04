@@ -60,6 +60,18 @@ int main(int argc, char** argv) {
 
     llmoc::glm::GlmFlashModel model;
     model.load(gcfg);
+    if (!model.weights_ready()) {
+      std::fprintf(stderr,
+                   "FATAL: GLM weights not loaded (path=%s).\n"
+                   "  %s\n"
+                   "  Fix: run download_glm.cmd (or ./download_glm.sh), confirm "
+                   "models/GLM-5.3-Flash.nvfp4.glmq (or .awq.glmq) exists,\n"
+                   "  and model.path in %s matches. See docs/MODEL_GLM53_FLASH.md\n",
+                   gcfg.model_path.c_str(),
+                   model.load_error().empty() ? "(no detail)" : model.load_error().c_str(),
+                   cfg_path.c_str());
+      return 1;
+    }
 
     llmoc::model::HfTokenizer tok;
     try {

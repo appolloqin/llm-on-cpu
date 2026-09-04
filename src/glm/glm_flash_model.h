@@ -17,6 +17,9 @@ class GlmFlashModel final : public model::ICausalLM {
   void load(const GlmEngineConfig& cfg);
   void load_strict(const GlmEngineConfig& cfg);
 
+  bool weights_ready() const { return weights_ready_; }
+  const std::string& load_error() const { return load_error_; }
+
   const model::CausalLmMeta& meta() const override { return meta_; }
   void init_cache(model::SessionCache& cache, int max_seq) const override;
   void forward(const std::vector<int32_t>& tokens, model::SessionCache& cache,
@@ -50,6 +53,7 @@ class GlmFlashModel final : public model::ICausalLM {
   GlmWeightStore store_;
   GlmExpertPrefetch prefetch_;
   bool weights_ready_ = false;
+  std::string load_error_;
   bool use_gpu_gemm_ = false;
   float rms_eps_ = 1e-6f;
   float rope_theta_ = 10000.f;
