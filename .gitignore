@@ -18,3 +18,4 @@ logs/
 /test_*.txt
 README.local.md
 docs/ABSORB_PRIORS.local.md
+docs/*

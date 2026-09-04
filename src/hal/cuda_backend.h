@@ -51,6 +51,11 @@ void device_free(void* p);
 bool h2d(void* dst, const void* src, size_t bytes);
 bool d2h(void* dst, const void* src, size_t bytes);
 
+// GPU gated_delta_recurrent: state persists on device. Returns false → CPU fallback.
+bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
+                         const float* beta, float* state, float* out,
+                         int n_heads, int dk, int dv);
+
 // ---- NVRTC JIT (no nvcc): 运行时编译 CUDA kernel, driver API 启动 ----
 // 动态加载 nvrtc64_XXX.dll + nvcuda.dll; 任一缺失 → jit_available()=false, 优雅降级。
 bool jit_available();

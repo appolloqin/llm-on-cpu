@@ -139,6 +139,11 @@ uint64_t g_lru_tick = 0;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
 std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunction 缓存(disable 时清空)
 
+// GDN device state: host state ptr → device state ptr (persists between decode steps)
+std::unordered_map<const float*, float*> g_gdn_state;
+float* g_gdn_buf = nullptr;   // device scratch for q/k/v/g/beta/out uploads
+size_t g_gdn_buf_cap = 0;
+
 // 累计性能采样: 用于诊断 GEMV 路径瓶颈。disable 时清零。
 double g_prof_h2d_us = 0.0;
 double g_prof_kernel_us = 0.0;
@@ -633,6 +638,13 @@ void disable() {
     if (kv.second.d_zeros) g_api.cudaFree(kv.second.d_zeros);
   }
   g_int4_cache.clear();
+  for (auto& kv : g_gdn_state) {
+    if (kv.second) g_api.cudaFree(kv.second);
+  }
+  g_gdn_state.clear();
+  if (g_gdn_buf) g_api.cudaFree(g_gdn_buf);
+  g_gdn_buf = nullptr;
+  g_gdn_buf_cap = 0;
   g_prof_h2d_us = g_prof_kernel_us = g_prof_d2h_us = 0.0;
   g_prof_calls = 0;
   if (g_dx) g_api.cudaFree(g_dx);
@@ -927,6 +939,46 @@ extern "C" __global__ void gemv_multi4_int4(
 }
 )CUDA";
 
+// GDN kernel: separate source to avoid interfering with GEMV JIT compilation.
+const char* kGdnSrc = R"CUDA(
+extern "C" __global__ void gated_delta_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    float* __restrict__ out, int dk, int dv, float scale) {
+  const int h = blockIdx.x;
+  const int j = threadIdx.x;
+  if (j >= dv) return;
+  const float* qh = q + h * dk;
+  const float* kh = k + h * dk;
+  const float* vh = v + h * dv;
+  float g_log = g[h];
+  float beta_t = beta[h];
+  float* st = state + (size_t)h * dk * dv;
+  float qn = 0.f, kn = 0.f;
+  for (int i = 0; i < dk; ++i) { qn += qh[i]*qh[i]; kn += kh[i]*kh[i]; }
+  qn = rsqrtf(qn + 1e-12f); kn = rsqrtf(kn + 1e-12f);
+  g_log = fmaxf(-80.f, fminf(0.f, g_log));
+  const float g_t = expf(g_log);
+  beta_t = fminf(1.f, fmaxf(0.f, beta_t));
+  float kv_j = 0.f;
+  for (int i = 0; i < dk; ++i) {
+    float s = st[i * dv + j] * g_t;
+    st[i * dv + j] = s;
+    kv_j += kh[i] * kn * s;
+  }
+  const float delta_j = beta_t * (vh[j] - kv_j);
+  float out_j = 0.f;
+  for (int i = 0; i < dk; ++i) {
+    float s = st[i * dv + j] + kh[i] * kn * delta_j;
+    s = fminf(1e4f, fmaxf(-1e4f, s));
+    st[i * dv + j] = s;
+    out_j += qh[i] * qn * scale * s;
+  }
+  out[h * dv + j] = out_j;
+}
+)CUDA";
+
 // kernel 名→句柄缓存(避免每 token 重编译; 与 g_jit_kernels 共享生命周期, disable 时清空)
 void* get_jit_kernel(const char* src, const char* name) {
   const auto it = g_jit_kernels.find(name);
@@ -1136,6 +1188,62 @@ bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float*
                          kCudaMemcpyD2H) != kCudaSuccess) return false;
     off += m[i];
   }
+  return true;
+}
+
+// GPU gated_delta_recurrent: state persists on device between calls.
+// q/k: [n_heads, dk], v: [n_heads, dv], g/beta: [n_heads], state: [n_heads, dk, dv], out: [n_heads, dv]
+bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
+                         const float* beta, float* state, float* out,
+                         int n_heads, int dk, int dv) {
+  if (!g_enabled || !jit_available()) return false;
+  if (!q || !k || !v || !g || !beta || !state || !out) return false;
+  const size_t state_bytes = sizeof(float) * n_heads * dk * dv;
+  const size_t io_bytes = sizeof(float) * (n_heads * dk * 2 + n_heads * dv + n_heads * 2 + n_heads * dv);
+  std::lock_guard<std::mutex> lock(g_mu);
+  // Ensure device state buffer for this host state pointer
+  auto it = g_gdn_state.find(state);
+  if (it == g_gdn_state.end()) {
+    void* d_state_v = nullptr;
+    if (g_api.cudaMalloc(&d_state_v, state_bytes) != kCudaSuccess) return false;
+    // Zero-init via H2D of a zero buffer
+    std::vector<float> zeros(state_bytes / sizeof(float), 0.f);
+    if (g_api.cudaMemcpy(d_state_v, zeros.data(), state_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(d_state_v); return false;
+    }
+    g_gdn_state[state] = static_cast<float*>(d_state_v);
+    it = g_gdn_state.find(state);
+  }
+  float* d_state = it->second;
+  // Ensure scratch buffer for q/k/v/g/beta/out
+  if (io_bytes > g_gdn_buf_cap) {
+    if (g_gdn_buf) g_api.cudaFree(g_gdn_buf);
+    void* buf_v = nullptr;
+    if (g_api.cudaMalloc(&buf_v, io_bytes) != kCudaSuccess) { g_gdn_buf = nullptr; return false; }
+    g_gdn_buf = static_cast<float*>(buf_v);
+    g_gdn_buf_cap = io_bytes;
+  }
+  // Layout in g_gdn_buf: [q | k | v | g | beta | out]
+  float* d_q = g_gdn_buf;
+  float* d_k = d_q + n_heads * dk;
+  float* d_v = d_k + n_heads * dk;
+  float* d_g = d_v + n_heads * dv;
+  float* d_beta = d_g + n_heads;
+  float* d_out = d_beta + n_heads;
+  // H2D uploads
+  if (g_api.cudaMemcpy(d_q, q, sizeof(float)*n_heads*dk, kCudaMemcpyH2D) != kCudaSuccess) return false;
+  if (g_api.cudaMemcpy(d_k, k, sizeof(float)*n_heads*dk, kCudaMemcpyH2D) != kCudaSuccess) return false;
+  if (g_api.cudaMemcpy(d_v, v, sizeof(float)*n_heads*dv, kCudaMemcpyH2D) != kCudaSuccess) return false;
+  if (g_api.cudaMemcpy(d_g, g, sizeof(float)*n_heads, kCudaMemcpyH2D) != kCudaSuccess) return false;
+  if (g_api.cudaMemcpy(d_beta, beta, sizeof(float)*n_heads, kCudaMemcpyH2D) != kCudaSuccess) return false;
+  // Launch kernel
+  void* fn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
+  if (!fn) return false;
+  float scale = 1.f / sqrtf((float)dk);
+  void* params[] = {&d_q, &d_k, &d_v, &d_g, &d_beta, &d_state, &d_out, &dk, &dv, &scale};
+  if (!jit_launch(fn, n_heads, 1, 1, dv, 1, 1, 0, params)) return false;
+  // D2H output
+  if (g_api.cudaMemcpy(out, d_out, sizeof(float)*n_heads*dv, kCudaMemcpyD2H) != kCudaSuccess) return false;
   return true;
 }
 
