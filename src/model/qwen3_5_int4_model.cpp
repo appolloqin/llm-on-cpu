@@ -549,9 +549,14 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       gemm_view_batch(sc.normed.data(), n_tok, lp.wk, sc.kk.data());
       gemm_view_batch(sc.normed.data(), n_tok, lp.wv, sc.vv.data());
     } else {
-      gemm_view(sc.normed.data(), lp.wq, sc.qg.data());
-      gemm_view(sc.normed.data(), lp.wk, sc.kk.data());
-      gemm_view(sc.normed.data(), lp.wv, sc.vv.data());
+      // Fused 3-GEMV: q+k+v share sc.normed → 1 launch + 1 H2D
+      const qlwc::Int4View* ws3[3] = {&lp.wq, &lp.wk, &lp.wv};
+      float* ys3[3] = {sc.qg.data(), sc.kk.data(), sc.vv.data()};
+      if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws3, ys3, 3)) {
+        gemm_view(sc.normed.data(), lp.wq, sc.qg.data());
+        gemm_view(sc.normed.data(), lp.wk, sc.kk.data());
+        gemm_view(sc.normed.data(), lp.wv, sc.vv.data());
+      }
     }
     for (int t = 0; t < n_tok; ++t) {
       const int idx = (static_cast<int>(cur_pos_t_.size()) == n_tok) ? t : (pos_start + t);
@@ -634,10 +639,15 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       gemm_view_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
       gemm_view_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
     } else {
-      gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
-      gemm_view(sc.normed.data(), lp.wz, sc.z.data());
-      gemm_view(sc.normed.data(), lp.wb, sc.b.data());
-      gemm_view(sc.normed.data(), lp.wa, sc.a.data());
+      // Fused 4-GEMV: wqkv+wz+wb+wa share sc.normed → 1 launch + 1 H2D
+      const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb, &lp.wa};
+      float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
+      if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
+        gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
+        gemm_view(sc.normed.data(), lp.wz, sc.z.data());
+        gemm_view(sc.normed.data(), lp.wb, sc.b.data());
+        gemm_view(sc.normed.data(), lp.wa, sc.a.data());
+      }
     }
 
     auto& conv_state = Lkv.linear.conv;
@@ -727,8 +737,13 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     for (int t = 0; t < n_tok; ++t)
       for (int i = 0; i < H; ++i) x[t * H + i] = sc.residual[t * H + i] + sc.down[t * H + i];
   } else {
-    gemm_view(sc.normed.data(), lp.wgate, sc.gproj.data());
-    gemm_view(sc.normed.data(), lp.wup, sc.uproj.data());
+    // Fused 2-GEMV: gate+up share sc.normed → 1 launch + 1 H2D
+    const qlwc::Int4View* ws2[2] = {&lp.wgate, &lp.wup};
+    float* ys2[2] = {sc.gproj.data(), sc.uproj.data()};
+    if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {
+      gemm_view(sc.normed.data(), lp.wgate, sc.gproj.data());
+      gemm_view(sc.normed.data(), lp.wup, sc.uproj.data());
+    }
     hal::silu_and_mul(sc.gproj.data(), sc.uproj.data(), sc.mid.data(), I);
     gemm_view(sc.mid.data(), lp.wdown, sc.down.data());
     for (int i = 0; i < H; ++i) x[i] = sc.residual[i] + sc.down[i];

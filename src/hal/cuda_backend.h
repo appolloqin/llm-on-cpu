@@ -33,6 +33,9 @@ bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16);
 // Returns false → caller must use CPU gemm_int4. Skips vocab-scale M (lm_head).
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y);
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
+// Fused multi-GEMV: 2-4 weight views sharing same x/K/ng/gs. One launch, one H2D.
+// Returns false → caller falls back to sequential try_gemm_int4 calls.
+bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float* const* ys, int n);
 // Upload only (warm); false if !enabled / OOM / budget.
 bool prefetch_int4_weight(const qlwc::Int4View& W);
 
