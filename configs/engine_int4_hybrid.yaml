@@ -8,4 +8,5 @@ tiers:
   gpu_vram_gb: 7
 decode:
   spec_k: 3
-  max_new_tokens: 204800
+  max_seq: 16384
+  max_new_tokens: 2048

@@ -30,8 +30,11 @@ tiers:
 
 decode:
   spec_k: 3
-  # 单次回复最多新生成 token（≠ 模型 256K 上下文窗口）
-  max_new_tokens: 204800
+  # KV/prompt 上下文容量（token）。prompt ≥ max_seq-8 会拒绝；多轮历史也计入。
+  # 越大越吃内存（KV ≈ layers×n_kv×max_seq×head_dim×8 字节量级）。
+  max_seq: 16384
+  # 单次回复最多新生成 token（会按 max_seq-prompt 自动截断）
+  max_new_tokens: 2048
 
 io:
   workers: 2

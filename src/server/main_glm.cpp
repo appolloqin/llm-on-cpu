@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
     }
 
     llmoc::model::Generator gen;
-    gen.init(&model, &tok, 4096);
+    gen.init(&model, &tok, gcfg.max_seq > 0 ? gcfg.max_seq : 16384);
 
     llmoc::sched::Scheduler sched;
     sched.start(&gen);

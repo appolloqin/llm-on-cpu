@@ -22,6 +22,7 @@ tiers:
   prefetch_buf_gb: 4
 
 decode:
+  max_seq: 16384
   max_new_tokens: 2048
 
 io:

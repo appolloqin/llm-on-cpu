@@ -11,7 +11,8 @@ tiers:
   prefetch_buf_gb: 0.5
 decode:
   spec_k: 3
-  max_new_tokens: 204800
+  max_seq: 16384
+  max_new_tokens: 2048
 io:
   workers: 2
 server:

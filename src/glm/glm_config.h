@@ -22,6 +22,7 @@ struct GlmEngineConfig {
   int server_port = 15085;
   std::string api_key_env = "LLMOC_API_KEY";
   int max_new_tokens = 2048;
+  int max_seq = 16384;
 
   static GlmEngineConfig load(const std::string& path);
   std::string resolve_tokenizer_dir() const;

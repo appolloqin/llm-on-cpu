@@ -32,7 +32,7 @@ struct GenerateResult {
 
 class Generator {
  public:
-  void init(ICausalLM* model, HfTokenizer* tok, int max_seq = 4096);
+  void init(ICausalLM* model, HfTokenizer* tok, int max_seq = 16384);
 
   GenerateResult generate(const GenerateRequest& req,
                           const std::function<void(const std::string& delta)>& on_token = {});
@@ -42,7 +42,7 @@ class Generator {
  private:
   ICausalLM* model_ = nullptr;
   HfTokenizer* tok_ = nullptr;
-  int max_seq_ = 4096;
+  int max_seq_ = 16384;
   RadixKvPool radix_;
 };
 

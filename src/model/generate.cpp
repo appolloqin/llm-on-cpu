@@ -243,17 +243,32 @@ GenerateResult Generator::generate(const GenerateRequest& req,
     ids = tok_->encode(prompt);
   }
 
-  if (static_cast<int>(ids.size()) >= max_seq_ - 8)
-    throw std::runtime_error("prompt too long");
+  if (static_cast<int>(ids.size()) >= max_seq_ - 8) {
+    throw std::runtime_error(
+        "prompt too long: prompt_tok=" + std::to_string(ids.size()) +
+        " max_seq=" + std::to_string(max_seq_) +
+        " (need prompt < max_seq-8; raise decode.max_seq in config)");
+  }
+
+  GenerateRequest greq = req;
+  const int room = max_seq_ - static_cast<int>(ids.size()) - 8;
+  if (room <= 0) {
+    throw std::runtime_error("prompt too long: no room for generation");
+  }
+  if (greq.max_new_tokens > room) {
+    LOG_WARN("gen clamp max_new: %d -> %d (max_seq=%d prompt=%d)", greq.max_new_tokens, room,
+             max_seq_, static_cast<int>(ids.size()));
+    greq.max_new_tokens = room;
+  }
 
   SessionCache cache;
   model_->init_cache(cache, max_seq_);
   (void)radix_.longest_prefix(ids);
 
   const auto& meta = model_->meta();
-  LOG_INFO("gen start: prompt_tok=%d max_new=%d kind=%s layers=%d hidden=%d mtp=%s",
-           static_cast<int>(ids.size()), req.max_new_tokens, meta.kind.c_str(), meta.layers,
-           meta.hidden, req.mtp.c_str());
+  LOG_INFO("gen start: prompt_tok=%d max_new=%d max_seq=%d kind=%s layers=%d hidden=%d mtp=%s",
+           static_cast<int>(ids.size()), greq.max_new_tokens, max_seq_, meta.kind.c_str(),
+           meta.layers, meta.hidden, greq.mtp.c_str());
 
   std::vector<float> logits;
   const auto tp0 = Clock::now();
@@ -310,7 +325,7 @@ GenerateResult Generator::generate(const GenerateRequest& req,
         }
       }
     }
-    return static_cast<int>(out.token_ids.size()) < req.max_new_tokens;
+    return static_cast<int>(out.token_ids.size()) < greq.max_new_tokens;
   };
 
   const bool greedy_fast = !use_mtp && req.temperature <= 1e-5f;
@@ -319,7 +334,7 @@ GenerateResult Generator::generate(const GenerateRequest& req,
   const auto td0 = Clock::now();
   int decode_steps = 0;
   double slowest_step_ms = 0;
-  while (static_cast<int>(out.token_ids.size()) < req.max_new_tokens) {
+  while (static_cast<int>(out.token_ids.size()) < greq.max_new_tokens) {
     const auto ts0 = Clock::now();
     if (use_mtp) {
       const float draft_temp = req.temperature <= 1e-5f ? 0.f : req.temperature;

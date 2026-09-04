@@ -73,7 +73,10 @@ GlmEngineConfig GlmEngineConfig::load(const std::string& path) {
     else if (full == "tiers.prefetch_buf_gb") cfg.prefetch_buf_gb = std::stod(val);
     else if (full == "io.workers") cfg.io_workers = static_cast<unsigned>(std::stoul(val));
     else if (full == "decode.max_new_tokens") cfg.max_new_tokens = std::stoi(val);
-    else if (full == "server.port") cfg.server_port = std::stoi(val);
+    else if (full == "decode.max_seq" || full == "decode.context_length") {
+      cfg.max_seq = std::stoi(val);
+      if (cfg.max_seq < 256) cfg.max_seq = 256;
+    } else if (full == "server.port") cfg.server_port = std::stoi(val);
     else if (full == "server.api_key_env") cfg.api_key_env = val;
   }
   return cfg;

@@ -47,7 +47,8 @@ tiers:
 decode:
   spec_k: 3
   accept_min: 2.0
-  max_new_tokens: 204800
+  max_seq: 16384
+  max_new_tokens: 2048
 
 io:
   engine: auto

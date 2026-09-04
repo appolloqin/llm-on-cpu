@@ -29,6 +29,8 @@ struct EngineConfig {
   int server_port = 15085;
   std::string api_key_env = "LLMOC_API_KEY";
   int max_new_tokens = 256;
+  // KV / prompt 上下文容量（token）；prompt ≥ max_seq-8 会拒绝。默认 16384。
+  int max_seq = 16384;
 
   // G8 device mesh
   std::vector<int> device_ids;  // empty => [0]

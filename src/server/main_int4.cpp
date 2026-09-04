@@ -107,8 +107,9 @@ int main(int argc, char** argv) {
     }
 
     llmoc::tune_openmp_for_decode();
-    LOG_INFO("[int4] mode=%s model=%s tokenizer=%s port=%d", llmoc::sched::mode_name(mode),
-             cfg.model_path.c_str(), tok_dir.c_str(), cfg.server_port);
+    LOG_INFO("[int4] mode=%s model=%s tokenizer=%s port=%d max_seq=%d",
+             llmoc::sched::mode_name(mode), cfg.model_path.c_str(), tok_dir.c_str(),
+             cfg.server_port, cfg.max_seq);
 
     const bool use_stream = (mode == llmoc::sched::ExecMode::kLayerStream);
     std::unique_ptr<llmoc::wt::ILayerStreamLoader> streamer;
@@ -178,7 +179,7 @@ int main(int argc, char** argv) {
     }
 
     llmoc::model::Generator gen;
-    gen.init(&model, &tok, 4096);
+    gen.init(&model, &tok, cfg.max_seq > 0 ? cfg.max_seq : 16384);
 
     llmoc::sched::Scheduler sched;
     sched.start(&gen);
