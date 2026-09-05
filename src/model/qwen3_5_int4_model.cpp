@@ -259,20 +259,33 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
     lp.wa = load_opt_w(base + "linear_attn.in_proj_a.weight", nv, cfg_.hidden);
     lp.wout = load_opt_w(base + "linear_attn.out_proj.weight", cfg_.hidden, value_dim);
     lp.nrm = pass(base + "linear_attn.norm.weight");
-    const uint16_t* A_log = pass(base + "linear_attn.A_log");
-    const uint16_t* dt_bias = pass(base + "linear_attn.dt_bias");
-    const uint16_t* conv_w = pass(base + "linear_attn.conv1d.weight");
-    lp.A_log_f.resize(nv);
-    lp.dt_bias_f.resize(nv);
-    for (int h = 0; h < nv; ++h) {
-      lp.A_log_f[h] = hal::load_w(A_log + h, pass_wd_);
-      lp.dt_bias_f[h] = hal::load_w(dt_bias + h, pass_wd_);
+    {
+      const std::string a_name = base + "linear_attn.A_log";
+      const std::string d_name = base + "linear_attn.dt_bias";
+      const std::string c_name = base + "linear_attn.conv1d.weight";
+      if (store_->lazy()) {
+        store_->ensure(a_name);
+        store_->ensure(d_name);
+        store_->ensure(c_name);
+      }
+      const auto pa = store_->get_pass(a_name);
+      const auto pd = store_->get_pass(d_name);
+      const auto pc = store_->get_pass(c_name);
+      const auto dta = pa.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
+      const auto dtd = pd.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
+      const auto dtc = pc.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
+      lp.A_log_f.resize(nv);
+      lp.dt_bias_f.resize(nv);
+      for (int h = 0; h < nv; ++h) {
+        lp.A_log_f[h] = hal::load_w(pa.data + h, dta);
+        lp.dt_bias_f[h] = hal::load_w(pd.data + h, dtd);
+      }
+      lp.conv_w_f.resize(static_cast<size_t>(conv_dim) * cfg_.conv_k);
+      for (int c = 0; c < conv_dim; ++c)
+        for (int k = 0; k < cfg_.conv_k; ++k)
+          lp.conv_w_f[c * cfg_.conv_k + k] =
+              hal::load_w(pc.data + c * cfg_.conv_k + k, dtc);
     }
-    lp.conv_w_f.resize(static_cast<size_t>(conv_dim) * cfg_.conv_k);
-    for (int c = 0; c < conv_dim; ++c)
-      for (int k = 0; k < cfg_.conv_k; ++k)
-        lp.conv_w_f[c * cfg_.conv_k + k] =
-            hal::load_w(conv_w + c * cfg_.conv_k + k, pass_wd_);
   }
 }
 

@@ -753,10 +753,16 @@ function inferCtMk(packedE, shapeE) {
 
 function mapQlwcName(hfKey) {
   let n = hfKey;
-  if (n.endsWith(".weight")) n = n.slice(0, -".weight".length);
-  n = n.replace(/\.(weight_packed|weight_scale|weight_zero_point|weight_shape|qweight|scales|qzeros|qscale|wzeros)$/i, "");
+  const wasWeight = n.endsWith(".weight");
+  if (wasWeight) n = n.slice(0, -".weight".length);
+  n = n.replace(
+    /\.(weight_packed|weight_scale|weight_zero_point|weight_shape|qweight|scales|qzeros|qscale|wzeros)$/i,
+    "",
+  );
   if (n.startsWith("model.")) n = n.slice("model.".length);
   if (n === "embed_tokens") return "embedding.weight";
+  // A_log / dt_bias / bias 等非 .weight 张量：保持原名（勿强行加 .weight）
+  if (!wasWeight) return n;
   return `${n}.weight`;
 }
 
@@ -1069,17 +1075,16 @@ async function main() {
     for (const key of Object.keys(index).sort()) {
       if (key.endsWith(".weight_packed") || key.endsWith(".qweight")) continue;
       if (/\.(weight_scale|weight_zero_point|weight_shape|scales|qzeros|qscale|wzeros)$/.test(key)) continue;
-      if (!key.endsWith(".weight")) continue;
-      const qlwcName = mapQlwcName(key);
-      if (seen.has(qlwcName)) continue;
       const e = index[key];
       const stDt = e.dtype;
+      // 透传：.weight / A_log / dt_bias / bias 等 BF16|F16|F32
       if (stDt !== "BF16" && stDt !== "F16" && stDt !== "F32") continue;
+      const qlwcName = mapQlwcName(key);
+      if (seen.has(qlwcName)) continue;
       const shape = e.shape;
       const nbytes = e.end - e.start;
       let data;
       if (stDt === "BF16" || stDt === "F16") {
-        // 大 embedding / lm_head：直接按 safetensors 切片拷贝，禁止整表 Buffer.alloc
         data = blobFromSlice(e, nbytes);
       } else if (nbytes <= MAX_BUF) {
         data = blobFromBuffer(convertF32toBf16(readTensor(e), shape.reduce((a, b) => a * b, 1)));
