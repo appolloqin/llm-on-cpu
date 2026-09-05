@@ -31,6 +31,7 @@ constexpr int kCudaSuccess = 0;
 constexpr int kCublasSuccess = 0;
 constexpr int kCudaMemcpyH2D = 1;
 constexpr int kCudaMemcpyD2H = 2;
+constexpr int kCudaMemcpyD2D = 3;
 constexpr int kCublasOpN = 0;
 constexpr int kCublasOpT = 1;
 
@@ -159,9 +160,11 @@ float* g_mlp_g = nullptr;
 float* g_mlp_u = nullptr;
 float* g_mlp_mid = nullptr;
 float* g_mlp_down = nullptr;
+float* g_mlp_core = nullptr;  // GDN core / attn intermediate
 uint16_t* g_mlp_ln = nullptr;
 int g_mlp_cap_h = 0;
 int g_mlp_cap_i = 0;
+int g_mlp_cap_core = 0;
 
 // Prefill attention scratch (host↔device per call; only used when cuda enabled)
 void* g_attn_q = nullptr;
@@ -771,11 +774,12 @@ void disable() {
   free_f(g_mlp_u);
   free_f(g_mlp_mid);
   free_f(g_mlp_down);
+  free_f(g_mlp_core);
   if (g_mlp_ln) {
     g_api.cudaFree(g_mlp_ln);
     g_mlp_ln = nullptr;
   }
-  g_mlp_cap_h = g_mlp_cap_i = 0;
+  g_mlp_cap_h = g_mlp_cap_i = g_mlp_cap_core = 0;
   if (g_attn_q) g_api.cudaFree(g_attn_q);
   if (g_attn_k) g_api.cudaFree(g_attn_k);
   if (g_attn_v) g_api.cudaFree(g_attn_v);
@@ -1276,16 +1280,20 @@ extern "C" __global__ void rmsnorm_w16(const float* __restrict__ x, const unsign
   float* partial = smem;
   const int tid = threadIdx.x;
   float sum = 0.f;
-  for (int i = tid; i < n; i += blockDim.x) sum += x[i] * x[i];
+  for (int i = tid; i < n; i += blockDim.x) {
+    float v = x[i];
+    sum += v * v;
+  }
   partial[tid] = sum;
   __syncthreads();
   for (int s = blockDim.x / 2; s > 0; s >>= 1) {
     if (tid < s) partial[tid] += partial[tid + s];
     __syncthreads();
   }
+  // Match CPU rmsnorm(..., one_plus_weight=true): y = x * rsqrt(mean(x^2)+eps) * (1+w)
   const float inv = rsqrtf(partial[0] / (float)n + eps);
   for (int i = tid; i < n; i += blockDim.x)
-    y[i] = x[i] * inv * w16_to_f32(w[i], is_f16);
+    y[i] = x[i] * inv * (1.f + w16_to_f32(w[i], is_f16));
 }
 
 extern "C" __global__ void silu_mul(const float* __restrict__ g, const float* __restrict__ u,
@@ -1812,6 +1820,18 @@ bool ensure_mlp_caps(int H, int I) {
   return g_mlp_x && g_mlp_norm && g_mlp_down && g_mlp_ln && g_mlp_g && g_mlp_u && g_mlp_mid;
 }
 
+bool ensure_mlp_core(int n) {
+  if (n <= g_mlp_cap_core && g_mlp_core) return true;
+  if (g_mlp_core) g_api.cudaFree(g_mlp_core);
+  g_mlp_core = nullptr;
+  g_mlp_cap_core = 0;
+  void* v = nullptr;
+  if (g_api.cudaMalloc(&v, sizeof(float) * static_cast<size_t>(n)) != kCudaSuccess) return false;
+  g_mlp_core = static_cast<float*>(v);
+  g_mlp_cap_core = n;
+  return true;
+}
+
 }  // namespace
 
 bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::Int4View& wgate,
@@ -1874,6 +1894,186 @@ bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::In
   const unsigned add_grid = (static_cast<unsigned>(H) + blk - 1) / blk;
   void* prm_add[] = {&g_mlp_x, &g_mlp_down, &g_mlp_norm, &H};
   if (!jit_launch(fn_add, add_grid, 1, 1, blk, 1, 1, 0, prm_add)) return false;
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(y, g_mlp_norm, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyD2H) ==
+         kCudaSuccess;
+}
+
+bool try_rmsnorm_gemm_multi_resident(const float* x, const uint16_t* ln1,
+                                     const qlwc::Int4View* const* Ws, float* const* ys, int n, int H,
+                                     float eps, bool ln_is_f16) {
+  if (!g_enabled || !g_resident || !jit_available()) return false;
+  if (!x || !ln1 || !Ws || !ys || n < 2 || n > 4 || H <= 0) return false;
+
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  if (!fn_rms) return false;
+  void* fn_multi = get_jit_kernel(kGemvInt4Src, "gemv_multi4_int4");
+  if (!fn_multi) return false;
+
+  const Int4Resident* res[4] = {};
+  int total_m = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, H)) return false;  // I unused; keep mid sized at least H
+    for (int i = 0; i < n; ++i) {
+      if (!Ws[i] || Ws[i]->K != H) return false;
+      res[i] = ensure_int4_resident(*Ws[i]);
+      if (!res[i]) return false;
+      total_m += res[i]->M;
+    }
+    for (int i = 1; i < n; ++i) {
+      if (res[i]->K != res[0]->K || res[i]->ng != res[0]->ng || res[i]->gs != res[0]->gs ||
+          res[i]->is_awq != res[0]->is_awq)
+        return false;
+    }
+    if (!ensure_xy(total_m, H, 1)) return false;
+    if (g_api.cudaMemcpy(g_mlp_x, x, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyH2D) !=
+        kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(g_mlp_ln, ln1, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+  }
+
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  const unsigned blk = 256;
+  void* prm_rms[] = {&g_mlp_x, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+
+  const uint8_t* q[4] = {};
+  const uint16_t* s[4] = {};
+  const uint16_t* z[4] = {};
+  float* ydev[4] = {};
+  int m[4] = {};
+  int offset = 0;
+  for (int i = 0; i < n; ++i) {
+    q[i] = static_cast<const uint8_t*>(res[i]->d_qweight);
+    s[i] = static_cast<const uint16_t*>(res[i]->d_scales);
+    z[i] = static_cast<const uint16_t*>(res[i]->d_zeros);
+    ydev[i] = reinterpret_cast<float*>(g_dy) + offset;
+    m[i] = res[i]->M;
+    offset += res[i]->M;
+  }
+  for (int i = n; i < 4; ++i) {
+    q[i] = q[0];
+    s[i] = s[0];
+    z[i] = z[0];
+    ydev[i] = ydev[0];
+    m[i] = 0;
+  }
+  int K = res[0]->K, ng = res[0]->ng, gs = res[0]->gs;
+  int is_awq_i = res[0]->is_awq ? 1 : 0;
+  const float* dx = g_mlp_norm;
+  void* params[] = {&q[0], &s[0], &z[0], &ydev[0], &m[0], &q[1], &s[1], &z[1], &ydev[1], &m[1],
+                    &q[2], &s[2], &z[2], &ydev[2], &m[2], &q[3], &s[3], &z[3], &ydev[3], &m[3],
+                    &n,    &K,    &ng,   &gs,      &is_awq_i, &dx};
+  constexpr int RPB = 8;
+  const int blocks = (total_m + RPB - 1) / RPB;
+  const unsigned shmem = sizeof(unsigned short) * RPB * ng * 2;
+  if (!jit_launch(fn_multi, static_cast<unsigned>(blocks), 1, 1, RPB * 32, 1, 1, shmem, params))
+    return false;
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  int off = 0;
+  for (int i = 0; i < n; ++i) {
+    if (g_api.cudaMemcpy(ys[i], reinterpret_cast<float*>(g_dy) + off,
+                         sizeof(float) * static_cast<size_t>(m[i]), kCudaMemcpyD2H) != kCudaSuccess)
+      return false;
+    off += m[i];
+  }
+  return true;
+}
+
+bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::Int4View& wout,
+                          const uint16_t* ln2, const qlwc::Int4View& wgate,
+                          const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,
+                          int I, float eps, bool ln_is_f16) {
+  if (!g_enabled || !g_resident || !jit_available()) return false;
+  if (!residual || !core || !ln2 || !y || H <= 0 || I <= 0) return false;
+  // wout: y[H] = W[H, K_core] @ core[K_core]
+  if (wout.M != H || wgate.K != H || wup.K != H || wdown.K != I || wgate.M != I || wup.M != I ||
+      wdown.M != H)
+    return false;
+  const int Kc = wout.K;
+  if (Kc <= 0) return false;
+
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  void* fn_silu = get_jit_kernel(kActSrc, "silu_mul");
+  void* fn_add = get_jit_kernel(kActSrc, "vec_add");
+  if (!fn_rms || !fn_silu || !fn_add) return false;
+
+  const Int4Resident* ro = nullptr;
+  const Int4Resident* rg = nullptr;
+  const Int4Resident* ru = nullptr;
+  const Int4Resident* rd = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, I)) return false;
+    if (!ensure_mlp_core(Kc)) return false;
+    ro = ensure_int4_resident(wout);
+    rg = ensure_int4_resident(wgate);
+    ru = ensure_int4_resident(wup);
+    rd = ensure_int4_resident(wdown);
+    if (!ro || !rg || !ru || !rd) return false;
+    if (g_api.cudaMemcpy(g_mlp_x, residual, sizeof(float) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(g_mlp_core, core, sizeof(float) * static_cast<size_t>(Kc),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(g_mlp_ln, ln2, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+  }
+
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(ro->d_qweight),
+                     static_cast<const uint16_t*>(ro->d_scales),
+                     static_cast<const uint16_t*>(ro->d_zeros), g_mlp_core, g_mlp_down, ro->M, ro->K,
+                     ro->ng, ro->gs, ro->is_awq))
+    return false;
+
+  const unsigned blk = 256;
+  const unsigned add_grid = (static_cast<unsigned>(H) + blk - 1) / blk;
+  // post-attn residual in g_mlp_norm = residual + attn_out
+  void* prm_add0[] = {&g_mlp_x, &g_mlp_down, &g_mlp_norm, &H};
+  if (!jit_launch(fn_add, add_grid, 1, 1, blk, 1, 1, 0, prm_add0)) return false;
+
+  // MLP from g_mlp_norm (copy to g_mlp_x as residual for final add)
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_api.cudaMemcpy(g_mlp_x, g_mlp_norm, sizeof(float) * static_cast<size_t>(H),
+                         kCudaMemcpyD2D) != kCudaSuccess)
+      return false;
+  }
+
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  void* prm_rms[] = {&g_mlp_norm, &g_mlp_ln, &g_mlp_down, &H, &eps, &is_f16};  // normed in down tmp
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(rg->d_qweight),
+                     static_cast<const uint16_t*>(rg->d_scales),
+                     static_cast<const uint16_t*>(rg->d_zeros), g_mlp_down, g_mlp_g, rg->M, rg->K,
+                     rg->ng, rg->gs, rg->is_awq))
+    return false;
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(ru->d_qweight),
+                     static_cast<const uint16_t*>(ru->d_scales),
+                     static_cast<const uint16_t*>(ru->d_zeros), g_mlp_down, g_mlp_u, ru->M, ru->K,
+                     ru->ng, ru->gs, ru->is_awq))
+    return false;
+
+  const unsigned silu_grid = (static_cast<unsigned>(I) + blk - 1) / blk;
+  void* prm_silu[] = {&g_mlp_g, &g_mlp_u, &g_mlp_mid, &I};
+  if (!jit_launch(fn_silu, silu_grid, 1, 1, blk, 1, 1, 0, prm_silu)) return false;
+
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(rd->d_qweight),
+                     static_cast<const uint16_t*>(rd->d_scales),
+                     static_cast<const uint16_t*>(rd->d_zeros), g_mlp_mid, g_mlp_down, rd->M, rd->K,
+                     rd->ng, rd->gs, rd->is_awq))
+    return false;
+
+  void* prm_add1[] = {&g_mlp_x, &g_mlp_down, &g_mlp_norm, &H};
+  if (!jit_launch(fn_add, add_grid, 1, 1, blk, 1, 1, 0, prm_add1)) return false;
 
   std::lock_guard<std::mutex> lock(g_mu);
   return g_api.cudaMemcpy(y, g_mlp_norm, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyD2H) ==

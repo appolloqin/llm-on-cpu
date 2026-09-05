@@ -715,25 +715,42 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       gemm_opt_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
       gemm_opt_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
     } else {
-      // Fused multi-GEMV only when a/b 也是 INT4；否则拆开（ignore 里的 BF16 透传）
-      if (lp.wb.is_int4 && lp.wa.is_int4) {
+      bool in_ok = false;
+      if (resident_gpu_ && lp.ln1 && lp.wb.is_int4 && lp.wa.is_int4) {
         const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
         float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
-        if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
-          gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
-          gemm_view(sc.normed.data(), lp.wz, sc.z.data());
+        in_ok = hal::cuda::try_rmsnorm_gemm_multi_resident(
+            x, lp.ln1, ws4, ys4, 4, H, cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16);
+      } else if (resident_gpu_ && lp.ln1) {
+        const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
+        float* ys2[2] = {sc.mixed.data(), sc.z.data()};
+        if (hal::cuda::try_rmsnorm_gemm_multi_resident(
+                x, lp.ln1, ws2, ys2, 2, H, cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16)) {
+          gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+          gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
+          in_ok = true;
+        }
+      }
+      if (!in_ok) {
+        if (lp.wb.is_int4 && lp.wa.is_int4) {
+          const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
+          float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
+          if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
+            gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
+            gemm_view(sc.normed.data(), lp.wz, sc.z.data());
+            gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+            gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
+          }
+        } else {
+          const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
+          float* ys2[2] = {sc.mixed.data(), sc.z.data()};
+          if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {
+            gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
+            gemm_view(sc.normed.data(), lp.wz, sc.z.data());
+          }
           gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
           gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
         }
-      } else {
-        const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
-        float* ys2[2] = {sc.mixed.data(), sc.z.data()};
-        if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {
-          gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
-          gemm_view(sc.normed.data(), lp.wz, sc.z.data());
-        }
-        gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
-        gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
       }
     }
 
@@ -811,6 +828,13 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
         float* zh = sc.z.data() + (t * nv + h) * dv;
           hal::rmsnorm_gated(ch, zh, lp.nrm, ch, dv, cfg_.rms_eps, pass_wd_);
       }
+    }
+    // Fuse wout + MLP on device (linear decode): skip host residual/mlp tail.
+    if (n_tok == 1 && resident_gpu_ && lp.wout.is_int4 && lp.ln2 &&
+        hal::cuda::try_out_mlp_resident(sc.residual.data(), sc.core.data(), lp.wout.i4, lp.ln2,
+                                        lp.wgate, lp.wup, lp.wdown, x, H, I, cfg_.rms_eps,
+                                        pass_wd_ == hal::WDtype::kF16)) {
+      return;
     }
     if (n_tok > 1)
       gemm_opt_batch(sc.core.data(), n_tok, lp.wout, sc.attn_out.data());

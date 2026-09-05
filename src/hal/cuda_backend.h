@@ -37,6 +37,19 @@ bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::In
                              const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,
                              int I, float eps, bool ln_is_f16);
 
+// Decode linear in-proj: rmsnorm(ln1) + 2..4 INT4 GEMVs, one H2D(x)+one packed D2H.
+// ys[i] length = Ws[i]->M. Requires all INT4 same K/ng/gs.
+bool try_rmsnorm_gemm_multi_resident(const float* x, const uint16_t* ln1,
+                                     const qlwc::Int4View* const* Ws, float* const* ys, int n, int H,
+                                     float eps, bool ln_is_f16);
+
+// After GDN: wout GEMV + residual add + MLP, one H2D(core)+H2D(residual) + one D2H(y).
+// core is post rmsnorm_gated [H_out=wout.K]; residual/y are [H].
+bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::Int4View& wout,
+                          const uint16_t* ln2, const qlwc::Int4View& wgate,
+                          const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,
+                          int I, float eps, bool ln_is_f16);
+
 // y[M] = W[M,K] @ x[K]. W pointer is cache key (stable WeightManager buffers).
 // Returns false → caller must use CPU gemm. No-op false when !enabled().
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16);
