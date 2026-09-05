@@ -753,16 +753,15 @@ function inferCtMk(packedE, shapeE) {
 
 function mapQlwcName(hfKey) {
   let n = hfKey;
-  const wasWeight = n.endsWith(".weight");
-  if (wasWeight) n = n.slice(0, -".weight".length);
   n = n.replace(
     /\.(weight_packed|weight_scale|weight_zero_point|weight_shape|qweight|scales|qzeros|qscale|wzeros)$/i,
     "",
   );
+  if (n.endsWith(".weight")) n = n.slice(0, -".weight".length);
   if (n.startsWith("model.")) n = n.slice("model.".length);
   if (n === "embed_tokens") return "embedding.weight";
-  // A_log / dt_bias / bias 等非 .weight 张量：保持原名（勿强行加 .weight）
-  if (!wasWeight) return n;
+  // GDN 标量/向量参数：保持裸名（引擎找 ...A_log / ...dt_bias，不加 .weight）
+  if (n.endsWith(".A_log") || n.endsWith(".dt_bias") || n.endsWith(".bias")) return n;
   return `${n}.weight`;
 }
 
