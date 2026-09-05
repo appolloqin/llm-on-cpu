@@ -251,11 +251,13 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
     lp.qn = pass(base + "self_attn.q_norm.weight");
     lp.kn = pass(base + "self_attn.k_norm.weight");
   } else {
+    const int value_dim = nv * dv;
     lp.wqkv = store_->get_int4(base + "linear_attn.in_proj_qkv.weight");
     lp.wz = store_->get_int4(base + "linear_attn.in_proj_z.weight");
-    lp.wb = store_->get_int4(base + "linear_attn.in_proj_b.weight");
-    lp.wa = store_->get_int4(base + "linear_attn.in_proj_a.weight");
-    lp.wout = store_->get_int4(base + "linear_attn.out_proj.weight");
+    // cyankiwi AWQ: in_proj_a/b 常在 ignore 中保持 BF16；out_proj 仅部分层量化
+    lp.wb = load_opt_w(base + "linear_attn.in_proj_b.weight", nv, cfg_.hidden);
+    lp.wa = load_opt_w(base + "linear_attn.in_proj_a.weight", nv, cfg_.hidden);
+    lp.wout = load_opt_w(base + "linear_attn.out_proj.weight", cfg_.hidden, value_dim);
     lp.nrm = pass(base + "linear_attn.norm.weight");
     const uint16_t* A_log = pass(base + "linear_attn.A_log");
     const uint16_t* dt_bias = pass(base + "linear_attn.dt_bias");
@@ -298,6 +300,23 @@ const uint16_t* Qwen35Int4Model::pass(const std::string& name) {
   return store_->get_pass(name).data;
 }
 
+Qwen35Int4Model::OptW Qwen35Int4Model::load_opt_w(const std::string& name, int M, int K) {
+  OptW o;
+  o.M = M;
+  o.K = K;
+  if (store_->lazy()) store_->ensure(name);
+  if (is_int4(name)) {
+    o.is_int4 = true;
+    o.i4 = store_->get_int4(name);
+  } else {
+    o.is_int4 = false;
+    const auto pv = store_->get_pass(name);
+    o.pass = pv.data;
+    o.dt = pv.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
+  }
+  return o;
+}
+
 void Qwen35Int4Model::gemm_w(const float* x, const std::string& wname, float* y, int M, int K) {
   if (is_int4(wname)) {
     if (store_->lazy()) store_->ensure(wname);
@@ -326,6 +345,27 @@ void Qwen35Int4Model::gemm_view_batch(const float* X, int n, const qlwc::Int4Vie
   hal::gemm_int4_batch(X, n, W, Y);
 }
 
+void Qwen35Int4Model::gemm_opt(const float* x, const OptW& W, float* y) {
+  if (W.is_int4) {
+    gemm_view(x, W.i4, y);
+  } else {
+    if (!W.pass) throw std::runtime_error("gemm_opt: missing passthrough weight");
+    hal::gemm_bias_free(x, W.pass, y, W.M, W.K, W.dt);
+  }
+}
+
+void Qwen35Int4Model::gemm_opt_batch(const float* X, int n, const OptW& W, float* Y) {
+  if (n <= 0) return;
+  if (W.is_int4) {
+    gemm_view_batch(X, n, W.i4, Y);
+    return;
+  }
+  if (!W.pass) throw std::runtime_error("gemm_opt_batch: missing passthrough weight");
+  for (int t = 0; t < n; ++t) {
+    gemm_opt(X + static_cast<size_t>(t) * W.K, W, Y + static_cast<size_t>(t) * W.M);
+  }
+}
+
 void Qwen35Int4Model::warm_gpu_int4_weights() {
   if (!hal::cuda::enabled()) return;
   int n_ok = 0, n_fail = 0;
@@ -345,9 +385,9 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
     } else {
       try_one(lp.wqkv);
       try_one(lp.wz);
-      try_one(lp.wb);
-      try_one(lp.wa);
-      try_one(lp.wout);
+      if (lp.wb.is_int4) try_one(lp.wb.i4);
+      if (lp.wa.is_int4) try_one(lp.wa.i4);
+      if (lp.wout.is_int4) try_one(lp.wout.i4);
     }
     try_one(lp.wgate);
     try_one(lp.wup);
@@ -639,17 +679,28 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     if (n_tok > 1) {
       gemm_view_batch(sc.normed.data(), n_tok, lp.wqkv, sc.mixed.data());
       gemm_view_batch(sc.normed.data(), n_tok, lp.wz, sc.z.data());
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
     } else {
-      // Fused 4-GEMV: wqkv+wz+wb+wa share sc.normed → 1 launch + 1 H2D
-      const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb, &lp.wa};
-      float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
-      if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
-        gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
-        gemm_view(sc.normed.data(), lp.wz, sc.z.data());
-        gemm_view(sc.normed.data(), lp.wb, sc.b.data());
-        gemm_view(sc.normed.data(), lp.wa, sc.a.data());
+      // Fused multi-GEMV only when a/b 也是 INT4；否则拆开（ignore 里的 BF16 透传）
+      if (lp.wb.is_int4 && lp.wa.is_int4) {
+        const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
+        float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
+        if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
+          gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
+          gemm_view(sc.normed.data(), lp.wz, sc.z.data());
+          gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+          gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
+        }
+      } else {
+        const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
+        float* ys2[2] = {sc.mixed.data(), sc.z.data()};
+        if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {
+          gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
+          gemm_view(sc.normed.data(), lp.wz, sc.z.data());
+        }
+        gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+        gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
       }
     }
 
@@ -717,9 +768,9 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       }
     }
     if (n_tok > 1)
-      gemm_view_batch(sc.core.data(), n_tok, lp.wout, sc.attn_out.data());
+      gemm_opt_batch(sc.core.data(), n_tok, lp.wout, sc.attn_out.data());
     else
-      gemm_view(sc.core.data(), lp.wout, sc.attn_out.data());
+      gemm_opt(sc.core.data(), lp.wout, sc.attn_out.data());
   }
 
   for (size_t i = 0; i < nH; ++i) x[i] = sc.residual[i] + sc.attn_out[i];

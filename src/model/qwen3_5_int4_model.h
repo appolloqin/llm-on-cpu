@@ -75,6 +75,15 @@ class Qwen35Int4Model final : public ICausalLM {
   int32_t vision_end_id() const { return cfg_.vision_end_id; }
 
  private:
+  struct OptW {
+    bool is_int4 = false;
+    qlwc::Int4View i4{};
+    const uint16_t* pass = nullptr;
+    hal::WDtype dt = hal::WDtype::kBF16;
+    int M = 0;
+    int K = 0;
+  };
+
   struct LayerPack {
     bool is_full = false;
     const uint16_t* ln1 = nullptr;
@@ -83,8 +92,9 @@ class Qwen35Int4Model final : public ICausalLM {
     qlwc::Int4View wq, wk, wv, wo;
     const uint16_t* qn = nullptr;
     const uint16_t* kn = nullptr;
-    // linear / GDN
-    qlwc::Int4View wqkv, wz, wb, wa, wout;
+    // linear / GDN（a/b/out 在 AWQ ignore 列表里常为 BF16 透传）
+    qlwc::Int4View wqkv, wz;
+    OptW wb, wa, wout;
     const uint16_t* nrm = nullptr;
     std::vector<float> A_log_f;
     std::vector<float> dt_bias_f;
@@ -119,9 +129,12 @@ class Qwen35Int4Model final : public ICausalLM {
 
   bool is_int4(const std::string& name) const;
   const uint16_t* pass(const std::string& name);
+  OptW load_opt_w(const std::string& name, int M, int K);
   void gemm_w(const float* x, const std::string& wname, float* y, int M, int K);
   void gemm_view(const float* x, const qlwc::Int4View& W, float* y);
   void gemm_view_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
+  void gemm_opt(const float* x, const OptW& W, float* y);
+  void gemm_opt_batch(const float* X, int n, const OptW& W, float* Y);
   void embed(int32_t token, float* out);
   void layer_forward(int layer, float* x, SessionCache& cache, int pos_start, int n_tok,
                      bool is_prefill);
