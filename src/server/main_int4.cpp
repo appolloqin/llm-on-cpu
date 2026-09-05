@@ -181,6 +181,9 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 4; ++i) model.forward({warm_ids.back()}, wc, logits, false);
       }
       LOG_INFO("int4 warmup: %d prefill + 4 decode forwards", static_cast<int>(warm_ids.size()));
+      if (llmoc::hal::cuda::resident_gpu_enabled()) {
+        llmoc::hal::cuda::log_resident_stats();
+      }
       if (use_stream && streamer) {
         const auto st = streamer->stats();
         LOG_INFO("layer_stream stats: pin_loads=%llu pin_hits=%llu releases=%llu window_bytes=%llu",

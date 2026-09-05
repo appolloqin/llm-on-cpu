@@ -825,9 +825,13 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   Int4Scratch::fit(sc.uproj, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.mid, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.down, static_cast<size_t>(n_tok) * H);
-  for (int t = 0; t < n_tok; ++t)
-    hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
-  if (n_tok > 1) {
+  if (n_tok == 1 && resident_gpu_ && lp.ln2 &&
+      hal::cuda::try_mlp_decode_resident(x, lp.ln2, lp.wgate, lp.wup, lp.wdown, x, H, I,
+                                         cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16)) {
+    // x already = residual + down
+  } else if (n_tok > 1) {
+    for (int t = 0; t < n_tok; ++t)
+      hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
     gemm_view_batch(sc.normed.data(), n_tok, lp.wgate, sc.gproj.data());
     gemm_view_batch(sc.normed.data(), n_tok, lp.wup, sc.uproj.data());
     for (int t = 0; t < n_tok; ++t)
@@ -836,7 +840,8 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     for (int t = 0; t < n_tok; ++t)
       for (int i = 0; i < H; ++i) x[t * H + i] = sc.residual[t * H + i] + sc.down[t * H + i];
   } else {
-    // Fused 2-GEMV: gate+up share sc.normed → 1 launch + 1 H2D
+    for (int t = 0; t < n_tok; ++t)
+      hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
     const qlwc::Int4View* ws2[2] = {&lp.wgate, &lp.wup};
     float* ys2[2] = {sc.gproj.data(), sc.uproj.data()};
     if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {

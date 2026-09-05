@@ -28,6 +28,14 @@ size_t vram_budget();
 // reserve headroom and enable GPU GDN / tighter decode residency. LLMOC_RESIDENT_GPU=0 forces off.
 bool try_enable_resident_gpu(size_t workspace_bytes);
 bool resident_gpu_enabled();
+// GDN GPU hit/miss + last error (for diagnosing silent CPU fallback).
+void log_resident_stats();
+
+// Decode MLP on device: rmsnorm → gate/up GEMV → silu× → down GEMV → residual add.
+// One H2D(x) + one D2H(y); false → caller uses host path.
+bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::Int4View& wgate,
+                             const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,
+                             int I, float eps, bool ln_is_f16);
 
 // y[M] = W[M,K] @ x[K]. W pointer is cache key (stable WeightManager buffers).
 // Returns false → caller must use CPU gemm. No-op false when !enabled().
