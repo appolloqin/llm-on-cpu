@@ -46,6 +46,10 @@ class Qwen35Int4Model final : public ICausalLM {
   bool layer_stream_enabled() const { return streamer_ != nullptr; }
   // hybrid/pure_gpu：将层投影 INT4 反量化上传 VRAM（跳过 embed/lm_head）
   void warm_gpu_int4_weights();
+  // Estimate GDN states + scratch for auto resident-GPU probe (after warm).
+  size_t resident_workspace_bytes() const;
+  void enable_resident_gpu(bool on);
+  bool resident_gpu() const { return resident_gpu_; }
   const CausalLmMeta& meta() const override { return meta_; }
   void init_cache(SessionCache& cache, int max_seq) const override;
   void forward(const std::vector<int32_t>& tokens, SessionCache& cache, std::vector<float>& logits,
@@ -155,6 +159,7 @@ class Qwen35Int4Model final : public ICausalLM {
 
   wt::ILayerStreamLoader* streamer_ = nullptr;
   int stream_window_ = 2;
+  bool resident_gpu_ = false;
 
   std::vector<float> last_hidden_;
   std::vector<float> last_logits_;

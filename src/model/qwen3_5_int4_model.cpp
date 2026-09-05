@@ -429,6 +429,26 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
   hal::cuda::log_status();
 }
 
+size_t Qwen35Int4Model::resident_workspace_bytes() const {
+  int n_lin = 0;
+  for (const auto& lp : layers_) {
+    if (!lp.is_full) ++n_lin;
+  }
+  const int nv = cfg_.linear_num_v;
+  const int dk = cfg_.linear_dk;
+  const int dv = cfg_.linear_dv;
+  const size_t gdn_states =
+      static_cast<size_t>(n_lin) * sizeof(float) * static_cast<size_t>(nv) * dk * dv;
+  const size_t gdn_io =
+      sizeof(float) * (static_cast<size_t>(nv) * dk * 2 + static_cast<size_t>(nv) * dv +
+                       static_cast<size_t>(nv) * 2 + static_cast<size_t>(nv) * dv);
+  const size_t act = sizeof(float) * static_cast<size_t>(cfg_.hidden) * 32;
+  const size_t margin = 256ull << 20;  // 256 MiB slack
+  return gdn_states + gdn_io + act + margin;
+}
+
+void Qwen35Int4Model::enable_resident_gpu(bool on) { resident_gpu_ = on; }
+
 void Qwen35Int4Model::embed(int32_t token, float* out) {
   if (vision_n_tok_ > 0 && token == cfg_.image_token_id) {
     if (vision_cursor_ >= vision_n_tok_)
@@ -770,8 +790,20 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       }
     }
 
-    hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
-                               Lkv.linear.recurrent.data(), sc.core.data(), n_tok, nv, dk, dv, true);
+    bool gdn_ok = false;
+    if (n_tok == 1 && resident_gpu_) {
+      gdn_ok = hal::cuda::try_gated_delta_gpu(
+          sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
+          Lkv.linear.recurrent.data(), sc.core.data(), nv, dk, dv);
+    }
+    if (!gdn_ok) {
+      if (resident_gpu_) {
+        hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
+      }
+      hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
+                                 Lkv.linear.recurrent.data(), sc.core.data(), n_tok, nv, dk, dv,
+                                 true);
+    }
 
     for (int t = 0; t < n_tok; ++t) {
       for (int h = 0; h < nv; ++h) {

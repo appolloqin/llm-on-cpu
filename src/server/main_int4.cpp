@@ -155,6 +155,19 @@ int main(int argc, char** argv) {
     }
     if (llmoc::hal::cuda::enabled() && !use_stream) {
       model.warm_gpu_int4_weights();
+      const size_t need = model.resident_workspace_bytes();
+      const double need_g = need / double(1ull << 30);
+      const double used_g = llmoc::hal::cuda::vram_used() / double(1ull << 30);
+      const double bud_g = llmoc::hal::cuda::vram_budget() / double(1ull << 30);
+      if (llmoc::hal::cuda::try_enable_resident_gpu(need)) {
+        model.enable_resident_gpu(true);
+        LOG_INFO("resident_gpu=ON need=%.2fGiB used=%.2fGiB budget=%.2fGiB", need_g,
+                 llmoc::hal::cuda::vram_used() / double(1ull << 30), bud_g);
+      } else {
+        LOG_INFO("resident_gpu=OFF need=%.2fGiB used=%.2fGiB budget=%.2fGiB jit=%d (%s)", need_g,
+                 used_g, bud_g, llmoc::hal::cuda::jit_available() ? 1 : 0,
+                 llmoc::hal::cuda::status());
+      }
     }
 
     // 预热

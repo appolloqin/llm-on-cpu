@@ -125,6 +125,8 @@ std::mutex g_mu;
 bool g_probed = false;
 bool g_probe_ok = false;
 bool g_enabled = false;
+bool g_resident = false;
+size_t g_resident_reserve = 0;  // accounting hold so weight uploads don't starve GDN workspace
 std::string g_status = "off";
 size_t g_budget = 0;
 size_t g_used = 0;
@@ -134,6 +136,8 @@ void* g_dy = nullptr;
 int g_cap_k = 0;
 int g_cap_m = 0;
 int g_cap_n = 0;  // batch columns for X/Y
+const float* g_sticky_x = nullptr;  // skip repeat H2D of same host x when resident_gpu
+int g_sticky_k = 0;
 std::unordered_map<const void*, CacheEntry> g_cache;
 std::unordered_map<const void*, Int4Resident> g_int4_cache;
 uint64_t g_lru_tick = 0;
@@ -361,6 +365,8 @@ bool ensure_xy(int M, int K, int n = 1) {
     if (g_api.cudaMalloc(&g_dx, sizeof(float) * static_cast<size_t>(need_k)) != kCudaSuccess)
       return false;
     g_cap_k = need_k;
+    g_sticky_x = nullptr;
+    g_sticky_k = 0;
   }
   if (need_m > g_cap_m || !g_dy) {
     if (g_dy) g_api.cudaFree(g_dy);
@@ -369,6 +375,22 @@ bool ensure_xy(int M, int K, int n = 1) {
     g_cap_m = need_m;
   }
   g_cap_n = n;
+  return true;
+}
+
+// Upload host x→g_dx unless resident path already has the same vector.
+bool upload_x_sticky(const float* x, int K) {
+  if (g_resident && g_sticky_x == x && g_sticky_k == K && g_dx) return true;
+  if (g_api.cudaMemcpy(g_dx, x, sizeof(float) * static_cast<size_t>(K), kCudaMemcpyH2D) !=
+      kCudaSuccess)
+    return false;
+  if (g_resident) {
+    g_sticky_x = x;
+    g_sticky_k = K;
+  } else {
+    g_sticky_x = nullptr;
+    g_sticky_k = 0;
+  }
   return true;
 }
 
@@ -589,6 +611,40 @@ const char* status() { return g_status.c_str(); }
 size_t vram_used() { return g_used; }
 size_t vram_budget() { return g_budget; }
 
+bool resident_gpu_enabled() { return g_resident && g_enabled; }
+
+bool try_enable_resident_gpu(size_t workspace_bytes) {
+  const char* env = std::getenv("LLMOC_RESIDENT_GPU");
+  if (env && env[0] == '0' && env[1] == '\0') {
+    g_resident = false;
+    g_status = "resident_gpu forced off (LLMOC_RESIDENT_GPU=0)";
+    return false;
+  }
+  const bool force = env && env[0] == '1' && env[1] == '\0';
+  if (!g_enabled) {
+    g_status = "resident_gpu: cuda not enabled";
+    return false;
+  }
+  if (!jit_available()) {
+    g_status = "resident_gpu: jit unavailable";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_mu);
+  size_t need_add = 0;
+  if (workspace_bytes > g_resident_reserve) need_add = workspace_bytes - g_resident_reserve;
+  if (!force && g_budget > 0 && g_used + need_add > g_budget) {
+    g_status = "resident_gpu: insufficient VRAM headroom";
+    return false;
+  }
+  if (need_add > 0) {
+    g_used += need_add;
+    g_resident_reserve = workspace_bytes;
+  }
+  g_resident = true;
+  g_status = "resident_gpu on";
+  return true;
+}
+
 int device_count() {
   if (!probe_available()) return 0;
   std::lock_guard<std::mutex> lock(g_mu);
@@ -692,9 +748,13 @@ void disable() {
   if (g_dy) g_api.cudaFree(g_dy);
   g_dx = g_dy = nullptr;
   g_cap_k = g_cap_m = g_cap_n = 0;
+  g_sticky_x = nullptr;
+  g_sticky_k = 0;
   if (g_cublas && g_api.cublasDestroy) g_api.cublasDestroy(g_cublas);
   g_cublas = nullptr;
   g_used = 0;
+  g_resident = false;
+  g_resident_reserve = 0;
   g_enabled = false;
   g_status = "disabled";
 }
@@ -1289,8 +1349,7 @@ bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
     }
     // 锁内: 准备 GPU 端输入(x H2D)。之后解锁再调 jit_gemv_int4(其内部 jit_compile 会再锁 g_mu, 不可重入)。
     if (!ensure_xy(W.M, W.K, 1)) return false;
-    if (g_api.cudaMemcpy(g_dx, x, sizeof(float) * static_cast<size_t>(W.K),
-                         kCudaMemcpyH2D) != kCudaSuccess) return false;
+    if (!upload_x_sticky(x, W.K)) return false;
     x_uploaded = true;
   }
   if (!x_uploaded) return false;
@@ -1330,9 +1389,7 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
         return gemm_dev(dW, X, Y, W.M, W.K);
       }
       if (!ensure_xy(W.M, W.K, 1)) return false;
-      if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(W.K),
-                           kCudaMemcpyH2D) != kCudaSuccess)
-        return false;
+      if (!upload_x_sticky(X, W.K)) return false;
       x_uploaded = true;
     }
     if (!x_uploaded) return false;
@@ -1435,8 +1492,7 @@ bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float*
         return false;
     }
     if (!ensure_xy(total_m, res[0]->K, 1)) return false;
-    if (g_api.cudaMemcpy(g_dx, x, sizeof(float) * static_cast<size_t>(res[0]->K),
-                         kCudaMemcpyH2D) != kCudaSuccess) return false;
+    if (!upload_x_sticky(x, res[0]->K)) return false;
   }
   // Build params for gemv_multi4_int4
   void* fn = get_jit_kernel(kGemvInt4Src, "gemv_multi4_int4");
@@ -1546,55 +1602,77 @@ bool try_attn_prefill(const float* q, const float* k, const float* v, float* out
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out,
                          int n_heads, int dk, int dv) {
-  if (!g_enabled || !jit_available()) return false;
+  if (!g_enabled || !jit_available() || !g_resident) return false;
   if (!q || !k || !v || !g || !beta || !state || !out) return false;
-  const size_t state_bytes = sizeof(float) * n_heads * dk * dv;
-  const size_t io_bytes = sizeof(float) * (n_heads * dk * 2 + n_heads * dv + n_heads * 2 + n_heads * dv);
+  if (n_heads <= 0 || dk <= 0 || dv <= 0) return false;
+  // Compile outside g_mu — jit_compile locks g_mu (non-recursive).
+  void* fn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
+  if (!fn) return false;
+
+  const size_t state_bytes = sizeof(float) * static_cast<size_t>(n_heads) * dk * dv;
+  const size_t io_bytes =
+      sizeof(float) * (static_cast<size_t>(n_heads) * dk * 2 + static_cast<size_t>(n_heads) * dv +
+                       static_cast<size_t>(n_heads) * 2 + static_cast<size_t>(n_heads) * dv);
   std::lock_guard<std::mutex> lock(g_mu);
-  // Ensure device state buffer for this host state pointer
   auto it = g_gdn_state.find(state);
   if (it == g_gdn_state.end()) {
     void* d_state_v = nullptr;
     if (g_api.cudaMalloc(&d_state_v, state_bytes) != kCudaSuccess) return false;
-    // Zero-init via H2D of a zero buffer
-    std::vector<float> zeros(state_bytes / sizeof(float), 0.f);
-    if (g_api.cudaMemcpy(d_state_v, zeros.data(), state_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
-      g_api.cudaFree(d_state_v); return false;
+    // Seed from host (post-prefill CPU GDN); do not zero-init.
+    if (g_api.cudaMemcpy(d_state_v, state, state_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(d_state_v);
+      return false;
     }
     g_gdn_state[state] = static_cast<float*>(d_state_v);
     it = g_gdn_state.find(state);
   }
   float* d_state = it->second;
-  // Ensure scratch buffer for q/k/v/g/beta/out
   if (io_bytes > g_gdn_buf_cap) {
     if (g_gdn_buf) g_api.cudaFree(g_gdn_buf);
     void* buf_v = nullptr;
-    if (g_api.cudaMalloc(&buf_v, io_bytes) != kCudaSuccess) { g_gdn_buf = nullptr; return false; }
+    if (g_api.cudaMalloc(&buf_v, io_bytes) != kCudaSuccess) {
+      g_gdn_buf = nullptr;
+      g_gdn_buf_cap = 0;
+      return false;
+    }
     g_gdn_buf = static_cast<float*>(buf_v);
     g_gdn_buf_cap = io_bytes;
   }
-  // Layout in g_gdn_buf: [q | k | v | g | beta | out]
   float* d_q = g_gdn_buf;
   float* d_k = d_q + n_heads * dk;
   float* d_v = d_k + n_heads * dk;
   float* d_g = d_v + n_heads * dv;
   float* d_beta = d_g + n_heads;
   float* d_out = d_beta + n_heads;
-  // H2D uploads
-  if (g_api.cudaMemcpy(d_q, q, sizeof(float)*n_heads*dk, kCudaMemcpyH2D) != kCudaSuccess) return false;
-  if (g_api.cudaMemcpy(d_k, k, sizeof(float)*n_heads*dk, kCudaMemcpyH2D) != kCudaSuccess) return false;
-  if (g_api.cudaMemcpy(d_v, v, sizeof(float)*n_heads*dv, kCudaMemcpyH2D) != kCudaSuccess) return false;
-  if (g_api.cudaMemcpy(d_g, g, sizeof(float)*n_heads, kCudaMemcpyH2D) != kCudaSuccess) return false;
-  if (g_api.cudaMemcpy(d_beta, beta, sizeof(float)*n_heads, kCudaMemcpyH2D) != kCudaSuccess) return false;
-  // Launch kernel
-  void* fn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
-  if (!fn) return false;
-  float scale = 1.f / sqrtf((float)dk);
+  if (g_api.cudaMemcpy(d_q, q, sizeof(float) * n_heads * dk, kCudaMemcpyH2D) != kCudaSuccess)
+    return false;
+  if (g_api.cudaMemcpy(d_k, k, sizeof(float) * n_heads * dk, kCudaMemcpyH2D) != kCudaSuccess)
+    return false;
+  if (g_api.cudaMemcpy(d_v, v, sizeof(float) * n_heads * dv, kCudaMemcpyH2D) != kCudaSuccess)
+    return false;
+  if (g_api.cudaMemcpy(d_g, g, sizeof(float) * n_heads, kCudaMemcpyH2D) != kCudaSuccess)
+    return false;
+  if (g_api.cudaMemcpy(d_beta, beta, sizeof(float) * n_heads, kCudaMemcpyH2D) != kCudaSuccess)
+    return false;
+  float scale = 1.f / sqrtf(static_cast<float>(dk));
   void* params[] = {&d_q, &d_k, &d_v, &d_g, &d_beta, &d_state, &d_out, &dk, &dv, &scale};
-  if (!jit_launch(fn, n_heads, 1, 1, dv, 1, 1, 0, params)) return false;
-  // D2H output
-  if (g_api.cudaMemcpy(out, d_out, sizeof(float)*n_heads*dv, kCudaMemcpyD2H) != kCudaSuccess) return false;
+  if (!jit_launch(fn, static_cast<unsigned>(n_heads), 1, 1, static_cast<unsigned>(dv), 1, 1, 0,
+                  params))
+    return false;
+  if (g_api.cudaMemcpy(out, d_out, sizeof(float) * n_heads * dv, kCudaMemcpyD2H) != kCudaSuccess)
+    return false;
   return true;
+}
+
+void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv) {
+  if (!g_enabled || !host_state || n_heads <= 0 || dk <= 0 || dv <= 0) return;
+  const size_t state_bytes = sizeof(float) * static_cast<size_t>(n_heads) * dk * dv;
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_gdn_state.find(host_state);
+  if (it == g_gdn_state.end() || !it->second) return;
+  if (g_api.cudaMemcpy(host_state, it->second, state_bytes, kCudaMemcpyD2H) != kCudaSuccess) return;
+  g_api.cudaFree(it->second);
+  g_gdn_state.erase(it);
 }
 
 bool prefetch_int4_weight(const qlwc::Int4View& W) {

@@ -24,6 +24,11 @@ void disable();
 size_t vram_used();
 size_t vram_budget();
 
+// Auto resident-GPU path: if free VRAM >= workspace_bytes (or LLMOC_RESIDENT_GPU=1),
+// reserve headroom and enable GPU GDN / tighter decode residency. LLMOC_RESIDENT_GPU=0 forces off.
+bool try_enable_resident_gpu(size_t workspace_bytes);
+bool resident_gpu_enabled();
+
 // y[M] = W[M,K] @ x[K]. W pointer is cache key (stable WeightManager buffers).
 // Returns false → caller must use CPU gemm. No-op false when !enabled().
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16);
@@ -57,10 +62,12 @@ bool d2h(void* dst, const void* src, size_t bytes);
 bool try_attn_prefill(const float* q, const float* k, const float* v, float* out, int seq,
                       int n_heads, int n_kv_heads, int head_dim, float scale);
 
-// GPU gated_delta_recurrent: state persists on device. Returns false → CPU fallback.
+// GPU gated_delta_recurrent (single step): state persists on device. Returns false → CPU fallback.
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out,
                          int n_heads, int dk, int dv);
+// Before CPU GDN on the same host state buffer: D2H device copy (if any) so host stays authoritative.
+void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv);
 
 // ---- NVRTC JIT (no nvcc): 运行时编译 CUDA kernel, driver API 启动 ----
 // 动态加载 nvrtc64_XXX.dll + nvcuda.dll; 任一缺失 → jit_available()=false, 优雅降级。
