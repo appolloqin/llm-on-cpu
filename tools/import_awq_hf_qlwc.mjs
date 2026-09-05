@@ -355,7 +355,12 @@ function writeQlwc(filePath, scheme, groupSize, items) {
   ]);
   const fileSize = Math.max(off, alignUp(preface.length + catalog.length, ALIGN));
 
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const outDir = path.dirname(filePath);
+  // Windows 盘符根目录（如 E:\）mkdir 会 EPERM，跳过即可
+  const root = path.parse(outDir).root;
+  if (outDir && outDir !== root) {
+    fs.mkdirSync(outDir, { recursive: true });
+  }
   const fd = fs.openSync(filePath, "w");
   try {
     writeAt(fd, preface, 0);
@@ -456,6 +461,57 @@ function gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, zpLayout) {
   return f32ArrToF16Bits(out);
 }
 
+/**
+ * compressed-tensors weight_zero_point: I32 [ceil(M/8), ng]，每 int32 沿 M 打包 8 个 4bit zp。
+ * 也兼容已展开的 [M,ng] / [ng,M] / I8 等。
+ */
+function loadCtZeroPoints(zerosE, M, ng) {
+  const zeros = readTensor(zerosE);
+  const dt = String(zerosE.dtype || "").toUpperCase();
+  const shape = zerosE.shape || [];
+  const packedRows = Math.ceil(M / 8);
+  const elems = tensorElemCount(zerosE, zeros);
+
+  const unpackPackedI32 = (layoutPmNg) => {
+    if (zeros.length < packedRows * ng * 4) {
+      throw new Error(`packed zp too short bytes=${zeros.length} need=${packedRows * ng * 4}`);
+    }
+    const view = new Int32Array(zeros.buffer, zeros.byteOffset, packedRows * ng);
+    const out = new Float32Array(M * ng);
+    for (let m = 0; m < M; ++m) {
+      const pm = (m / 8) | 0;
+      const shift = (m % 8) * 4;
+      for (let g = 0; g < ng; ++g) {
+        const idx = layoutPmNg ? pm * ng + g : g * packedRows + pm;
+        out[m * ng + g] = (view[idx] >>> shift) & 0xf;
+      }
+    }
+    return out;
+  };
+
+  // 典型 CT: shape [M/8, ng] I32
+  if (
+    (dt === "I32" || dt === "U32") &&
+    ((shape.length === 2 && shape[0] === packedRows && shape[1] === ng) ||
+      elems === packedRows * ng)
+  ) {
+    return { zpF: unpackPackedI32(true), layout: "m_g" };
+  }
+  // 偶发 [ng, M/8]
+  if (
+    (dt === "I32" || dt === "U32") &&
+    shape.length === 2 &&
+    shape[0] === ng &&
+    shape[1] === packedRows
+  ) {
+    return { zpF: unpackPackedI32(false), layout: "m_g" };
+  }
+
+  const zpF = tensorToF32(zeros, zerosE.dtype, elems);
+  const layout = inferLayout(zpF.length, M, ng);
+  return { zpF, layout };
+}
+
 function scalesToF16Mg(scaleF, M, ng, layout) {
   const out = new Float32Array(M * ng);
   for (let m = 0; m < M; ++m) {
@@ -502,10 +558,7 @@ function importCtToQlwc(packedE, scalesE, zerosE, M, K, gsHint, symmetric, tmpDi
   let qlwcZeros = null;
   if (!symmetric) {
     if (!zerosE) throw new Error("asymmetric CT weights need weight_zero_point");
-    const zeros = readTensor(zerosE);
-    const zpCount = tensorElemCount(zerosE, zeros);
-    const zpF = tensorToF32(zeros, zerosE.dtype, zpCount);
-    const zpLayout = inferLayout(zpF.length, M, ng);
+    const { zpF, layout: zpLayout } = loadCtZeroPoints(zerosE, M, ng);
     qlwcZeros = gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, zpLayout);
   }
 
