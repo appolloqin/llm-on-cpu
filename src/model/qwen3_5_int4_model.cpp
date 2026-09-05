@@ -1048,6 +1048,11 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
 
   double lin = 0, full = 0;
   const bool time_layers = (ms_lin && ms_full);
+  const bool prog_prefill = is_prefill && n >= 64;
+  const auto t_pf0 = prog_prefill ? Clock::now() : Clock::time_point{};
+  if (prog_prefill) {
+    LOG_INFO("prefill begin: tok=%d layers=%d (progress every 8 layers)", n, cfg_.layers);
+  }
   for (int L = 0; L < cfg_.layers; ++L) {
     if (streamer_) {
       if (L + 1 < cfg_.layers) streamer_->prefetch_layer(L + 1);
@@ -1092,6 +1097,12 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
       run();
     }
     if (streamer_ && L + 1 >= stream_window_) streamer_->release_layer(L + 1 - stream_window_);
+    if (prog_prefill && ((L + 1) % 8 == 0 || L + 1 == cfg_.layers)) {
+      const double ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - t_pf0).count();
+      LOG_INFO("prefill layer %d/%d (%.1fs, ~%.1f layer/s)", L + 1, cfg_.layers, ms / 1000.0,
+               (L + 1) / (ms > 0 ? ms / 1000.0 : 1.0));
+    }
   }
   if (ms_lin) *ms_lin = lin;
   if (ms_full) *ms_full = full;

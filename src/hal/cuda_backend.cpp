@@ -383,21 +383,37 @@ bool load_apis(std::string& err) {
 
 bool ensure_xy(int M, int K, int n = 1) {
   if (n < 1) n = 1;
-  const int need_k = K * n;
-  const int need_m = M * n;
-  if (need_k > g_cap_k || !g_dx) {
-    if (g_dx) g_api.cudaFree(g_dx);
-    if (g_api.cudaMalloc(&g_dx, sizeof(float) * static_cast<size_t>(need_k)) != kCudaSuccess)
-      return false;
-    g_cap_k = need_k;
+  // Use size_t to avoid overflow; reject absurd batches early.
+  const size_t need_k = static_cast<size_t>(K) * static_cast<size_t>(n);
+  const size_t need_m = static_cast<size_t>(M) * static_cast<size_t>(n);
+  constexpr size_t kMaxFloats = 64ull << 20;  // ~256MiB
+  if (need_k == 0 || need_m == 0 || need_k > kMaxFloats || need_m > kMaxFloats) return false;
+
+  if (static_cast<int>(need_k) > g_cap_k || !g_dx) {
+    if (g_dx) {
+      g_api.cudaFree(g_dx);
+      g_dx = nullptr;
+    }
+    g_cap_k = 0;
     g_sticky_x = nullptr;
     g_sticky_k = 0;
-  }
-  if (need_m > g_cap_m || !g_dy) {
-    if (g_dy) g_api.cudaFree(g_dy);
-    if (g_api.cudaMalloc(&g_dy, sizeof(float) * static_cast<size_t>(need_m)) != kCudaSuccess)
+    if (g_api.cudaMalloc(&g_dx, sizeof(float) * need_k) != kCudaSuccess) {
+      g_dx = nullptr;
       return false;
-    g_cap_m = need_m;
+    }
+    g_cap_k = static_cast<int>(need_k);
+  }
+  if (static_cast<int>(need_m) > g_cap_m || !g_dy) {
+    if (g_dy) {
+      g_api.cudaFree(g_dy);
+      g_dy = nullptr;
+    }
+    g_cap_m = 0;
+    if (g_api.cudaMalloc(&g_dy, sizeof(float) * need_m) != kCudaSuccess) {
+      g_dy = nullptr;
+      return false;
+    }
+    g_cap_m = static_cast<int>(need_m);
   }
   g_cap_n = n;
   return true;
@@ -1496,6 +1512,10 @@ bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int 
                         bool is_f16) {
   if (!g_enabled || !X || !W || !Y || M <= 0 || K <= 0 || n <= 0) return false;
   if (n == 1) return try_gemm_w16(X, W, Y, M, K, is_f16);
+  // Long prefill under tight VRAM: CPU weight-stationary is safer/faster than growing g_dx/g_dy.
+  constexpr int kMaxGpuBatch = 128;
+  if (n > kMaxGpuBatch) return false;
+
   std::lock_guard<std::mutex> lock(g_mu);
   auto it = g_cache.find(W);
   if (it == g_cache.end()) {
