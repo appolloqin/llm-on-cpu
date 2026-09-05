@@ -2,6 +2,7 @@
 #include "hal/cuda_backend.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -204,38 +205,61 @@ float f16_to_f32(uint16_t h) {
 
 bool load_apis(std::string& err) {
   if (g_api.cudaMalloc) return true;
+  std::vector<std::string> dirs;  // Windows: toolkit bin 搜索路径；供 cudart/nvrtc 共用
 #if defined(_WIN32)
-  const char* cudart_names[] = {"cudart64_12.dll", "cudart64_110.dll", nullptr};
-  const char* cublas_names[] = {"cublas64_12.dll", "cublas64_11.dll", nullptr};
-  const char* dirs[] = {
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.5\\bin\\",
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6\\bin\\",
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4\\bin\\",
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.3\\bin\\",
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.2\\bin\\",
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.1\\bin\\",
-      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.0\\bin\\",
-      "",
+  // CUDA 13: cudart64_13 / cublas64_13；官方布局常在 bin\x64（仅 bin 在 PATH 时找不到）
+  const char* cudart_names[] = {"cudart64_13.dll", "cudart64_12.dll", "cudart64_110.dll", nullptr};
+  const char* cublas_names[] = {"cublas64_13.dll", "cublas64_12.dll", "cublas64_11.dll", nullptr};
+  auto add_dir = [&](std::string d) {
+    if (d.empty()) return;
+    if (d.back() != '\\' && d.back() != '/') d.push_back('\\');
+    dirs.push_back(std::move(d));
+  };
+  auto add_toolkit_root = [&](const std::string& root) {
+    if (root.empty()) return;
+    add_dir(root + "\\bin\\x64");
+    add_dir(root + "\\bin");
+  };
+  for (const char* ev : {"CUDA_PATH", "CUDA_PATH_V13_3", "CUDA_PATH_V13_2", "CUDA_PATH_V13_1",
+                         "CUDA_PATH_V13_0", "CUDA_PATH_V12_6", "CUDA_PATH_V12_5", "CUDA_HOME"}) {
+    const char* v = std::getenv(ev);
+    if (v && v[0]) add_toolkit_root(v);
+  }
+  static const char* kRoots[] = {
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.1",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.0",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.5",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.3",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.2",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.1",
+      "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.0",
       nullptr};
-  for (int d = 0; dirs[d]; ++d) {
+  for (int i = 0; kRoots[i]; ++i) add_toolkit_root(kRoots[i]);
+  dirs.emplace_back("");  // PATH / 默认搜索
+
+  for (const auto& dir : dirs) {
     for (int i = 0; cudart_names[i] && !g_api.cudart; ++i) {
-      std::string p = std::string(dirs[d]) + cudart_names[i];
-      g_api.cudart = dirs[d][0] ? load_lib_path(p) : load_lib(cudart_names[i]);
+      g_api.cudart = dir.empty() ? load_lib(cudart_names[i]) : load_lib_path(dir + cudart_names[i]);
     }
     for (int i = 0; cublas_names[i] && !g_api.cublas; ++i) {
-      std::string p = std::string(dirs[d]) + cublas_names[i];
-      g_api.cublas = dirs[d][0] ? load_lib_path(p) : load_lib(cublas_names[i]);
+      g_api.cublas = dir.empty() ? load_lib(cublas_names[i]) : load_lib_path(dir + cublas_names[i]);
     }
     if (g_api.cudart && g_api.cublas) break;
   }
 #else
-  g_api.cudart = load_lib("libcudart.so.12");
+  g_api.cudart = load_lib("libcudart.so.13");
+  if (!g_api.cudart) g_api.cudart = load_lib("libcudart.so.12");
   if (!g_api.cudart) g_api.cudart = load_lib("libcudart.so");
-  g_api.cublas = load_lib("libcublas.so.12");
+  g_api.cublas = load_lib("libcublas.so.13");
+  if (!g_api.cublas) g_api.cublas = load_lib("libcublas.so.12");
   if (!g_api.cublas) g_api.cublas = load_lib("libcublas.so");
 #endif
   if (!g_api.cudart || !g_api.cublas) {
-    err = "cudart/cublas not found";
+    err = "cudart/cublas not found (CUDA 12/13; on Win CUDA13 often under bin\\x64)";
     return false;
   }
   g_api.cudaMalloc = reinterpret_cast<cudaMalloc_t>(sym(g_api.cudart, "cudaMalloc"));
@@ -282,11 +306,11 @@ bool load_apis(std::string& err) {
   {
     const char* nvrtc_names[] = {"nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_110_0.dll",
                                  nullptr};
-    for (int d = 0; dirs[d] && !g_api.nvrtc; ++d) {
+    for (const auto& dir : dirs) {
       for (int i = 0; nvrtc_names[i] && !g_api.nvrtc; ++i) {
-        const std::string p = std::string(dirs[d]) + nvrtc_names[i];
-        g_api.nvrtc = dirs[d][0] ? load_lib_path(p) : load_lib(nvrtc_names[i]);
+        g_api.nvrtc = dir.empty() ? load_lib(nvrtc_names[i]) : load_lib_path(dir + nvrtc_names[i]);
       }
+      if (g_api.nvrtc) break;
     }
   }
 #else
@@ -305,6 +329,7 @@ bool load_apis(std::string& err) {
     g_api.cuModuleUnload = reinterpret_cast<cuModuleUnload_t>(sym(g_api.nvcuda, "cuModuleUnload"));
     g_api.cuLaunchKernel = reinterpret_cast<cuLaunchKernel_t>(sym(g_api.nvcuda, "cuLaunchKernel"));
   }
+  g_api.nvrtc = load_lib("libnvrtc.so.13");
   if (!g_api.nvrtc) g_api.nvrtc = load_lib("libnvrtc.so.12");
   if (!g_api.nvrtc) g_api.nvrtc = load_lib("libnvrtc.so");
 #endif
