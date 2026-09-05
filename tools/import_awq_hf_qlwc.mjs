@@ -479,10 +479,8 @@ function finishQPayload(payload) {
 }
 
 /** compressed-tensors pack-quantized → QLWC：按行流式重打包，不解 FP32、不二次量化 */
-function importCtToQlwc(packedE, scalesE, zerosE, M, K, gs, symmetric, tmpDir, tag) {
-  if (K % gs !== 0) throw new Error(`K=${K} % group_size=${gs} != 0`);
+function importCtToQlwc(packedE, scalesE, zerosE, M, K, gsHint, symmetric, tmpDir, tag) {
   if (K % 2 !== 0) throw new Error(`QLWC pack needs even K, got ${K}`);
-  const ng = K / gs;
   const colsPacked = Math.ceil(K / 8);
   const rowBytes = colsPacked * 4;
   const expected = M * rowBytes;
@@ -492,18 +490,20 @@ function importCtToQlwc(packedE, scalesE, zerosE, M, K, gs, symmetric, tmpDir, t
   }
 
   const scales = readTensor(scalesE);
-  const scaleCount =
-    scalesE.dtype === "F16" || scalesE.dtype === "BF16" ? scales.length / 2 : scales.length / 4;
+  const scaleCount = tensorElemCount(scalesE, scales);
   const scaleF = tensorToF32(scales, scalesE.dtype, scaleCount);
-  const scaleLayout = inferLayout(scaleF.length, M, ng);
+  const resolved = resolveScaleGroup(scaleF.length, M, K, gsHint);
+  const { ng, gs, layout: scaleLayout } = resolved;
+  if (gsHint > 0 && gs !== gsHint) {
+    // 仅首次由调用方汇总打印；此处保持安静以免刷屏
+  }
   const qlwcScales = scalesToF16Mg(scaleF, M, ng, scaleLayout);
 
   let qlwcZeros = null;
   if (!symmetric) {
     if (!zerosE) throw new Error("asymmetric CT weights need weight_zero_point");
     const zeros = readTensor(zerosE);
-    const zpCount =
-      zerosE.dtype === "I8" || zerosE.dtype === "U8" ? zeros.length : zeros.length / 4;
+    const zpCount = tensorElemCount(zerosE, zeros);
     const zpF = tensorToF32(zeros, zerosE.dtype, zpCount);
     const zpLayout = inferLayout(zpF.length, M, ng);
     qlwcZeros = gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, zpLayout);
@@ -537,7 +537,7 @@ function importCtToQlwc(packedE, scalesE, zerosE, M, K, gs, symmetric, tmpDir, t
         writeAt(payload.fd, rowOut, m * (K / 2));
       }
     }
-    return { q: finishQPayload(payload), scales: qlwcScales, zeros: qlwcZeros };
+    return { q: finishQPayload(payload), scales: qlwcScales, zeros: qlwcZeros, gs, ng };
   } catch (err) {
     if (payload.mode === "file") {
       try {
@@ -617,7 +617,7 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
   } finally {
     fs.closeSync(fd);
   }
-  return { q: blobFromBuffer(outQ), scales: qlwcScales, zeros: qlwcZeros };
+  return { q: blobFromBuffer(outQ), scales: qlwcScales, zeros: qlwcZeros, gs, ng };
 }
 
 function loadConfig(hfDir) {
@@ -762,6 +762,51 @@ function inferLayout(len, M, ng) {
   throw new Error(`unexpected tensor length ${len} for M=${M} ng=${ng}`);
 }
 
+/** config/CLI 的 group_size 可能与真实 weight_scale 不一致；以 scale 元素数为准。 */
+function resolveScaleGroup(scaleCount, M, K, gsHint) {
+  const match = (ng, layout) => {
+    if (ng <= 0 || K % ng !== 0) return null;
+    if (layout === "m_g" && scaleCount === M * ng) return { ng, gs: K / ng, layout };
+    if (layout === "g_m" && scaleCount === ng * M) return { ng, gs: K / ng, layout };
+    if (layout === "ng" && scaleCount === ng) return { ng, gs: K / ng, layout };
+    if (layout === "m" && scaleCount === M && ng === 1) return { ng: 1, gs: K, layout: "m" };
+    if (layout === "1" && scaleCount === 1 && ng === 1) return { ng: 1, gs: K, layout: "1" };
+    return null;
+  };
+  if (gsHint > 0 && K % gsHint === 0) {
+    const ng = K / gsHint;
+    for (const layout of ["m_g", "g_m", "ng", "m", "1"]) {
+      const r = match(ng, layout);
+      if (r) return r;
+    }
+  }
+  if (M > 0 && scaleCount % M === 0) {
+    const r = match(scaleCount / M, "m_g");
+    if (r) return r;
+  }
+  // 穷举能整除 K 的 ng（K 通常 ≤ 数万）
+  for (let ng = 1; ng <= K; ++ng) {
+    if (K % ng !== 0) continue;
+    for (const layout of ["m_g", "g_m", "ng"]) {
+      const r = match(ng, layout);
+      if (r) return r;
+    }
+  }
+  throw new Error(
+    `cannot resolve group from scale length=${scaleCount} M=${M} K=${K} gsHint=${gsHint}`,
+  );
+}
+
+function tensorElemCount(entry, buf) {
+  if (entry.shape && entry.shape.length) {
+    return entry.shape.reduce((a, b) => a * b, 1);
+  }
+  const dt = entry.dtype;
+  if (dt === "F16" || dt === "BF16") return buf.length / 2;
+  if (dt === "I8" || dt === "U8") return buf.length;
+  return buf.length / 4;
+}
+
 function pickScale(values, M, ng, m, g, layout) {
   if (layout === "m_g") return values[m * ng + g];
   if (layout === "g_m") return values[g * M + m];
@@ -899,6 +944,8 @@ async function main() {
   let nQ = 0;
   let nPass = 0;
   let nSkip = 0;
+  let fileGs = gs;
+  let gsWarned = false;
 
   try {
     const qBases = groupQuantBases(index, format);
@@ -940,6 +987,18 @@ async function main() {
         format === "compressed-tensors"
           ? importCtToQlwc(packedE, scaleE, zpE, M, K, gs, cfgOpts.symmetric, tmpDir, tag)
           : importAwqToQlwc(packedE, scaleE, zpE, M, K, gs, cfgOpts.symmetric, tmpDir, tag);
+      const usedGs = qres.gs ?? gs;
+      if (nQ === 0) {
+        fileGs = usedGs;
+        if (usedGs !== gs) {
+          console.warn(
+            `[import-awq] weight_scale implies group_size=${usedGs} (config/CLI=${gs}); using ${usedGs}`,
+          );
+          gsWarned = true;
+        }
+      } else if (usedGs !== fileGs) {
+        throw new Error(`mixed group sizes in checkpoint: ${fileGs} vs ${usedGs} at ${qlwcName}`);
+      }
       items.push({
         name: qlwcName,
         kind: 1,
@@ -995,9 +1054,9 @@ async function main() {
         );
       }
     }
-    writeQlwc(opt.out, scheme, gs, items);
+    writeQlwc(opt.out, scheme, fileGs, items);
     const sizeG = fs.statSync(opt.out).size / 1024 ** 3;
-    console.log(`[import-awq] int4=${nQ} passthrough=${nPass}`);
+    console.log(`[import-awq] int4=${nQ} passthrough=${nPass} group_size=${fileGs}${gsWarned ? " (from scales)" : ""}`);
     console.log(`[import-awq] wrote ${opt.out} (${sizeG.toFixed(2)} GiB)`);
   } finally {
     try {
