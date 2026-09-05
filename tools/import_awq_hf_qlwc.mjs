@@ -57,8 +57,10 @@ function u32(v) {
   return b;
 }
 function u64(v) {
+  const n = typeof v === "bigint" ? v : BigInt(Math.trunc(Number(v)));
+  if (n < 0n) throw new Error(`u64 got negative ${v} (often int32 overflow on ≥2GiB size)`);
   const b = Buffer.alloc(8);
-  b.writeBigUInt64LE(BigInt(v));
+  b.writeBigUInt64LE(n);
   return b;
 }
 function str(s) {
@@ -217,7 +219,10 @@ function blobFromSlice(entry, length) {
 function blobLen(b) {
   if (!b) return 0;
   if (Buffer.isBuffer(b) || ArrayBuffer.isView(b)) return b.byteLength ?? b.length;
-  return b.length | 0;
+  // 禁止 `| 0`：≥2GiB 会变成有符号负数，随后 u64()/writeBigUInt64LE 报错
+  const n = Number(b.length);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`bad blob length ${b.length}`);
+  return n;
 }
 
 function writeAt(fd, buf, filePos) {
