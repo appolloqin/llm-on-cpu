@@ -8,13 +8,24 @@ namespace llmoc::model {
 
 void SessionCache::init(int n_layers, int max_seq, int n_kv_heads, int head_dim, int n_v_heads,
                         int dk, int dv, int conv_dim, int conv_k) {
+  init(n_layers, max_seq, n_kv_heads, head_dim, n_v_heads, dk, dv, conv_dim, conv_k, nullptr);
+}
+
+void SessionCache::init(int n_layers, int max_seq, int n_kv_heads, int head_dim, int n_v_heads,
+                        int dk, int dv, int conv_dim, int conv_k,
+                        const std::vector<uint8_t>* need_full_kv) {
   max_seq_ = max_seq;
   n_kv_heads_ = n_kv_heads;
   head_dim_ = head_dim;
   layers_.assign(n_layers, {});
-  for (auto& L : layers_) {
-    L.k.assign(static_cast<size_t>(n_kv_heads) * max_seq * head_dim, 0.f);
-    L.v.assign(static_cast<size_t>(n_kv_heads) * max_seq * head_dim, 0.f);
+  for (int i = 0; i < n_layers; ++i) {
+    auto& L = layers_[static_cast<size_t>(i)];
+    const bool want_kv =
+        !need_full_kv || static_cast<int>(need_full_kv->size()) <= i || (*need_full_kv)[static_cast<size_t>(i)];
+    if (want_kv) {
+      L.k.assign(static_cast<size_t>(n_kv_heads) * max_seq * head_dim, 0.f);
+      L.v.assign(static_cast<size_t>(n_kv_heads) * max_seq * head_dim, 0.f);
+    }
     L.seq = 0;
     L.linear.conv.assign(static_cast<size_t>(conv_dim) * conv_k, 0.f);
     L.linear.recurrent.assign(static_cast<size_t>(n_v_heads) * dk * dv, 0.f);

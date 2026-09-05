@@ -27,6 +27,9 @@ class SessionCache {
  public:
   void init(int n_layers, int max_seq, int n_kv_heads, int head_dim, int n_v_heads, int dk, int dv,
             int conv_dim, int conv_k);
+  // need_full_kv[i]=false → skip K/V alloc (linear-attn layers); nullptr = all layers need KV
+  void init(int n_layers, int max_seq, int n_kv_heads, int head_dim, int n_v_heads, int dk, int dv,
+            int conv_dim, int conv_k, const std::vector<uint8_t>* need_full_kv);
   void clear();
 
   // P0: 投机 verify 快照 / 回滚（拒绝后缀不得污染已提交状态）

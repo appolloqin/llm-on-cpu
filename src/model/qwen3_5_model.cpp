@@ -157,8 +157,11 @@ void Qwen35Model::warm_gpu_bf16_weights() {
 }
 
 void Qwen35Model::init_cache(SessionCache& cache, int max_seq) const {
+  std::vector<uint8_t> need_kv(static_cast<size_t>(cfg_.layers), 1);
+  for (int i = 0; i < cfg_.layers; ++i)
+    need_kv[static_cast<size_t>(i)] = (cfg_.layer_types[i] == "full_attention") ? 1 : 0;
   cache.init(cfg_.layers, max_seq, cfg_.n_kv, cfg_.head_dim, cfg_.linear_num_v, cfg_.linear_dk,
-             cfg_.linear_dv, meta_.conv_dim, cfg_.conv_k);
+             cfg_.linear_dv, meta_.conv_dim, cfg_.conv_k, &need_kv);
 }
 
 const uint16_t* Qwen35Model::w(const std::string& name) {

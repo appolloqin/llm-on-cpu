@@ -142,6 +142,8 @@ class Qwen35Int4Model final : public ICausalLM {
   void embed(int32_t token, float* out);
   void layer_forward(int layer, float* x, SessionCache& cache, int pos_start, int n_tok,
                      bool is_prefill);
+  // Decode-only: linear layer on device residual stream. false → caller uses layer_forward.
+  bool layer_forward_linear_act(int layer, SessionCache& cache);
   void forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache, bool is_prefill,
                          float* h_out, double* ms_lin = nullptr, double* ms_full = nullptr);
   void prepare_mrope_positions(const std::vector<int32_t>& tokens, bool is_prefill);

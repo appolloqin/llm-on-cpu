@@ -93,6 +93,57 @@ void gemm_bias_free(const float* x, const uint16_t* W, float* y, int M, int K, W
 #endif
 }
 
+void gemm_bias_free_batch(const float* X, int n, const uint16_t* W, float* Y, int M, int K,
+                          WDtype dt) {
+  if (n <= 0 || !X || !W || !Y || M <= 0 || K <= 0) return;
+  if (n == 1) {
+    gemm_bias_free(X, W, Y, M, K, dt);
+    return;
+  }
+  if (cuda::try_gemm_w16_batch(X, n, W, Y, M, K, dt == WDtype::kF16)) return;
+  // Weight-stationary: each W row streamed once across all tokens (critical for long prefill).
+#if defined(LLMOC_ENABLE_AVX2)
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (M >= 64)
+#endif
+  for (int m = 0; m < M; ++m) {
+    const uint16_t* row = W + static_cast<size_t>(m) * K;
+    for (int t = 0; t < n; ++t) {
+      const float* x = X + static_cast<size_t>(t) * K;
+      __m256 vacc0 = _mm256_setzero_ps();
+      __m256 vacc1 = _mm256_setzero_ps();
+      __m256 vacc2 = _mm256_setzero_ps();
+      __m256 vacc3 = _mm256_setzero_ps();
+      int k = 0;
+      for (; k + 32 <= K; k += 32) {
+        vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k), load8_w_f32(row + k, dt), vacc0);
+        vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 8), load8_w_f32(row + k + 8, dt), vacc1);
+        vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 16), load8_w_f32(row + k + 16, dt), vacc2);
+        vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 24), load8_w_f32(row + k + 24, dt), vacc3);
+      }
+      __m256 vacc = _mm256_add_ps(_mm256_add_ps(vacc0, vacc1), _mm256_add_ps(vacc2, vacc3));
+      float acc = hsum256(vacc);
+      for (; k < K; ++k) acc += x[k] * load_w(row + k, dt);
+      Y[static_cast<size_t>(t) * M + m] = std::isfinite(acc) ? acc : 0.f;
+    }
+  }
+#else
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (M >= 64)
+#endif
+  for (int m = 0; m < M; ++m) {
+    const uint16_t* row = W + static_cast<size_t>(m) * K;
+    for (int t = 0; t < n; ++t) {
+      const float* x = X + static_cast<size_t>(t) * K;
+      double acc = 0.0;
+      for (int k = 0; k < K; ++k) acc += static_cast<double>(x[k]) * load_w(row + k, dt);
+      const float o = static_cast<float>(acc);
+      Y[static_cast<size_t>(t) * M + m] = std::isfinite(o) ? o : 0.f;
+    }
+  }
+#endif
+}
+
 void rmsnorm(const float* x, const uint16_t* w, float* y, int n, float eps, WDtype dt,
              bool one_plus_weight) {
   double ss = 0.0;
@@ -317,23 +368,55 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale) {
   const int g = n_heads / n_kv_heads;
-  std::vector<float> scores(seq);
-  for (int tq = 0; tq < seq; ++tq) {
-    for (int h = 0; h < n_heads; ++h) {
+  const int work = seq * n_heads;
+#if defined(_OPENMP)
+#pragma omp parallel if (work >= 64)
+#endif
+  {
+    std::vector<float> scores(static_cast<size_t>(seq));
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for (int wi = 0; wi < work; ++wi) {
+      const int tq = wi / n_heads;
+      const int h = wi % n_heads;
       const int hkv = h / g;
       const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
       for (int tk = 0; tk <= tq; ++tk) {
         const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
+#if defined(LLMOC_ENABLE_AVX2)
+        __m256 vacc = _mm256_setzero_ps();
+        int d = 0;
+        for (; d + 8 <= head_dim; d += 8) {
+          vacc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + d), _mm256_loadu_ps(kt + d), vacc);
+        }
+        float dot = hsum256(vacc);
+        for (; d < head_dim; ++d) dot += qh[d] * kt[d];
+        scores[tk] = dot * scale;
+#else
         double dot = 0.0;
         for (int d = 0; d < head_dim; ++d) dot += static_cast<double>(qh[d]) * kt[d];
         scores[tk] = static_cast<float>(dot) * scale;
+#endif
       }
       softmax_inplace(scores.data(), tq + 1);
       float* oh = out + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
       std::fill(oh, oh + head_dim, 0.f);
       for (int tk = 0; tk <= tq; ++tk) {
         const float* vt = v + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
-        for (int d = 0; d < head_dim; ++d) oh[d] += scores[tk] * vt[d];
+        const float s = scores[tk];
+#if defined(LLMOC_ENABLE_AVX2)
+        int d = 0;
+        const __m256 vs = _mm256_set1_ps(s);
+        for (; d + 8 <= head_dim; d += 8) {
+          __m256 o = _mm256_loadu_ps(oh + d);
+          o = _mm256_fmadd_ps(vs, _mm256_loadu_ps(vt + d), o);
+          _mm256_storeu_ps(oh + d, o);
+        }
+        for (; d < head_dim; ++d) oh[d] += s * vt[d];
+#else
+        for (int d = 0; d < head_dim; ++d) oh[d] += s * vt[d];
+#endif
       }
     }
   }

@@ -300,8 +300,11 @@ void Qwen35Int4Model::enable_layer_stream(wt::ILayerStreamLoader* loader) {
 }
 
 void Qwen35Int4Model::init_cache(SessionCache& cache, int max_seq) const {
+  std::vector<uint8_t> need_kv(static_cast<size_t>(cfg_.layers), 1);
+  for (int i = 0; i < cfg_.layers; ++i)
+    need_kv[static_cast<size_t>(i)] = (cfg_.layer_types[i] == "full_attention") ? 1 : 0;
   cache.init(cfg_.layers, max_seq, cfg_.n_kv, cfg_.head_dim, cfg_.linear_num_v, cfg_.linear_dk,
-             cfg_.linear_dv, meta_.conv_dim, cfg_.conv_k);
+             cfg_.linear_dv, meta_.conv_dim, cfg_.conv_k, &need_kv);
 }
 
 bool Qwen35Int4Model::is_int4(const std::string& name) const {
@@ -361,10 +364,14 @@ void Qwen35Int4Model::gemm_view_batch(const float* X, int n, const qlwc::Int4Vie
 void Qwen35Int4Model::gemm_opt(const float* x, const OptW& W, float* y) {
   if (W.is_int4) {
     gemm_view(x, W.i4, y);
-  } else {
-    if (!W.pass) throw std::runtime_error("gemm_opt: missing passthrough weight");
-    hal::gemm_bias_free(x, W.pass, y, W.M, W.K, W.dt);
+    return;
   }
+  if (!W.pass) throw std::runtime_error("gemm_opt: missing passthrough weight");
+  if (hal::cuda::enabled() &&
+      hal::cuda::try_gemm_w16(x, W.pass, y, W.M, W.K, W.dt == hal::WDtype::kF16)) {
+    return;
+  }
+  hal::gemm_bias_free(x, W.pass, y, W.M, W.K, W.dt);
 }
 
 void Qwen35Int4Model::gemm_opt_batch(const float* X, int n, const OptW& W, float* Y) {
@@ -374,9 +381,16 @@ void Qwen35Int4Model::gemm_opt_batch(const float* X, int n, const OptW& W, float
     return;
   }
   if (!W.pass) throw std::runtime_error("gemm_opt_batch: missing passthrough weight");
-  for (int t = 0; t < n; ++t) {
-    gemm_opt(X + static_cast<size_t>(t) * W.K, W, Y + static_cast<size_t>(t) * W.M);
+  if (n == 1) {
+    gemm_opt(X, W, Y);
+    return;
   }
+  // Weight-stationary batch (serial gemm_opt re-reads full BF16 out_proj every token).
+  if (hal::cuda::enabled() &&
+      hal::cuda::try_gemm_w16_batch(X, n, W.pass, Y, W.M, W.K, W.dt == hal::WDtype::kF16)) {
+    return;
+  }
+  hal::gemm_bias_free_batch(X, n, W.pass, Y, W.M, W.K, W.dt);
 }
 
 void Qwen35Int4Model::warm_gpu_int4_weights() {
@@ -401,6 +415,16 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
       if (lp.wb.is_int4) try_one(lp.wb.i4);
       if (lp.wa.is_int4) try_one(lp.wa.i4);
       if (lp.wout.is_int4) try_one(lp.wout.i4);
+      auto try_pass = [&](const OptW& W) {
+        if (W.is_int4 || !W.pass || W.M <= 0 || W.K <= 0) return;
+        if (hal::cuda::prefetch_w16(W.pass, W.M, W.K, W.dt == hal::WDtype::kF16))
+          ++n_ok;
+        else
+          ++n_fail;
+      };
+      try_pass(lp.wb);
+      try_pass(lp.wa);
+      try_pass(lp.wout);
     }
     try_one(lp.wgate);
     try_one(lp.wup);
@@ -878,16 +902,128 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   }
 }
 
+bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
+  if (!resident_gpu_ || !hal::cuda::decode_act_valid()) return false;
+  const auto& lp = layers_[layer];
+  if (lp.is_full || !lp.ln1 || !lp.ln2) return false;
+
+  const int H = cfg_.hidden;
+  const int I = cfg_.intermediate;
+  const int nk = cfg_.linear_num_k, nv = cfg_.linear_num_v;
+  const int dk = cfg_.linear_dk, dv = cfg_.linear_dv;
+  const int key_dim = nk * dk, value_dim = nv * dv;
+  const int conv_dim = key_dim * 2 + value_dim;
+  auto& sc = scratch();
+  auto& Lkv = cache.layer(layer);
+
+  Int4Scratch::fit(sc.mixed, static_cast<size_t>(conv_dim));
+  Int4Scratch::fit(sc.z, static_cast<size_t>(value_dim));
+  Int4Scratch::fit(sc.b, static_cast<size_t>(nv));
+  Int4Scratch::fit(sc.a, static_cast<size_t>(nv));
+  Int4Scratch::fit(sc.mixed_c, static_cast<size_t>(conv_dim));
+  Int4Scratch::fit(sc.q, static_cast<size_t>(nv) * dk);
+  Int4Scratch::fit(sc.k, static_cast<size_t>(nv) * dk);
+  Int4Scratch::fit(sc.v, static_cast<size_t>(nv) * dv);
+  Int4Scratch::fit(sc.g, static_cast<size_t>(nv));
+  Int4Scratch::fit(sc.beta, static_cast<size_t>(nv));
+  Int4Scratch::fit(sc.core, static_cast<size_t>(value_dim));
+  Int4Scratch::fit(sc.normed, static_cast<size_t>(H));
+
+  bool in_ok = false;
+  const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+  if (lp.wb.is_int4 && lp.wa.is_int4) {
+    const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
+    float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
+    in_ok = hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws4, ys4, 4, cfg_.rms_eps, ln_f16);
+  } else {
+    const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
+    float* ys2[2] = {sc.mixed.data(), sc.z.data()};
+    if (hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws2, ys2, 2, cfg_.rms_eps, ln_f16)) {
+      if (!hal::cuda::decode_act_sync_to_host(sc.normed.data(), H)) return false;
+      hal::rmsnorm(sc.normed.data(), lp.ln1, sc.normed.data(), H, cfg_.rms_eps, pass_wd_, true);
+      gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+      gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
+      in_ok = true;
+    }
+  }
+  if (!in_ok) return false;
+
+  auto& conv_state = Lkv.linear.conv;
+  const float* cw = lp.conv_w_f.data();
+  const int ck = cfg_.conv_k;
+  const float* xin = sc.mixed.data();
+  float* xout = sc.mixed_c.data();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (conv_dim >= 1024 && !omp_in_parallel())
+#endif
+  for (int c = 0; c < conv_dim; ++c) {
+    float* st = &conv_state[static_cast<size_t>(c) * ck];
+    const float* wk = cw + static_cast<size_t>(c) * ck;
+    if (ck == 4) {
+      st[3] = st[2];
+      st[2] = st[1];
+      st[1] = st[0];
+      st[0] = xin[c];
+      const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
+      xout[c] = acc / (1.f + std::exp(-acc));
+    } else {
+      for (int k = ck - 1; k > 0; --k) st[k] = st[k - 1];
+      st[0] = xin[c];
+      float acc = 0.f;
+      for (int k = 0; k < ck; ++k) acc += st[k] * wk[ck - 1 - k];
+      xout[c] = acc / (1.f + std::exp(-acc));
+    }
+  }
+  Lkv.linear.has_state = true;
+
+  const int rep = nv / nk;
+  const float* mc = sc.mixed_c.data();
+  for (int h = 0; h < nk; ++h) {
+    for (int r = 0; r < rep; ++r) {
+      const int hh = h * rep + r;
+      std::memcpy(sc.q.data() + hh * dk, mc + h * dk, sizeof(float) * dk);
+      std::memcpy(sc.k.data() + hh * dk, mc + key_dim + h * dk, sizeof(float) * dk);
+    }
+  }
+  std::memcpy(sc.v.data(), mc + 2 * key_dim, sizeof(float) * value_dim);
+  for (int h = 0; h < nv; ++h) {
+    sc.beta[h] = sigmoid(sc.b[h]);
+    float A = std::exp(lp.A_log_f[h]);
+    if (!std::isfinite(A) || A > 1e4f) A = 1e4f;
+    if (A < 1e-6f) A = 1e-6f;
+    float sp = softplus(sc.a[h] + lp.dt_bias_f[h]);
+    if (!std::isfinite(sp)) sp = 0.f;
+    sc.g[h] = -A * sp;
+  }
+
+  if (!hal::cuda::try_gated_delta_gpu(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(),
+                                      sc.beta.data(), Lkv.linear.recurrent.data(), sc.core.data(),
+                                      nv, dk, dv)) {
+    hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
+    hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
+                               Lkv.linear.recurrent.data(), sc.core.data(), 1, nv, dk, dv, true);
+  }
+
+  for (int h = 0; h < nv; ++h) {
+    float* ch = sc.core.data() + h * dv;
+    float* zh = sc.z.data() + h * dv;
+    hal::rmsnorm_gated(ch, zh, lp.nrm, ch, dv, cfg_.rms_eps, pass_wd_);
+  }
+
+  const qlwc::Int4View* wout_i4 = lp.wout.is_int4 ? &lp.wout.i4 : nullptr;
+  const uint16_t* wout_pass = lp.wout.is_int4 ? nullptr : lp.wout.pass;
+  if (!wout_i4 && !wout_pass) return false;
+  return hal::cuda::try_ffn_on_act(sc.core.data(), value_dim, wout_i4, wout_pass,
+                                   lp.wout.dt == hal::WDtype::kF16, lp.ln2, lp.wgate, lp.wup,
+                                   lp.wdown, I, cfg_.rms_eps, ln_f16);
+}
+
 void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache,
                                         bool is_prefill, float* h_out, double* ms_lin,
                                         double* ms_full) {
   if (!store_ || tokens.empty()) throw std::runtime_error("model not ready / empty tokens");
   const int n = static_cast<int>(tokens.size());
   const int H = cfg_.hidden;
-  static const bool kProf = [] {
-    const char* e = std::getenv("LLMOC_PROFILE");
-    return e && e[0] == '1';
-  }();
   using Clock = std::chrono::steady_clock;
 
   auto& sc = scratch();
@@ -906,31 +1042,74 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
   for (int t = 0; t < n; ++t) embed(tokens[t], x + t * H);
   prepare_mrope_positions(tokens, is_prefill);
 
+  const bool stream_act = resident_gpu_ && !is_prefill && n == 1 &&
+                         hal::cuda::resident_gpu_enabled() &&
+                         hal::cuda::decode_act_begin(x, H);
+
   double lin = 0, full = 0;
+  const bool time_layers = (ms_lin && ms_full);
   for (int L = 0; L < cfg_.layers; ++L) {
     if (streamer_) {
       if (L + 1 < cfg_.layers) streamer_->prefetch_layer(L + 1);
       streamer_->pin_layer(L);
       fill_layer_pack(L);
     }
-    if (kProf && ms_lin && ms_full) {
-      const auto a = Clock::now();
+    const bool is_full = (cfg_.layer_types[L] == "full_attention");
+    auto run = [&]() {
+      if (stream_act && !is_full) {
+        if (layer_forward_linear_act(L, cache)) return;
+        if (!hal::cuda::decode_act_sync_to_host(x, H)) {
+         hal::cuda::decode_act_invalidate();
+          layer_forward(L, x, cache, pos_start, n, is_prefill);
+          return;
+        }
+        layer_forward(L, x, cache, pos_start, n, is_prefill);
+       hal::cuda::decode_act_load_from_host(x, H);
+        return;
+      }
+      if (stream_act && is_full) {
+        if (!hal::cuda::decode_act_sync_to_host(x, H)) {
+         hal::cuda::decode_act_invalidate();
+          layer_forward(L, x, cache, pos_start, n, is_prefill);
+          return;
+        }
+        layer_forward(L, x, cache, pos_start, n, is_prefill);
+       hal::cuda::decode_act_load_from_host(x, H);
+        return;
+      }
       layer_forward(L, x, cache, pos_start, n, is_prefill);
+    };
+    if (time_layers) {
+      const auto a = Clock::now();
+      run();
       const auto b = Clock::now();
       const double d = std::chrono::duration<double, std::milli>(b - a).count();
-      if (cfg_.layer_types[L] == "full_attention")
+      if (is_full)
         full += d;
       else
         lin += d;
     } else {
-      layer_forward(L, x, cache, pos_start, n, is_prefill);
+      run();
     }
     if (streamer_ && L + 1 >= stream_window_) streamer_->release_layer(L + 1 - stream_window_);
   }
   if (ms_lin) *ms_lin = lin;
   if (ms_full) *ms_full = full;
 
-  hal::rmsnorm(x + (n - 1) * H, final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+  if (stream_act && hal::cuda::decode_act_valid()) {
+    // Sync residual for last_hidden_; lm_head may re-norm from device act.
+    if (!hal::cuda::decode_act_sync_to_host(h_out, H)) {
+     hal::rmsnorm(x, final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+     hal::cuda::decode_act_invalidate();
+    } else {
+      std::vector<float> tmp(static_cast<size_t>(H));
+      std::memcpy(tmp.data(), h_out, sizeof(float) * static_cast<size_t>(H));
+     hal::rmsnorm(tmp.data(), final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+    }
+  } else {
+   hal::cuda::decode_act_invalidate();
+   hal::rmsnorm(x + (n - 1) * H, final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+  }
   for (int i = 0; i < H; ++i)
     if (!std::isfinite(h_out[i])) h_out[i] = 0.f;
   last_hidden_.assign(h_out, h_out + H);
@@ -938,62 +1117,78 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
 
 void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& cache,
                               std::vector<float>& logits, bool is_prefill) {
-  const int n = static_cast<int>(tokens.size());
   const int H = cfg_.hidden;
   const int V = cfg_.vocab;
   static const bool kProf = [] {
     const char* e = std::getenv("LLMOC_PROFILE");
     return e && e[0] == '1';
   }();
+  // One-shot decode profile when resident_gpu (no env needed).
+  static int kAutoProfLeft = resident_gpu_ ? 2 : 0;
+  const bool do_prof = kProf || (!is_prefill && kAutoProfLeft > 0);
   using Clock = std::chrono::steady_clock;
-  const auto t0 = kProf ? Clock::now() : Clock::time_point{};
+  const auto t0 = do_prof ? Clock::now() : Clock::time_point{};
 
   std::vector<float> h(H);
   double ms_lin = 0, ms_full = 0;
-  forward_to_hidden(tokens, cache, is_prefill, h.data(), kProf ? &ms_lin : nullptr,
-                    kProf ? &ms_full : nullptr);
+  forward_to_hidden(tokens, cache, is_prefill, h.data(), do_prof ? &ms_lin : nullptr,
+                    do_prof ? &ms_full : nullptr);
 
   Clock::time_point t_head0;
-  if (kProf) t_head0 = Clock::now();
+  if (do_prof) t_head0 = Clock::now();
 
   prefix_hiddens_.clear();
   prefix_logits_.clear();
   logits.resize(static_cast<size_t>(V));
-  if (lm_is_int4_) {
-    bool gpu_ok = false;    if (hal::cuda::enabled()) {
-      gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
-    }
-    if (!gpu_ok) {
-#if defined(LLMOC_ENABLE_AVX2)
-      if (lm_int4_.qweight) {
-        const int rb = (lm_int4_.K + 1) / 2;
-        _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
-        if (V > 4)
-          _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight + static_cast<size_t>(4) * rb),
-                       _MM_HINT_T0);
-      }
-#endif
-      hal::gemm_int4(h.data(), lm_int4_, logits.data());
-    }
-  } else {
-    if (hal::cuda::enabled() && lm_pass_ &&
-        hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
-                                pass_wd_ == hal::WDtype::kF16)) {
-      /* GPU resident W16 cublas SGEMM */
-    } else {
-      hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+  bool lm_from_act = false;
+  if (hal::cuda::enabled() && hal::cuda::decode_act_valid()) {
+    const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+    if (lm_is_int4_) {
+      lm_from_act = hal::cuda::try_lm_head_int4_from_act(final_norm_, lm_int4_, logits.data(),
+                                                         cfg_.rms_eps, ln_f16);
+    } else if (lm_pass_) {
+      lm_from_act = hal::cuda::try_lm_head_w16_from_act(final_norm_, lm_pass_, V, logits.data(),
+                                                        cfg_.rms_eps, ln_f16, ln_f16);
     }
   }
+  if (!lm_from_act) {
+    if (lm_is_int4_) {
+      bool gpu_ok = false;
+      if (hal::cuda::enabled()) {
+        gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
+      }
+      if (!gpu_ok) {
+#if defined(LLMOC_ENABLE_AVX2)
+        if (lm_int4_.qweight) {
+          const int rb = (lm_int4_.K + 1) / 2;
+          _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight), _MM_HINT_T0);
+          if (V > 4)
+            _mm_prefetch(reinterpret_cast<const char*>(lm_int4_.qweight + static_cast<size_t>(4) * rb),
+                         _MM_HINT_T0);
+        }
+#endif
+        hal::gemm_int4(h.data(), lm_int4_, logits.data());
+      }
+    } else {
+      if (hal::cuda::enabled() && lm_pass_ &&
+          hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
+                                  pass_wd_ == hal::WDtype::kF16)) {
+        /* GPU resident W16 cublas SGEMM */
+      } else {
+        hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+      }
+    }
+  }
+  hal::cuda::decode_act_invalidate();
   last_logits_ = logits;
 
-  if (kProf) {
+  if (do_prof) {
     const auto t1 = Clock::now();
     const double ms_head = std::chrono::duration<double, std::milli>(t1 - t_head0).count();
     const double ms_tot = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::fprintf(stderr,
-                 "[profile] n=%d prefill=%d layers_linear=%.1f layers_full=%.1f lm_head=%.1f "
-                 "total=%.1f ms\n",
-                 n, is_prefill ? 1 : 0, ms_lin, ms_full, ms_head, ms_tot);
+    LOG_INFO("profile decode: lin=%.1fms full=%.1fms lm_head=%.1fms total=%.1fms (%.2f tok/s)",
+             ms_lin, ms_full, ms_head, ms_tot, ms_tot > 0 ? 1000.0 / ms_tot : 0.0);
+    if (kAutoProfLeft > 0) --kAutoProfLeft;
   }
 }
 

@@ -28,81 +28,77 @@ size_t vram_budget();
 // reserve headroom and enable GPU GDN / tighter decode residency. LLMOC_RESIDENT_GPU=0 forces off.
 bool try_enable_resident_gpu(size_t workspace_bytes);
 bool resident_gpu_enabled();
-// GDN GPU hit/miss + last error (for diagnosing silent CPU fallback).
 void log_resident_stats();
 
-// Decode MLP on device: rmsnorm → gate/up GEMV → silu× → down GEMV → residual add.
-// One H2D(x) + one D2H(y); false → caller uses host path.
+// ---- Decode residual stream (device); additive — CPU path unchanged when unused ----
+bool decode_act_begin(const float* h_host, int H);
+bool decode_act_sync_to_host(float* h_host, int H);
+bool decode_act_load_from_host(const float* h_host, int H);
+float* decode_act_ptr();
+bool decode_act_valid();
+void decode_act_invalidate();
+
+// From device residual: rmsnorm(ln1) + 2..4 INT4 GEMVs; only projection outputs D2H.
+bool try_rmsnorm_gemm_multi_from_act(const uint16_t* ln1, const qlwc::Int4View* const* Ws,
+                                     float* const* ys, int n, float eps, bool ln_is_f16);
+
+// After host conv/GDN/rmsnorm_gated: H2D(core) + wout + residual add + MLP on device act.
+// wout: INT4 if wout_i4 non-null, else BF16/F16 pass-through.
+bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* wout_i4,
+                    const uint16_t* wout_pass, bool wout_is_f16, const uint16_t* ln2,
+                    const qlwc::Int4View& wgate, const qlwc::Int4View& wup,
+                    const qlwc::Int4View& wdown, int I, float eps, bool ln_is_f16);
+
+// Final RMSNorm + lm_head; D2H logits only (hidden stays on device until invalidate).
+bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pass, int V,
+                              float* logits_host, float eps, bool ln_is_f16, bool lm_is_f16);
+bool try_lm_head_int4_from_act(const uint16_t* final_norm, const qlwc::Int4View& lm,
+                               float* logits_host, float eps, bool ln_is_f16);
+
+// Legacy host↔device helpers (still used by non-stream paths / fallbacks).
 bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::Int4View& wgate,
                              const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,
                              int I, float eps, bool ln_is_f16);
-
-// Decode linear in-proj: rmsnorm(ln1) + 2..4 INT4 GEMVs, one H2D(x)+one packed D2H.
-// ys[i] length = Ws[i]->M. Requires all INT4 same K/ng/gs.
 bool try_rmsnorm_gemm_multi_resident(const float* x, const uint16_t* ln1,
                                      const qlwc::Int4View* const* Ws, float* const* ys, int n, int H,
                                      float eps, bool ln_is_f16);
-
-// After GDN: wout GEMV + residual add + MLP, one H2D(core)+H2D(residual) + one D2H(y).
-// core is post rmsnorm_gated [H_out=wout.K]; residual/y are [H].
 bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::Int4View& wout,
                           const uint16_t* ln2, const qlwc::Int4View& wgate,
                           const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,
                           int I, float eps, bool ln_is_f16);
 
 // y[M] = W[M,K] @ x[K]. W pointer is cache key (stable WeightManager buffers).
-// Returns false → caller must use CPU gemm. No-op false when !enabled().
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16);
+bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int M, int K,
+                        bool is_f16);
 bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16);
 
-// INT4: prefer on-device dequant-GEMV/GEMM (quantized weights resident). Prefill batch (n>1)
-// uses JIT gemm_int4 on the same resident cache; FP32 dequant→cublas is fallback only.
-// Returns false → caller must use CPU gemm_int4. Skips vocab-scale M (lm_head).
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y);
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
-// Fused multi-GEMV: 2-4 weight views sharing same x/K/ng/gs. One launch, one H2D.
-// Returns false → caller falls back to sequential try_gemm_int4 calls.
 bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float* const* ys, int n);
-// Upload only (warm); false if !enabled / OOM / budget.
 bool prefetch_int4_weight(const qlwc::Int4View& W);
 
-// AWQ / NVFP4 (shared views) — same dequant→FP32→SGEMM path.
 bool try_gemm_awq(const float* x, const AwqView& W, float* y);
 bool prefetch_awq_weight(const AwqView& W);
 bool try_gemm_nvfp4(const float* x, const Nvfp4View& W, float* y);
 bool prefetch_nvfp4_weight(const Nvfp4View& W);
 
-// Raw device buffer helpers for expert-slot residency (H2D).
 void* device_alloc(size_t bytes);
 void device_free(void* p);
 bool h2d(void* dst, const void* src, size_t bytes);
 bool d2h(void* dst, const void* src, size_t bytes);
 
-// Prefill causal attention on GPU (hybrid/pure_gpu). false → caller uses CPU attn_prefill.
-// q/k/v/out layouts match hal::attn_prefill. No-op false when !enabled().
 bool try_attn_prefill(const float* q, const float* k, const float* v, float* out, int seq,
                       int n_heads, int n_kv_heads, int head_dim, float scale);
 
-// GPU gated_delta_recurrent (single step): state persists on device. Returns false → CPU fallback.
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
-                         const float* beta, float* state, float* out,
-                         int n_heads, int dk, int dv);
-// Before CPU GDN on the same host state buffer: D2H device copy (if any) so host stays authoritative.
+                         const float* beta, float* state, float* out, int n_heads, int dk, int dv);
 void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv);
 
-// ---- NVRTC JIT (no nvcc): 运行时编译 CUDA kernel, driver API 启动 ----
-// 动态加载 nvrtc64_XXX.dll + nvcuda.dll; 任一缺失 → jit_available()=false, 优雅降级。
 bool jit_available();
-// 编译 cuda_src 中名为 kernel_name 的 __global__ kernel; 成功返回 true 并填充 out_fn(供 jit_launch)。
-// 失败返回 false, g_status 记录原因。函数句柄缓存到 disable() 自动卸载。
 bool jit_compile(const char* cuda_src, const char* kernel_name, void** out_fn);
-// 启动已编译 kernel; params 为内核参数地址数组(void*[])。grid/block 为线程组织。
 bool jit_launch(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
                 unsigned bz, unsigned shmem_bytes, void** params);
-
-// GPU 原生 INT4 dequant-GEMV(kernel 内按 group 反量化, 权重保持量化形态驻留 VRAM)。
-// 所有指针均为设备指针。is_awq=true: w=(q-7)*scale; false: w=q*scale+zero(zeros 不可为空)。
-// 返回 false 表示 JIT 不可用, 调用方回退 CPU。
 bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
                    const float* d_x, float* d_y, int M, int K, int ng, int gs, bool is_awq);
 

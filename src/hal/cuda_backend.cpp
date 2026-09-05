@@ -151,6 +151,9 @@ float* g_gdn_buf = nullptr;   // device scratch for q/k/v/g/beta/out uploads
 size_t g_gdn_buf_cap = 0;
 uint64_t g_gdn_ok = 0;
 uint64_t g_gdn_fail = 0;
+uint64_t g_act_ffn_ok = 0;
+uint64_t g_act_ffn_try = 0;
+uint64_t g_act_lm_ok = 0;
 std::string g_gdn_last_err;
 
 // Resident MLP decode scratch (device)
@@ -165,6 +168,11 @@ uint16_t* g_mlp_ln = nullptr;
 int g_mlp_cap_h = 0;
 int g_mlp_cap_i = 0;
 int g_mlp_cap_core = 0;
+
+// Cross-layer decode residual on device
+float* g_act_h = nullptr;
+int g_act_h_dim = 0;
+bool g_act_valid = false;
 
 // Prefill attention scratch (host↔device per call; only used when cuda enabled)
 void* g_attn_q = nullptr;
@@ -663,11 +671,50 @@ bool try_enable_resident_gpu(size_t workspace_bytes) {
 }
 
 void log_resident_stats() {
-  LOG_INFO("resident_gdn: ok=%llu fail=%llu last_err=%s",
+  LOG_INFO("resident_gdn: ok=%llu fail=%llu last_err=%s act=%d ffn=%llu/%llu lm=%llu",
            static_cast<unsigned long long>(g_gdn_ok),
            static_cast<unsigned long long>(g_gdn_fail),
-           g_gdn_last_err.empty() ? "-" : g_gdn_last_err.c_str());
+           g_gdn_last_err.empty() ? "-" : g_gdn_last_err.c_str(), g_act_valid ? 1 : 0,
+           static_cast<unsigned long long>(g_act_ffn_ok),
+           static_cast<unsigned long long>(g_act_ffn_try),
+           static_cast<unsigned long long>(g_act_lm_ok));
 }
+
+bool decode_act_begin(const float* h_host, int H) {
+  if (!g_enabled || !g_resident || !h_host || H <= 0) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (!g_act_h || g_act_h_dim < H) {
+    if (g_act_h) g_api.cudaFree(g_act_h);
+    g_act_h = nullptr;
+    g_act_h_dim = 0;
+    void* v = nullptr;
+    if (g_api.cudaMalloc(&v, sizeof(float) * static_cast<size_t>(H)) != kCudaSuccess) return false;
+    g_act_h = static_cast<float*>(v);
+    g_act_h_dim = H;
+  }
+  if (g_api.cudaMemcpy(g_act_h, h_host, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyH2D) !=
+      kCudaSuccess) {
+    g_act_valid = false;
+    return false;
+  }
+  g_act_valid = true;
+  return true;
+}
+
+bool decode_act_sync_to_host(float* h_host, int H) {
+  if (!g_enabled || !g_act_valid || !g_act_h || !h_host || H <= 0 || H > g_act_h_dim) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(h_host, g_act_h, sizeof(float) * static_cast<size_t>(H),
+                          kCudaMemcpyD2H) == kCudaSuccess;
+}
+
+bool decode_act_load_from_host(const float* h_host, int H) {
+  return decode_act_begin(h_host, H);
+}
+
+float* decode_act_ptr() { return (g_act_valid && g_act_h) ? g_act_h : nullptr; }
+bool decode_act_valid() { return g_act_valid && g_act_h != nullptr; }
+void decode_act_invalidate() { g_act_valid = false; }
 
 int device_count() {
   if (!probe_available()) return 0;
@@ -761,6 +808,7 @@ void disable() {
   g_gdn_buf = nullptr;
   g_gdn_buf_cap = 0;
   g_gdn_ok = g_gdn_fail = 0;
+  g_act_ffn_ok = g_act_ffn_try = g_act_lm_ok = 0;
   g_gdn_last_err.clear();
   auto free_f = [&](float*& p) {
     if (p) {
@@ -780,6 +828,12 @@ void disable() {
     g_mlp_ln = nullptr;
   }
   g_mlp_cap_h = g_mlp_cap_i = g_mlp_cap_core = 0;
+  if (g_act_h) {
+    g_api.cudaFree(g_act_h);
+    g_act_h = nullptr;
+  }
+  g_act_h_dim = 0;
+  g_act_valid = false;
   if (g_attn_q) g_api.cudaFree(g_attn_q);
   if (g_attn_k) g_api.cudaFree(g_attn_k);
   if (g_attn_v) g_api.cudaFree(g_attn_v);
@@ -935,9 +989,7 @@ __device__ __forceinline__ float f16_to_f32_dev(unsigned short h) {
   return __uint_as_float(bits);
 }
 
-// 多行/块的 GEMV kernel: 每个 block 处理 ROWS_PER_BLOCK 行, blockDim.x 并行 K 维。
-// 关键优化: scales/zeros 加载到 shared mem(避免重复 FP16→FP32), qrow 按 int4 向量化读
-// (16 字节 = 32 INT4 = 2 warp-iter), x 按 float4 向量化读(16 字节 = 4 floats)。
+// 多行/块的 GEMV: 每 block ROWS_PER_BLOCK 行; x 尽量进 shared(避免每行重复读 global)。
 #define ROWS_PER_BLOCK 8
 extern "C" __global__ void gemv_int4(
     const unsigned char* __restrict__ qweight,
@@ -945,28 +997,30 @@ extern "C" __global__ void gemv_int4(
     const unsigned short* __restrict__ zeros,
     const float* __restrict__ x,
     float* __restrict__ y,
-    int M, int K, int ng, int gs, int is_awq) {
+    int M, int K, int ng, int gs, int is_awq, int use_sx) {
   const int row0 = blockIdx.x * ROWS_PER_BLOCK;
   const int tid = threadIdx.x;
   const int rb = (K + 1) >> 1;
-  // 共享 scales/zeros(ng <= K/128 ≈ 24, 适合 shared)
-  extern __shared__ unsigned short smem_buf[];
-  unsigned short* s_scales = smem_buf;
-  unsigned short* s_zeros = is_awq ? nullptr : smem_buf + ROWS_PER_BLOCK * ng;
+  extern __shared__ unsigned char smem_raw[];
+  unsigned short* s_scales = (unsigned short*)smem_raw;
+  const int scale_words = ROWS_PER_BLOCK * ng * (is_awq ? 1 : 2);
+  unsigned short* s_zeros = is_awq ? nullptr : s_scales + ROWS_PER_BLOCK * ng;
+  float* sx = (float*)(s_scales + ((scale_words + 1) & ~1));  // 4-byte align
   for (int row_off = 0; row_off < ROWS_PER_BLOCK; ++row_off) {
     const int m = row0 + row_off;
     if (m >= M) break;
-    for (int g = tid; g < ng; g += blockDim.x) {
+    for (int g = tid; g < ng; g += blockDim.x)
       s_scales[row_off * ng + g] = scales[m * ng + g];
-    }
     if (!is_awq) {
-      for (int g = tid; g < ng; g += blockDim.x) {
+      for (int g = tid; g < ng; g += blockDim.x)
         s_zeros[row_off * ng + g] = zeros[m * ng + g];
-      }
     }
   }
+  if (use_sx) {
+    for (int i = tid; i < K; i += blockDim.x) sx[i] = x[i];
+  }
   __syncthreads();
-  // 主体: 每行一个 warp 处理; blockDim.x / 32 warps_per_block 行并行
+  const float* xr = use_sx ? sx : x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
   if (warp_id >= ROWS_PER_BLOCK) return;
@@ -974,18 +1028,15 @@ extern "C" __global__ void gemv_int4(
   if (m >= M) return;
   const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
   float acc = 0.f;
-  // 每 lane 处理 K/32 个连续 k; 用 uchar4 向量化读 packed weight(8 INT4/load)
   for (int k = lane * 8; k < K; k += 32 * 8) {
     const int g = k / gs;
     const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
     const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
-    // 向量化读 4 bytes = 8 INT4; 安全前提: rb%4==0(K=8*n)
     const int kp = k >> 1;
     if (kp + 3 < rb) {
       const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
-      // v.x[lo,hi], v.z[lo,hi] 等; 每字节 2 个 INT4
-      const float x0 = x[k + 0], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
-      const float x4 = x[k + 4], x5 = x[k + 5], x6 = x[k + 6], x7 = x[k + 7];
+      const float x0 = xr[k + 0], x1 = xr[k + 1], x2 = xr[k + 2], x3 = xr[k + 3];
+      const float x4 = xr[k + 4], x5 = xr[k + 5], x6 = xr[k + 6], x7 = xr[k + 7];
       const float w0 = ((float)((v.x & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
       const float w1 = ((float)((v.x >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
       const float w2 = ((float)((v.y & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
@@ -996,7 +1047,6 @@ extern "C" __global__ void gemv_int4(
       const float w7 = ((float)((v.w >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
       acc += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
     } else {
-      // 尾部逐字节处理
       for (int kk = k; kk < k + 8 && kk < K; ++kk) {
         const int gg = kk / gs;
         const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
@@ -1004,11 +1054,10 @@ extern "C" __global__ void gemv_int4(
         const unsigned char b = qrow[kk >> 1];
         const int qi = (kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
         const float w = ((float)qi - (is_awq ? 7 : 0)) * ss + (is_awq ? 0.f : zz);
-        acc += x[kk] * w;
+        acc += xr[kk] * w;
       }
     }
   }
-  // warp reduce
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
   if (lane == 0) y[m] = acc;
 }
@@ -1377,14 +1426,20 @@ bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
   void* fn = get_jit_kernel(kGemvInt4Src, "gemv_int4");
   if (!fn) return false;
   int is_awq_i = is_awq ? 1 : 0;
-  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_x, &d_y, &M, &K, &ng, &gs, &is_awq_i};
-  constexpr int ROWS_PER_BLOCK = 8;
-  constexpr int BLOCK_DIM = ROWS_PER_BLOCK * 32;  // 8 warps × 32 = 256
-  const int blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
-  const unsigned shmem = sizeof(unsigned short) * ROWS_PER_BLOCK * ng *
-                         (is_awq ? 1 : 2);
-  return jit_launch(fn, static_cast<unsigned>(blocks), 1, 1,
-                    static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
+  constexpr int RPB = 8;
+  constexpr int BLOCK_DIM = RPB * 32;
+  const int scale_words = RPB * ng * (is_awq ? 1 : 2);
+  const size_t scale_bytes = sizeof(unsigned short) * static_cast<size_t>((scale_words + 1) & ~1);
+  // Prefer caching x in shared when it fits (~48KiB default limit).
+  constexpr size_t kMaxSmem = 48ull * 1024ull;
+  int use_sx = (scale_bytes + sizeof(float) * static_cast<size_t>(K) <= kMaxSmem) ? 1 : 0;
+  const unsigned shmem =
+      static_cast<unsigned>(scale_bytes + (use_sx ? sizeof(float) * static_cast<size_t>(K) : 0));
+  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_x, &d_y, &M, &K, &ng, &gs, &is_awq_i,
+                    &use_sx};
+  const int blocks = (M + RPB - 1) / RPB;
+  return jit_launch(fn, static_cast<unsigned>(blocks), 1, 1, static_cast<unsigned>(BLOCK_DIM), 1, 1,
+                    shmem, params);
 }
 
 bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
@@ -1435,6 +1490,38 @@ bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, boo
   }
   if (it->second.M != M || it->second.K != K) return false;
   return gemm_dev(reinterpret_cast<const float*>(it->second.d_W), x, y, M, K);
+}
+
+bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int M, int K,
+                        bool is_f16) {
+  if (!g_enabled || !X || !W || !Y || M <= 0 || K <= 0 || n <= 0) return false;
+  if (n == 1) return try_gemm_w16(X, W, Y, M, K, is_f16);
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_cache.find(W);
+  if (it == g_cache.end()) {
+    const size_t nbytes = sizeof(float) * static_cast<size_t>(M) * K;
+    if (g_budget > 0 && g_used + nbytes > g_budget) return false;
+    if (M >= kMaxGpuInt4Rows) return false;
+    std::vector<float> host(static_cast<size_t>(M) * K);
+    for (size_t i = 0; i < host.size(); ++i)
+      host[i] = is_f16 ? f16_to_f32(W[i]) : bf16_to_f32(W[i]);
+    void* dW = nullptr;
+    if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return false;
+    if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(dW);
+      return false;
+    }
+    CacheEntry e;
+    e.d_W = dW;
+    e.M = M;
+    e.K = K;
+    e.bytes = nbytes;
+    g_cache[W] = e;
+    g_used += nbytes;
+    it = g_cache.find(W);
+  }
+  if (it->second.M != M || it->second.K != K) return false;
+  return gemm_dev_batch(reinterpret_cast<const float*>(it->second.d_W), X, n, Y, M, K);
 }
 
 bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16) {
@@ -2078,6 +2165,298 @@ bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::
   std::lock_guard<std::mutex> lock(g_mu);
   return g_api.cudaMemcpy(y, g_mlp_norm, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyD2H) ==
          kCudaSuccess;
+}
+
+bool try_rmsnorm_gemm_multi_from_act(const uint16_t* ln1, const qlwc::Int4View* const* Ws,
+                                     float* const* ys, int n, float eps, bool ln_is_f16) {
+  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !ln1 || !Ws || !ys || n < 2 || n > 4)
+    return false;
+  int H = g_act_h_dim;
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  void* fn_multi = get_jit_kernel(kGemvInt4Src, "gemv_multi4_int4");
+  if (!fn_rms || !fn_multi) return false;
+
+  const Int4Resident* res[4] = {};
+  int total_m = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, H)) return false;
+    for (int i = 0; i < n; ++i) {
+      if (!Ws[i] || Ws[i]->K != H) return false;
+      res[i] = ensure_int4_resident(*Ws[i]);
+      if (!res[i]) return false;
+      total_m += res[i]->M;
+    }
+    for (int i = 1; i < n; ++i) {
+      if (res[i]->K != res[0]->K || res[i]->ng != res[0]->ng || res[i]->gs != res[0]->gs ||
+          res[i]->is_awq != res[0]->is_awq)
+        return false;
+    }
+    if (!ensure_xy(total_m, H, 1)) return false;
+    if (g_api.cudaMemcpy(g_mlp_ln, ln1, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+  }
+
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  const unsigned blk = 256;
+  void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+
+  const uint8_t* q[4] = {};
+  const uint16_t* s[4] = {};
+  const uint16_t* z[4] = {};
+  float* ydev[4] = {};
+  int m[4] = {};
+  int offset = 0;
+  for (int i = 0; i < n; ++i) {
+    q[i] = static_cast<const uint8_t*>(res[i]->d_qweight);
+    s[i] = static_cast<const uint16_t*>(res[i]->d_scales);
+    z[i] = static_cast<const uint16_t*>(res[i]->d_zeros);
+    ydev[i] = reinterpret_cast<float*>(g_dy) + offset;
+    m[i] = res[i]->M;
+    offset += res[i]->M;
+  }
+  for (int i = n; i < 4; ++i) {
+    q[i] = q[0];
+    s[i] = s[0];
+    z[i] = z[0];
+    ydev[i] = ydev[0];
+    m[i] = 0;
+  }
+  int K = res[0]->K, ng = res[0]->ng, gs = res[0]->gs;
+  int is_awq_i = res[0]->is_awq ? 1 : 0;
+  const float* dx = g_mlp_norm;
+  void* params[] = {&q[0], &s[0], &z[0], &ydev[0], &m[0], &q[1], &s[1], &z[1], &ydev[1], &m[1],
+                    &q[2], &s[2], &z[2], &ydev[2], &m[2], &q[3], &s[3], &z[3], &ydev[3], &m[3],
+                    &n,    &K,    &ng,   &gs,      &is_awq_i, &dx};
+  constexpr int RPB = 8;
+  const int blocks = (total_m + RPB - 1) / RPB;
+  const unsigned shmem = sizeof(unsigned short) * RPB * ng * 2;
+  if (!jit_launch(fn_multi, static_cast<unsigned>(blocks), 1, 1, RPB * 32, 1, 1, shmem, params))
+    return false;
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  int off = 0;
+  for (int i = 0; i < n; ++i) {
+    if (g_api.cudaMemcpy(ys[i], reinterpret_cast<float*>(g_dy) + off,
+                         sizeof(float) * static_cast<size_t>(m[i]), kCudaMemcpyD2H) != kCudaSuccess)
+      return false;
+    off += m[i];
+  }
+  return true;
+}
+
+bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* wout_i4,
+                    const uint16_t* wout_pass, bool wout_is_f16, const uint16_t* ln2,
+                    const qlwc::Int4View& wgate, const qlwc::Int4View& wup,
+                    const qlwc::Int4View& wdown, int I, float eps, bool ln_is_f16) {
+  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !host_core || !ln2) return false;
+  int H = g_act_h_dim;
+  if (H <= 0 || I <= 0 || core_dim <= 0) return false;
+  if (wgate.K != H || wup.K != H || wdown.K != I || wgate.M != I || wup.M != I || wdown.M != H)
+    return false;
+  if (wout_i4) {
+    if (wout_i4->M != H || wout_i4->K != core_dim) return false;
+  } else if (!wout_pass) {
+    return false;
+  }
+  ++g_act_ffn_try;
+
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  void* fn_silu = get_jit_kernel(kActSrc, "silu_mul");
+  void* fn_add = get_jit_kernel(kActSrc, "vec_add");
+  if (!fn_rms || !fn_silu || !fn_add) return false;
+
+  const Int4Resident* ro = nullptr;
+  const Int4Resident* rg = nullptr;
+  const Int4Resident* ru = nullptr;
+  const Int4Resident* rd = nullptr;
+  const float* d_wout_fp32 = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, I)) return false;
+    if (!ensure_mlp_core(core_dim)) return false;
+    if (wout_i4) {
+      ro = ensure_int4_resident(*wout_i4);
+      if (!ro) return false;
+    } else {
+      // Upload BF16→FP32 into g_cache keyed by pass pointer (same as try_gemm_w16).
+      auto it = g_cache.find(wout_pass);
+      if (it == g_cache.end()) {
+        const size_t nbytes = sizeof(float) * static_cast<size_t>(H) * core_dim;
+        if (g_budget > 0 && g_used + nbytes > g_budget) return false;
+        std::vector<float> host(static_cast<size_t>(H) * core_dim);
+        for (size_t i = 0; i < host.size(); ++i)
+          host[i] = wout_is_f16 ? f16_to_f32(wout_pass[i]) : bf16_to_f32(wout_pass[i]);
+        void* dW = nullptr;
+        if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return false;
+        if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+          g_api.cudaFree(dW);
+          return false;
+        }
+        CacheEntry e;
+        e.d_W = dW;
+        e.M = H;
+        e.K = core_dim;
+        e.bytes = nbytes;
+        g_cache[wout_pass] = e;
+        g_used += nbytes;
+        it = g_cache.find(wout_pass);
+      }
+      if (it->second.M != H || it->second.K != core_dim) return false;
+      d_wout_fp32 = reinterpret_cast<const float*>(it->second.d_W);
+    }
+    rg = ensure_int4_resident(wgate);
+    ru = ensure_int4_resident(wup);
+    rd = ensure_int4_resident(wdown);
+    if (!rg || !ru || !rd) return false;
+    if (g_api.cudaMemcpy(g_mlp_core, host_core, sizeof(float) * static_cast<size_t>(core_dim),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(g_mlp_ln, ln2, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+  }
+
+  if (ro) {
+    if (!jit_gemv_int4(static_cast<const uint8_t*>(ro->d_qweight),
+                       static_cast<const uint16_t*>(ro->d_scales),
+                       static_cast<const uint16_t*>(ro->d_zeros), g_mlp_core, g_mlp_down, ro->M,
+                       ro->K, ro->ng, ro->gs, ro->is_awq))
+      return false;
+  } else {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_xy(H, core_dim, 1)) return false;
+    const float alpha = 1.f, beta = 0.f;
+    if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, H, 1, core_dim, &alpha, d_wout_fp32,
+                          core_dim, g_mlp_core, core_dim, &beta, g_mlp_down, H) != kCublasSuccess)
+      return false;
+  }
+
+  const unsigned blk = 256;
+  const unsigned add_grid = (static_cast<unsigned>(H) + blk - 1) / blk;
+  // g_mlp_norm = g_act_h + attn_out
+  void* prm_add0[] = {&g_act_h, &g_mlp_down, &g_mlp_norm, &H};
+  if (!jit_launch(fn_add, add_grid, 1, 1, blk, 1, 1, 0, prm_add0)) return false;
+
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_api.cudaMemcpy(g_mlp_x, g_mlp_norm, sizeof(float) * static_cast<size_t>(H),
+                         kCudaMemcpyD2D) != kCudaSuccess)
+      return false;
+  }
+
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  void* prm_rms[] = {&g_mlp_norm, &g_mlp_ln, &g_mlp_down, &H, &eps, &is_f16};
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(rg->d_qweight),
+                     static_cast<const uint16_t*>(rg->d_scales),
+                     static_cast<const uint16_t*>(rg->d_zeros), g_mlp_down, g_mlp_g, rg->M, rg->K,
+                     rg->ng, rg->gs, rg->is_awq))
+    return false;
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(ru->d_qweight),
+                     static_cast<const uint16_t*>(ru->d_scales),
+                     static_cast<const uint16_t*>(ru->d_zeros), g_mlp_down, g_mlp_u, ru->M, ru->K,
+                     ru->ng, ru->gs, ru->is_awq))
+    return false;
+
+  const unsigned silu_grid = (static_cast<unsigned>(I) + blk - 1) / blk;
+  void* prm_silu[] = {&g_mlp_g, &g_mlp_u, &g_mlp_mid, &I};
+  if (!jit_launch(fn_silu, silu_grid, 1, 1, blk, 1, 1, 0, prm_silu)) return false;
+
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(rd->d_qweight),
+                     static_cast<const uint16_t*>(rd->d_scales),
+                     static_cast<const uint16_t*>(rd->d_zeros), g_mlp_mid, g_mlp_down, rd->M, rd->K,
+                     rd->ng, rd->gs, rd->is_awq))
+    return false;
+
+  // Write back into persistent residual: g_act_h = g_mlp_x + down
+  void* prm_add1[] = {&g_mlp_x, &g_mlp_down, &g_act_h, &H};
+  if (!jit_launch(fn_add, add_grid, 1, 1, blk, 1, 1, 0, prm_add1)) return false;
+  g_act_valid = true;
+  ++g_act_ffn_ok;
+  return true;
+}
+
+bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pass, int V,
+                              float* logits_host, float eps, bool ln_is_f16, bool lm_is_f16) {
+  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !final_norm || !lm_pass ||
+      !logits_host || V <= 0)
+    return false;
+  int H = g_act_h_dim;
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  if (!fn_rms) return false;
+
+  const float* d_W = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, H)) return false;
+    auto it = g_cache.find(lm_pass);
+    if (it == g_cache.end()) return false;  // expect warm prefetch
+    if (it->second.M != V || it->second.K != H) return false;
+    d_W = reinterpret_cast<const float*>(it->second.d_W);
+    if (g_api.cudaMemcpy(g_mlp_ln, final_norm, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (!ensure_xy(V, H, 1)) return false;
+  }
+
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  const unsigned blk = 256;
+  void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    const float alpha = 1.f, beta = 0.f;
+    if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, V, 1, H, &alpha, d_W, H, g_mlp_norm, H,
+                          &beta, reinterpret_cast<float*>(g_dy), V) != kCublasSuccess)
+      return false;
+    (void)lm_is_f16;
+    if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(V),
+                         kCudaMemcpyD2H) != kCudaSuccess)
+      return false;
+    ++g_act_lm_ok;
+    return true;
+  }
+}
+
+bool try_lm_head_int4_from_act(const uint16_t* final_norm, const qlwc::Int4View& lm,
+                               float* logits_host, float eps, bool ln_is_f16) {
+  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !final_norm || !logits_host)
+    return false;
+  int H = g_act_h_dim;
+  if (lm.K != H) return false;
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  if (!fn_rms) return false;
+  const Int4Resident* res = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, H)) return false;
+    res = ensure_int4_resident(lm);
+    if (!res) return false;
+    if (g_api.cudaMemcpy(g_mlp_ln, final_norm, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (!ensure_xy(lm.M, H, 1)) return false;
+  }
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  const unsigned blk = 256;
+  void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+  if (!jit_gemv_int4(static_cast<const uint8_t*>(res->d_qweight),
+                     static_cast<const uint16_t*>(res->d_scales),
+                     static_cast<const uint16_t*>(res->d_zeros), g_mlp_norm,
+                     reinterpret_cast<float*>(g_dy), res->M, res->K, res->ng, res->gs, res->is_awq))
+    return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(lm.M),
+                       kCudaMemcpyD2H) != kCudaSuccess)
+    return false;
+  ++g_act_lm_ok;
+  return true;
 }
 
 bool prefetch_int4_weight(const qlwc::Int4View& W) {
