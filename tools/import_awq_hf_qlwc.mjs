@@ -201,6 +201,25 @@ function quantAwqSym(W, M, K, groupSize) {
   return { q: packInt4(q, M, K), scales: f32ArrToF16Bits(scales), zeros: null };
 }
 
+// Node Buffer 长度走有符号 32-bit；≥2GiB 会变成负数并抛 length out of range。
+const MAX_BUF = 0x7ffff000;
+const COPY_CHUNK = 1 << 20;
+
+function blobFromBuffer(buf) {
+  return { kind: "buffer", buf, length: buf.length };
+}
+function blobFromFile(filePath, length) {
+  return { kind: "file", path: filePath, length };
+}
+function blobFromSlice(entry, length) {
+  return { kind: "slice", entry, length: length ?? entry.end - entry.start };
+}
+function blobLen(b) {
+  if (!b) return 0;
+  if (Buffer.isBuffer(b) || ArrayBuffer.isView(b)) return b.byteLength ?? b.length;
+  return b.length | 0;
+}
+
 function writeAt(fd, buf, filePos) {
   const CHUNK = 1 << 30;
   let off = 0;
@@ -213,6 +232,64 @@ function writeAt(fd, buf, filePos) {
   }
 }
 
+function writeBlob(fd, blob, filePos) {
+  if (!blob) return;
+  if (Buffer.isBuffer(blob) || ArrayBuffer.isView(blob)) {
+    const buf = Buffer.isBuffer(blob)
+      ? blob
+      : Buffer.from(blob.buffer, blob.byteOffset, blob.byteLength);
+    writeAt(fd, buf, filePos);
+    return;
+  }
+  if (blob.kind === "buffer") {
+    writeAt(fd, blob.buf, filePos);
+    return;
+  }
+  const tmp = Buffer.alloc(COPY_CHUNK);
+  if (blob.kind === "file") {
+    const src = fs.openSync(blob.path, "r");
+    try {
+      let left = blob.length;
+      let pos = filePos;
+      let soff = 0;
+      while (left > 0) {
+        const n = Math.min(COPY_CHUNK, left);
+        const r = fs.readSync(src, tmp, 0, n, soff);
+        if (r <= 0) throw new Error(`short read temp blob ${blob.path}`);
+        writeAt(fd, tmp.subarray(0, r), pos);
+        soff += r;
+        pos += r;
+        left -= r;
+      }
+    } finally {
+      fs.closeSync(src);
+    }
+    return;
+  }
+  if (blob.kind === "slice") {
+    const e = blob.entry;
+    const src = fs.openSync(e.file, "r");
+    try {
+      let left = blob.length;
+      let pos = filePos;
+      let soff = e.start;
+      while (left > 0) {
+        const n = Math.min(COPY_CHUNK, left);
+        const r = fs.readSync(src, tmp, 0, n, soff);
+        if (r <= 0) throw new Error(`short read slice ${e.file}`);
+        writeAt(fd, tmp.subarray(0, r), pos);
+        soff += r;
+        pos += r;
+        left -= r;
+      }
+    } finally {
+      fs.closeSync(src);
+    }
+    return;
+  }
+  throw new Error(`unknown blob kind ${blob.kind}`);
+}
+
 function writeQlwc(filePath, scheme, groupSize, items) {
   const buildCat = (withOff, offsets) => {
     const parts = [u32(scheme), u32(groupSize), u32(ALIGN), u64(items.length)];
@@ -222,11 +299,19 @@ function writeQlwc(filePath, scheme, groupSize, items) {
       for (const d of it.shape) parts.push(u64(d));
       if (it.kind === 0) {
         parts.push(u32(it.pass_dtype));
-        parts.push(u64(withOff ? offsets[i].data : 0), u64(it.data.length));
+        parts.push(u64(withOff ? offsets[i].data : 0), u64(blobLen(it.data)));
       } else {
         const o = withOff ? offsets[i] : { q: 0, s: 0, z: 0 };
-        const zlen = it.zeros ? it.zeros.length * 2 : 0;
-        parts.push(u32(groupSize), u64(o.q), u64(it.q.length), u64(o.s), u64(it.scales.length * 2), u64(o.z), u64(zlen));
+        const zlen = it.zeros ? blobLen(it.zeros) : 0;
+        parts.push(
+          u32(groupSize),
+          u64(o.q),
+          u64(blobLen(it.q)),
+          u64(o.s),
+          u64(blobLen(it.scales)),
+          u64(o.z),
+          u64(zlen),
+        );
       }
     }
     return Buffer.concat(parts);
@@ -238,14 +323,14 @@ function writeQlwc(filePath, scheme, groupSize, items) {
   for (const it of items) {
     if (it.kind === 0) {
       offsets.push({ data: off });
-      off = alignUp(off + it.data.length, ALIGN);
+      off = alignUp(off + blobLen(it.data), ALIGN);
     } else {
       const qOff = off;
-      off = alignUp(off + it.q.length, 64);
+      off = alignUp(off + blobLen(it.q), 64);
       const sOff = off;
-      off = alignUp(off + it.scales.length * 2, 64);
+      off = alignUp(off + blobLen(it.scales), 64);
       const zOff = off;
-      const zlen = it.zeros ? it.zeros.length * 2 : 0;
+      const zlen = it.zeros ? blobLen(it.zeros) : 0;
       off = alignUp(off + zlen, ALIGN);
       offsets.push({ q: qOff, s: sOff, z: zOff });
     }
@@ -253,11 +338,16 @@ function writeQlwc(filePath, scheme, groupSize, items) {
 
   const catalog = buildCat(true, offsets);
   const crc = fnv1a64(catalog);
-  const preface = Buffer.concat([QLW_MAGIC, u32(1), u64(catalog.length), (() => {
-    const b = Buffer.alloc(8);
-    b.writeBigUInt64LE(crc);
-    return b;
-  })()]);
+  const preface = Buffer.concat([
+    QLW_MAGIC,
+    u32(1),
+    u64(catalog.length),
+    (() => {
+      const b = Buffer.alloc(8);
+      b.writeBigUInt64LE(crc);
+      return b;
+    })(),
+  ]);
   const fileSize = Math.max(off, alignUp(preface.length + catalog.length, ALIGN));
 
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -268,13 +358,11 @@ function writeQlwc(filePath, scheme, groupSize, items) {
     fs.ftruncateSync(fd, fileSize);
     for (let i = 0; i < items.length; ++i) {
       const it = items[i];
-      if (it.kind === 0) writeAt(fd, it.data, offsets[i].data);
+      if (it.kind === 0) writeBlob(fd, it.data, offsets[i].data);
       else {
-        writeAt(fd, it.q, offsets[i].q);
-        writeAt(fd, Buffer.from(it.scales.buffer, it.scales.byteOffset, it.scales.byteLength), offsets[i].s);
-        if (it.zeros) {
-          writeAt(fd, Buffer.from(it.zeros.buffer, it.zeros.byteOffset, it.zeros.byteLength), offsets[i].z);
-        }
+        writeBlob(fd, it.q, offsets[i].q);
+        writeBlob(fd, it.scales, offsets[i].s);
+        if (it.zeros) writeBlob(fd, it.zeros, offsets[i].z);
       }
       if ((i + 1) % 50 === 0) process.stderr.write(`\r[import-awq] writing ${i + 1}/${items.length}...`);
     }
@@ -326,15 +414,205 @@ async function buildIndex(hfDir) {
 }
 
 function readTensor(entry) {
-  const n = entry.end - entry.start;
+  const n = Number(entry.end) - Number(entry.start);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`bad tensor span start=${entry.start} end=${entry.end}`);
+  }
+  if (n > MAX_BUF) {
+    throw new Error(
+      `tensor blob too large for single Buffer (${n} bytes ≈ ${(n / 2 ** 30).toFixed(2)} GiB); use slice/stream path`,
+    );
+  }
   const buf = Buffer.alloc(n);
   const fd = fs.openSync(entry.file, "r");
   try {
-    fs.readSync(fd, buf, 0, n, entry.start);
+    let off = 0;
+    while (off < n) {
+      const w = fs.readSync(fd, buf, off, n - off, entry.start + off);
+      if (w <= 0) throw new Error(`short read at ${entry.file}`);
+      off += w;
+    }
   } finally {
     fs.closeSync(fd);
   }
   return buf;
+}
+
+function gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, zpLayout) {
+  // CT/GPTQ: w=(q-zp)*scale  →  QLWC GPTQ: w=q*scale+zero  ⇒  zero = -zp*scale
+  const out = new Float32Array(M * ng);
+  for (let m = 0; m < M; ++m) {
+    for (let g = 0; g < ng; ++g) {
+      const sc = pickScale(scaleF, M, ng, m, g, scaleLayout);
+      const zp = pickScale(zpF, M, ng, m, g, zpLayout);
+      out[m * ng + g] = -zp * sc;
+    }
+  }
+  return f32ArrToF16Bits(out);
+}
+
+function scalesToF16Mg(scaleF, M, ng, layout) {
+  const out = new Float32Array(M * ng);
+  for (let m = 0; m < M; ++m) {
+    for (let g = 0; g < ng; ++g) out[m * ng + g] = pickScale(scaleF, M, ng, m, g, layout);
+  }
+  return f32ArrToF16Bits(out);
+}
+
+function allocQPayload(qBytes, tmpDir, tag) {
+  if (qBytes <= MAX_BUF) return { mode: "buffer", q: Buffer.alloc(qBytes), length: qBytes };
+  const filePath = path.join(tmpDir, `${tag}.q.bin`);
+  const fd = fs.openSync(filePath, "w");
+  fs.ftruncateSync(fd, qBytes);
+  return { mode: "file", fd, path: filePath, length: qBytes };
+}
+
+function finishQPayload(payload) {
+  if (payload.mode === "buffer") return blobFromBuffer(payload.q);
+  fs.closeSync(payload.fd);
+  return blobFromFile(payload.path, payload.length);
+}
+
+/** compressed-tensors pack-quantized → QLWC：按行流式重打包，不解 FP32、不二次量化 */
+function importCtToQlwc(packedE, scalesE, zerosE, M, K, gs, symmetric, tmpDir, tag) {
+  if (K % gs !== 0) throw new Error(`K=${K} % group_size=${gs} != 0`);
+  if (K % 2 !== 0) throw new Error(`QLWC pack needs even K, got ${K}`);
+  const ng = K / gs;
+  const colsPacked = Math.ceil(K / 8);
+  const rowBytes = colsPacked * 4;
+  const expected = M * rowBytes;
+  const span = packedE.end - packedE.start;
+  if (span < expected) {
+    throw new Error(`packed size ${span} < expected ${expected} for M=${M} K=${K}`);
+  }
+
+  const scales = readTensor(scalesE);
+  const scaleCount =
+    scalesE.dtype === "F16" || scalesE.dtype === "BF16" ? scales.length / 2 : scales.length / 4;
+  const scaleF = tensorToF32(scales, scalesE.dtype, scaleCount);
+  const scaleLayout = inferLayout(scaleF.length, M, ng);
+  const qlwcScales = scalesToF16Mg(scaleF, M, ng, scaleLayout);
+
+  let qlwcZeros = null;
+  if (!symmetric) {
+    if (!zerosE) throw new Error("asymmetric CT weights need weight_zero_point");
+    const zeros = readTensor(zerosE);
+    const zpCount =
+      zerosE.dtype === "I8" || zerosE.dtype === "U8" ? zeros.length : zeros.length / 4;
+    const zpF = tensorToF32(zeros, zerosE.dtype, zpCount);
+    const zpLayout = inferLayout(zpF.length, M, ng);
+    qlwcZeros = gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, zpLayout);
+  }
+
+  const qBytes = M * (K / 2);
+  const payload = allocQPayload(qBytes, tmpDir, tag);
+  const rowOut = Buffer.alloc(K / 2);
+  const rowBuf = Buffer.alloc(rowBytes);
+  const fd = fs.openSync(packedE.file, "r");
+  try {
+    for (let m = 0; m < M; ++m) {
+      let off = 0;
+      const pos0 = packedE.start + m * rowBytes;
+      while (off < rowBytes) {
+        const w = fs.readSync(fd, rowBuf, off, rowBytes - off, pos0 + off);
+        if (w <= 0) throw new Error(`short packed row read m=${m}`);
+        off += w;
+      }
+      const view = new Int32Array(rowBuf.buffer, rowBuf.byteOffset, colsPacked);
+      for (let k = 0; k < K; k += 2) {
+        const pc0 = (k / 8) | 0;
+        const pc1 = ((k + 1) / 8) | 0;
+        const q0 = (view[pc0] >>> ((k % 8) * 4)) & 0xf;
+        const q1 = (view[pc1] >>> (((k + 1) % 8) * 4)) & 0xf;
+        rowOut[k / 2] = (q0 & 0xf) | ((q1 & 0xf) << 4);
+      }
+      if (payload.mode === "buffer") {
+        rowOut.copy(payload.q, m * (K / 2));
+      } else {
+        writeAt(payload.fd, rowOut, m * (K / 2));
+      }
+    }
+    return { q: finishQPayload(payload), scales: qlwcScales, zeros: qlwcZeros };
+  } catch (err) {
+    if (payload.mode === "file") {
+      try {
+        fs.closeSync(payload.fd);
+      } catch {
+        /* ignore */
+      }
+    }
+    throw err;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** AutoAWQ qweight [K, ceil(M/8)] int32 → QLWC row-nibble */
+function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir, tag) {
+  if (K % gs !== 0) throw new Error(`K=${K} % group_size=${gs} != 0`);
+  if (K % 2 !== 0) throw new Error(`QLWC pack needs even K, got ${K}`);
+  const ng = K / gs;
+  const colsPacked = Math.ceil(M / 8);
+  const colBytes = colsPacked * 4;
+
+  const scales = readTensor(scalesE);
+  const scaleCount =
+    scalesE.dtype === "F16" || scalesE.dtype === "BF16" ? scales.length / 2 : scales.length / 4;
+  const scaleF = tensorToF32(scales, scalesE.dtype, scaleCount);
+  const scaleLayout = inferLayout(scaleF.length, M, ng);
+  const qlwcScales = scalesToF16Mg(scaleF, M, ng, scaleLayout);
+
+  let qlwcZeros = null;
+  if (!symmetric) {
+    if (!qzerosE) throw new Error("asymmetric AutoAWQ needs qzeros");
+    const qzeros = readTensor(qzerosE);
+    const zeroF = tensorToF32(qzeros, "I32", qzeros.length / 4);
+    const zpF = new Float32Array(M * ng);
+    for (let m = 0; m < M; ++m) {
+      for (let g = 0; g < ng; ++g) {
+        const zpIdx = g * Math.ceil(M / 8) + Math.floor(m / 8);
+        const word = zeroF[zpIdx] | 0;
+        zpF[m * ng + g] = (word >>> ((m % 8) * 4)) & 0xf;
+      }
+    }
+    qlwcZeros = gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, "m_g");
+  }
+
+  const qBytes = M * (K / 2);
+  if (qBytes > MAX_BUF) {
+    throw new Error(
+      `AutoAWQ packed weight too large (${(qBytes / 2 ** 30).toFixed(2)} GiB); ` +
+        `use compressed-tensors HF or a smaller model for streaming import`,
+    );
+  }
+  const outQ = Buffer.alloc(qBytes);
+  const colBuf = Buffer.alloc(colBytes);
+  const fd = fs.openSync(qweightE.file, "r");
+  try {
+    for (let k = 0; k < K; k += 2) {
+      for (let kk = 0; kk < 2; ++kk) {
+        const kkAbs = k + kk;
+        let off = 0;
+        const pos0 = qweightE.start + kkAbs * colBytes;
+        while (off < colBytes) {
+          const w = fs.readSync(fd, colBuf, off, colBytes - off, pos0 + off);
+          if (w <= 0) throw new Error(`short awq col read k=${kkAbs}`);
+          off += w;
+        }
+        const view = new Int32Array(colBuf.buffer, colBuf.byteOffset, colsPacked);
+        for (let m = 0; m < M; ++m) {
+          const pm = (m / 8) | 0;
+          const q = (view[pm] >>> ((m % 8) * 4)) & 0xf;
+          const byteIndex = m * (K / 2) + (k / 2);
+          if (kk === 0) outQ[byteIndex] = (outQ[byteIndex] & 0xf0) | (q & 0xf);
+          else outQ[byteIndex] = (outQ[byteIndex] & 0x0f) | ((q & 0xf) << 4);
+        }
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return { q: blobFromBuffer(outQ), scales: qlwcScales, zeros: qlwcZeros };
 }
 
 function loadConfig(hfDir) {
@@ -412,6 +690,11 @@ function tensorToF32(buf, dtype, count) {
   if (dtype === "I8") {
     const out = new Float32Array(count);
     for (let i = 0; i < count; ++i) out[i] = buf.readInt8(i);
+    return out;
+  }
+  if (dtype === "U8") {
+    const out = new Float32Array(count);
+    for (let i = 0; i < count; ++i) out[i] = buf.readUInt8(i);
     return out;
   }
   throw new Error(`unsupported safetensors dtype ${dtype}`);
@@ -552,83 +835,104 @@ async function main() {
   const index = await buildIndex(opt.src);
   const format = detectFormat(index, cfgOpts, opt.format);
   const scheme = cfgOpts.symmetric ? SCHEME_AWQ : SCHEME_GPTQ;
-  const quantFn = cfgOpts.symmetric ? quantAwqSym : quantGptqAsym;
 
   console.log(`[import-awq] format=${format} scheme=${cfgOpts.symmetric ? "awq" : "gptq"} group=${gs}`);
   console.log(`[import-awq] indexing ${Object.keys(index).length} tensors`);
 
+  const tmpDir = path.join(path.dirname(opt.out), `.import-awq-tmp-${process.pid}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
   const items = [];
   const seen = new Set();
   let nQ = 0;
   let nPass = 0;
 
-  const qBases = groupQuantBases(index, format);
-  for (const [base, g] of [...qBases.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const qlwcName = mapQlwcName(base);
-    if (seen.has(qlwcName)) continue;
-    const packedE = index[g.packed];
-    let M, K;
-    if (g.weight_shape && index[g.weight_shape]) {
-      const shapeBuf = readTensor(index[g.weight_shape]);
-      M = shapeBuf.readInt32LE(0);
-      K = shapeBuf.readInt32LE(4);
-    } else if (format === "compressed-tensors") {
-      M = packedE.shape[0];
-      K = packedE.shape[1] * 8;
-    } else {
-      K = packedE.shape[0];
-      M = packedE.shape[1] * 8;
-    }
-    if (!shouldQuantize(qlwcName, [M, K], opt.minCols, gs)) {
-      continue;
-    }
-    const packed = readTensor(packedE);
-    const scales = g.weight_scale || g.scales ? readTensor(index[g.weight_scale || g.scales]) : null;
-    const zeros = g.weight_zero_point || g.qzeros ? readTensor(index[g.weight_zero_point || g.qzeros]) : null;
-    if (!scales) throw new Error(`missing scales for ${base}`);
-    const scaleE = index[g.weight_scale || g.scales];
-    const zpE = g.weight_zero_point || g.qzeros ? index[g.weight_zero_point || g.qzeros] : null;
-    let W;
-    if (format === "compressed-tensors") {
-      W = dequantCt(packed, scales, zeros, M, K, gs, scaleE.dtype, zpE?.dtype ?? "I8", cfgOpts.symmetric);
-    } else {
-      W = dequantAwq(packed, scales, zeros, M, K, gs, scaleE.dtype, cfgOpts.symmetric);
-    }
-    const qres = quantFn(W, M, K, gs);
-    items.push({ name: qlwcName, kind: 1, shape: [M, K], q: qres.q, scales: qres.scales, zeros: qres.zeros });
-    seen.add(qlwcName);
-    nQ += 1;
-    if (nQ % 10 === 0) process.stderr.write(`\r[import-awq] packed ${nQ} int4 tensors...`);
-  }
-  if (nQ >= 10) process.stderr.write("\n");
+  try {
+    const qBases = groupQuantBases(index, format);
+    for (const [base, g] of [...qBases.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const qlwcName = mapQlwcName(base);
+      if (seen.has(qlwcName)) continue;
+      const packedE = index[g.packed];
+      let M, K;
+      if (g.weight_shape && index[g.weight_shape]) {
+        const shapeBuf = readTensor(index[g.weight_shape]);
+        M = shapeBuf.readInt32LE(0);
+        K = shapeBuf.readInt32LE(4);
+      } else if (format === "compressed-tensors") {
+        M = packedE.shape[0];
+        K = packedE.shape[1] * 8;
+      } else {
+        K = packedE.shape[0];
+        M = packedE.shape[1] * 8;
+      }
+      if (!shouldQuantize(qlwcName, [M, K], opt.minCols, gs)) continue;
 
-  for (const key of Object.keys(index).sort()) {
-    if (key.endsWith(".weight_packed") || key.endsWith(".qweight")) continue;
-    if (/\.(weight_scale|weight_zero_point|weight_shape|scales|qzeros|qscale|wzeros)$/.test(key)) continue;
-    if (!key.endsWith(".weight")) continue;
-    const qlwcName = mapQlwcName(key);
-    if (seen.has(qlwcName)) continue;
-    const e = index[key];
-    const stDt = e.dtype;
-    if (stDt !== "BF16" && stDt !== "F16" && stDt !== "F32") continue;
-    const shape = e.shape;
-    const raw = readTensor(e);
-    items.push({
-      name: qlwcName,
-      kind: 0,
-      shape,
-      pass_dtype: passDtypeCode(stDt),
-      data: stDt === "BF16" || stDt === "F16" ? raw : convertF32toBf16(raw, shape.reduce((a, b) => a * b, 1)),
-    });
-    seen.add(qlwcName);
-    nPass += 1;
-  }
+      const scaleKey = g.weight_scale || g.scales;
+      if (!scaleKey || !index[scaleKey]) throw new Error(`missing scales for ${base}`);
+      const scaleE = index[scaleKey];
+      const zpKey = g.weight_zero_point || g.qzeros;
+      const zpE = zpKey && index[zpKey] ? index[zpKey] : null;
+      const tag = `t${nQ}`;
+      const qres =
+        format === "compressed-tensors"
+          ? importCtToQlwc(packedE, scaleE, zpE, M, K, gs, cfgOpts.symmetric, tmpDir, tag)
+          : importAwqToQlwc(packedE, scaleE, zpE, M, K, gs, cfgOpts.symmetric, tmpDir, tag);
+      items.push({
+        name: qlwcName,
+        kind: 1,
+        shape: [M, K],
+        q: qres.q,
+        scales: qres.scales,
+        zeros: qres.zeros,
+      });
+      seen.add(qlwcName);
+      nQ += 1;
+      if (nQ % 10 === 0) process.stderr.write(`\r[import-awq] packed ${nQ} int4 tensors...`);
+    }
+    if (nQ >= 10) process.stderr.write("\n");
 
-  if (items.length === 0) throw new Error("no tensors imported — check HF dir and format");
-  writeQlwc(opt.out, scheme, gs, items);
-  const sizeG = fs.statSync(opt.out).size / 1024 ** 3;
-  console.log(`[import-awq] int4=${nQ} passthrough=${nPass}`);
-  console.log(`[import-awq] wrote ${opt.out} (${sizeG.toFixed(2)} GiB)`);
+    for (const key of Object.keys(index).sort()) {
+      if (key.endsWith(".weight_packed") || key.endsWith(".qweight")) continue;
+      if (/\.(weight_scale|weight_zero_point|weight_shape|scales|qzeros|qscale|wzeros)$/.test(key)) continue;
+      if (!key.endsWith(".weight")) continue;
+      const qlwcName = mapQlwcName(key);
+      if (seen.has(qlwcName)) continue;
+      const e = index[key];
+      const stDt = e.dtype;
+      if (stDt !== "BF16" && stDt !== "F16" && stDt !== "F32") continue;
+      const shape = e.shape;
+      const nbytes = e.end - e.start;
+      let data;
+      if (stDt === "BF16" || stDt === "F16") {
+        // 大 embedding / lm_head：直接按 safetensors 切片拷贝，禁止整表 Buffer.alloc
+        data = blobFromSlice(e, nbytes);
+      } else if (nbytes <= MAX_BUF) {
+        data = blobFromBuffer(convertF32toBf16(readTensor(e), shape.reduce((a, b) => a * b, 1)));
+      } else {
+        throw new Error(`F32 passthrough too large (${(nbytes / 2 ** 30).toFixed(2)} GiB): ${key}`);
+      }
+      items.push({
+        name: qlwcName,
+        kind: 0,
+        shape,
+        pass_dtype: passDtypeCode(stDt === "F32" ? "BF16" : stDt),
+        data,
+      });
+      seen.add(qlwcName);
+      nPass += 1;
+    }
+
+    if (items.length === 0) throw new Error("no tensors imported — check HF dir and format");
+    writeQlwc(opt.out, scheme, gs, items);
+    const sizeG = fs.statSync(opt.out).size / 1024 ** 3;
+    console.log(`[import-awq] int4=${nQ} passthrough=${nPass}`);
+    console.log(`[import-awq] wrote ${opt.out} (${sizeG.toFixed(2)} GiB)`);
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 function convertF32toBf16(buf, n) {
