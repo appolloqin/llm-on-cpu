@@ -289,7 +289,7 @@ function main() {
   // 无 verify 时仅按体积判断，避免误杀
   if (!verifyBin && weightLooksOk(opt.outLwc)) lwcOk = true;
 
-  const qlwcOk = opt.int4 ? qlwcLooksOk(opt.outQlwc) : weightLooksOk(opt.outQlwc);
+  let qlwcOk = opt.int4 ? qlwcLooksOk(opt.outQlwc) : weightLooksOk(opt.outQlwc);
   const hfPreQuant = hasConfig ? detectHfPreQuantized(opt.outHf) : null;
   const hfImport = opt.int4 && hfQuantImportable(hfPreQuant);
   const idPreQuant = modelIdLooksPreQuantized(opt.model);

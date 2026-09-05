@@ -650,6 +650,54 @@ function detectFormat(index, cfgOpts, forced) {
   throw new Error("cannot detect HF quant format (need .weight_packed or .qweight tensors, or config.quantization_config)");
 }
 
+function readWeightShape(entry) {
+  const buf = readTensor(entry);
+  const dt = String(entry.dtype || "").toUpperCase();
+  let M;
+  let K;
+  if (dt === "I64" || dt === "U64") {
+    if (buf.length < 16) throw new Error(`weight_shape I64 too short (${buf.length})`);
+    M = Number(buf.readBigInt64LE(0));
+    K = Number(buf.readBigInt64LE(8));
+  } else if (dt === "I32" || dt === "U32") {
+    if (buf.length < 8) throw new Error(`weight_shape I32 too short (${buf.length})`);
+    M = buf.readInt32LE(0);
+    K = buf.readInt32LE(4);
+  } else if (buf.length >= 16) {
+    // 缺 dtype 时：16B 优先按 I64（compressed-tensors 常见）
+    M = Number(buf.readBigInt64LE(0));
+    K = Number(buf.readBigInt64LE(8));
+  } else if (buf.length >= 8) {
+    M = buf.readInt32LE(0);
+    K = buf.readInt32LE(4);
+  } else {
+    throw new Error(`weight_shape bad size ${buf.length} dtype=${entry.dtype}`);
+  }
+  if (!Number.isFinite(M) || !Number.isFinite(K) || M <= 0 || K <= 0) {
+    throw new Error(`weight_shape invalid M=${M} K=${K} dtype=${entry.dtype}`);
+  }
+  return [M, K];
+}
+
+function inferCtMk(packedE, shapeE) {
+  if (shapeE) {
+    const [M, K] = readWeightShape(shapeE);
+    const colsPacked = Math.ceil(K / 8);
+    const expect = M * colsPacked * 4;
+    const span = packedE.end - packedE.start;
+    if (span < expect) {
+      throw new Error(
+        `weight_shape [M=${M},K=${K}] expects packed ${expect}B but tensor has ${span}B`,
+      );
+    }
+    return [M, K];
+  }
+  // packed layout [M, ceil(K/8)] int32
+  const M = packedE.shape[0];
+  const K = packedE.shape[1] * 8;
+  return [M, K];
+}
+
 function mapQlwcName(hfKey) {
   let n = hfKey;
   if (n.endsWith(".weight")) n = n.slice(0, -".weight".length);
@@ -850,6 +898,7 @@ async function main() {
   const seen = new Set();
   let nQ = 0;
   let nPass = 0;
+  let nSkip = 0;
 
   try {
     const qBases = groupQuantBases(index, format);
@@ -857,19 +906,29 @@ async function main() {
       const qlwcName = mapQlwcName(base);
       if (seen.has(qlwcName)) continue;
       const packedE = index[g.packed];
-      let M, K;
-      if (g.weight_shape && index[g.weight_shape]) {
-        const shapeBuf = readTensor(index[g.weight_shape]);
-        M = shapeBuf.readInt32LE(0);
-        K = shapeBuf.readInt32LE(4);
-      } else if (format === "compressed-tensors") {
-        M = packedE.shape[0];
-        K = packedE.shape[1] * 8;
-      } else {
-        K = packedE.shape[0];
-        M = packedE.shape[1] * 8;
+      let M;
+      let K;
+      try {
+        if (format === "compressed-tensors") {
+          [M, K] = inferCtMk(packedE, g.weight_shape ? index[g.weight_shape] : null);
+        } else if (g.weight_shape && index[g.weight_shape]) {
+          [M, K] = readWeightShape(index[g.weight_shape]);
+        } else {
+          K = packedE.shape[0];
+          M = packedE.shape[1] * 8;
+        }
+      } catch (e) {
+        throw new Error(`${base}: ${e.message || e}`);
       }
-      if (!shouldQuantize(qlwcName, [M, K], opt.minCols, gs)) continue;
+      if (!shouldQuantize(qlwcName, [M, K], opt.minCols, gs)) {
+        if (nSkip < 5) {
+          console.warn(
+            `[import-awq] skip ${qlwcName} shape=[${M},${K}] (minCols=${opt.minCols} gs=${gs})`,
+          );
+        }
+        nSkip += 1;
+        continue;
+      }
 
       const scaleKey = g.weight_scale || g.scales;
       if (!scaleKey || !index[scaleKey]) throw new Error(`missing scales for ${base}`);
@@ -927,6 +986,15 @@ async function main() {
     }
 
     if (items.length === 0) throw new Error("no tensors imported — check HF dir and format");
+    if (format === "compressed-tensors" || format === "autoawq") {
+      const nPacked = [...qBases.keys()].length;
+      if (nQ === 0 && nPacked > 0) {
+        throw new Error(
+          `imported int4=0 but found ${nPacked} packed weight bases — ` +
+            `likely bad weight_shape parse or group_size=${gs} mismatch; refusing passthrough-only QLWC`,
+        );
+      }
+    }
     writeQlwc(opt.out, scheme, gs, items);
     const sizeG = fs.statSync(opt.out).size / 1024 ** 3;
     console.log(`[import-awq] int4=${nQ} passthrough=${nPass}`);
