@@ -61,7 +61,7 @@ TINY_TEST(Int4, GemmAwqMatchesScalarRef) {
     const float sc = llmoc::hal::f16_to_f32(scales[m]);
     for (int k = 0; k < K; ++k) {
       const float w =
-          static_cast<float>(static_cast<int>(q[static_cast<size_t>(m) * K + k]) - 7) * sc;
+          static_cast<float>(static_cast<int>(q[static_cast<size_t>(m) * K + k]) - 8) * sc;
       acc += x[k] * w;
     }
     y_ref[m] = acc;
