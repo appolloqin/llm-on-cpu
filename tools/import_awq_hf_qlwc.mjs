@@ -605,7 +605,9 @@ function importCtToQlwc(packedE, scalesE, zerosE, M, K, gsHint, symmetric, tmpDi
   }
 }
 
-/** AutoAWQ qweight [K, ceil(M/8)] int32 → QLWC row-nibble */
+/** AutoAWQ qweight [K, ceil(M/8)] int32 → QLWC row-nibble
+ *  scales: [ng, M] (g_m); qzeros: [ng, ceil(M/8)] with AWQ pack order.
+ */
 function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir, tag) {
   if (K % gs !== 0) throw new Error(`K=${K} % group_size=${gs} != 0`);
   if (K % 2 !== 0) throw new Error(`QLWC pack needs even K, got ${K}`);
@@ -617,7 +619,10 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
   const scaleCount =
     scalesE.dtype === "F16" || scalesE.dtype === "BF16" ? scales.length / 2 : scales.length / 4;
   const scaleF = tensorToF32(scales, scalesE.dtype, scaleCount);
-  const scaleLayout = inferLayout(scaleF.length, M, ng);
+  if (scaleCount !== M * ng) {
+    throw new Error(`AutoAWQ scales length ${scaleCount} != M*ng=${M * ng}`);
+  }
+  const scaleLayout = layoutFromShape(scalesE.shape, M, ng, /*preferGmForAwq=*/ true);
   const qlwcScales = scalesToF16Mg(scaleF, M, ng, scaleLayout);
 
   let qlwcZeros = null;
@@ -625,12 +630,18 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
     if (!qzerosE) throw new Error("asymmetric AutoAWQ needs qzeros");
     const qzeros = readTensor(qzerosE);
     const zeroF = tensorToF32(qzeros, "I32", qzeros.length / 4);
+    const packedRows = Math.ceil(M / 8);
+    if (zeroF.length < ng * packedRows) {
+      throw new Error(`AutoAWQ qzeros too short ${zeroF.length} need ${ng * packedRows}`);
+    }
     const zpF = new Float32Array(M * ng);
     for (let m = 0; m < M; ++m) {
+      const pm = (m / 8) | 0;
+      const nib = awqNibbleIndex(m % 8);
       for (let g = 0; g < ng; ++g) {
-        const zpIdx = g * Math.ceil(M / 8) + Math.floor(m / 8);
-        const word = zeroF[zpIdx] | 0;
-        zpF[m * ng + g] = (word >>> ((m % 8) * 4)) & 0xf;
+        // qzeros [ng, ceil(M/8)]
+        const word = zeroF[g * packedRows + pm] | 0;
+        zpF[m * ng + g] = (word >>> (nib * 4)) & 0xf;
       }
     }
     qlwcZeros = gptqZerosFromZp(scaleF, zpF, M, ng, scaleLayout, "m_g");
@@ -660,7 +671,8 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
         const view = new Int32Array(colBuf.buffer, colBuf.byteOffset, colsPacked);
         for (let m = 0; m < M; ++m) {
           const pm = (m / 8) | 0;
-          const q = (view[pm] >>> ((m % 8) * 4)) & 0xf;
+          const nib = awqNibbleIndex(m % 8);
+          const q = (view[pm] >>> (nib * 4)) & 0xf;
           const byteIndex = m * (K / 2) + (k / 2);
           if (kk === 0) outQ[byteIndex] = (outQ[byteIndex] & 0xf0) | (q & 0xf);
           else outQ[byteIndex] = (outQ[byteIndex] & 0x0f) | ((q & 0xf) << 4);
@@ -670,7 +682,7 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
   } finally {
     fs.closeSync(fd);
   }
-  return { q: blobFromBuffer(outQ), scales: qlwcScales, zeros: qlwcZeros, gs, ng };
+  return { q: blobFromBuffer(outQ), scales: qlwcScales, zeros: qlwcZeros, gs, ng, scaleLayout };
 }
 
 function loadConfig(hfDir) {
@@ -828,12 +840,35 @@ function tensorToF32(buf, dtype, count) {
 }
 
 function inferLayout(len, M, ng) {
-  if (len === M * ng) return "m_g";
-  if (len === ng * M) return "g_m";
+  // NOTE: M*ng === ng*M, so length alone cannot distinguish m_g vs g_m.
+  if (len === M * ng) return "m_g"; // ambiguous — prefer caller to pass shape
   if (len === ng) return "ng";
   if (len === M) return "m";
   if (len === 1) return "1";
   throw new Error(`unexpected tensor length ${len} for M=${M} ng=${ng}`);
+}
+
+/** Prefer safetensors shape; AutoAWQ gemm scales are [ng, M] (g_m). */
+function layoutFromShape(shape, M, ng, preferGmForAwq) {
+  if (Array.isArray(shape) && shape.length === 2) {
+    const [a, b] = shape;
+    if (a === M && b === ng) return "m_g";
+    if (a === ng && b === M) return "g_m";
+  }
+  return preferGmForAwq ? "g_m" : "m_g";
+}
+
+// AutoAWQ gemm packs 8 out-features into one int32 with this nibble order (not 0..7).
+// See awq/modules/linear/gemm.py order_map = [0, 2, 4, 6, 1, 3, 5, 7]
+const AWQ_PACK_ORDER = [0, 2, 4, 6, 1, 3, 5, 7];
+const AWQ_PACK_ORDER_INV = (() => {
+  const inv = new Array(8);
+  for (let i = 0; i < 8; ++i) inv[AWQ_PACK_ORDER[i]] = i;
+  return inv;
+})();
+
+function awqNibbleIndex(mLocal) {
+  return AWQ_PACK_ORDER_INV[mLocal & 7];
 }
 
 /** config/CLI 的 group_size 可能与真实 weight_scale 不一致；以 scale 元素数为准。 */
@@ -905,7 +940,7 @@ function unpackAwqNibble(qweight, M, K, m, k) {
   const view = new Int32Array(qweight.buffer, qweight.byteOffset, qweight.byteLength / 4);
   const pm = Math.floor(m / packFactor);
   const val = view[k * colsPacked + pm];
-  return (val >>> ((m % packFactor) * 4)) & 0xf;
+  return (val >>> (awqNibbleIndex(m) * 4)) & 0xf;
 }
 
 function dequantCt(packed, scales, zeros, M, K, gs, scaleDt, zpDt, symmetric) {
@@ -938,18 +973,23 @@ function dequantAwq(qweight, scales, qzeros, M, K, gs, scaleDt, symmetric) {
   const scaleCount =
     scaleDt === "F16" || scaleDt === "BF16" ? scales.length / 2 : scales.length / 4;
   const scaleF = tensorToF32(scales, scaleDt, scaleCount);
-  const scaleLayout = inferLayout(scaleF.length, M, ng);
+  // AutoAWQ gemm scales are [ng, M] — length alone cannot distinguish m_g vs g_m.
+  const layout = scaleF.length === M * ng ? "g_m" : inferLayout(scaleF.length, M, ng);
   const zeroF = qzeros ? tensorToF32(qzeros, "I32", qzeros.length / 4) : null;
+  const packedRows = Math.ceil(M / 8);
   const W = new Float32Array(M * K);
   for (let m = 0; m < M; ++m) {
     for (let k = 0; k < K; ++k) {
       const g = Math.floor(k / gs);
       const q = unpackAwqNibble(qweight, M, K, m, k);
-      const sc = pickScale(scaleF, M, ng, m, g, scaleLayout);
+      const sc = pickScale(scaleF, M, ng, m, g, layout);
       if (symmetric) W[m * K + k] = (q - 8) * sc;
       else {
-        const zpIdx = Math.floor(k / gs) * Math.ceil(M / 8) + Math.floor(m / 8);
-        const zp = zeroF ? zeroF[zpIdx] & 0xf : 0;
+        const pm = (m / 8) | 0;
+        const nib = awqNibbleIndex(m);
+        const zpIdx = g * packedRows + pm;
+        const word = zeroF ? zeroF[zpIdx] | 0 : 0;
+        const zp = (word >>> (nib * 4)) & 0xf;
         W[m * K + k] = (q - zp) * sc;
       }
     }
