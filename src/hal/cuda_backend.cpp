@@ -155,6 +155,9 @@ std::unordered_map<const void*, W16Pack> g_w16_pack;
 // Only enforced for large W16 packs (lm_head); small out/a/b use FP32+cublas.
 constexpr size_t kVramHeadroom = 1536ull << 20;  // 1.5 GiB
 constexpr int kW16PackMinRows = 65536;           // lm_head-scale → pack; else FP32 inflate
+constexpr int kW16TileRows = 2048;               // FP32 inflate tile for vocab GEMV via cublas
+float* g_w16_tile = nullptr;                     // device FP32[tile_rows * K]
+int g_w16_tile_cap = 0;                          // floats capacity
 std::string g_act_lin_last_err;
 std::unordered_map<const void*, Int4Resident> g_int4_cache;
 uint64_t g_lru_tick = 0;
@@ -908,6 +911,11 @@ void disable() {
   if (g_dy) g_api.cudaFree(g_dy);
   g_dx = g_dy = nullptr;
   g_cap_k = g_cap_m = g_cap_n = 0;
+  if (g_w16_tile) {
+    g_api.cudaFree(g_w16_tile);
+    g_w16_tile = nullptr;
+  }
+  g_w16_tile_cap = 0;
   g_sticky_x = nullptr;
   g_sticky_k = 0;
   if (g_cublas && g_api.cublasDestroy) g_api.cublasDestroy(g_cublas);
@@ -1515,7 +1523,7 @@ extern "C" __global__ void rmsnorm_gated_heads_v2(const float* __restrict__ x,
 }
 
 // GEMV with packed BF16/F16 weights (no FP32 inflate). y[M] = W[M,K] @ x[K]
-// Grid-stride over rows so M > 65535 (lm_head) is safe on all CC.
+// Prefer tiled cublas for vocab-scale M; this kernel remains for small M fallback.
 extern "C" __global__ void gemv_w16(const unsigned short* __restrict__ W, const float* __restrict__ x,
                                     float* __restrict__ y, int M, int K, int is_f16) {
   extern __shared__ float smem[];
@@ -1535,6 +1543,24 @@ extern "C" __global__ void gemv_w16(const unsigned short* __restrict__ W, const 
       y[m] = (o == o) ? o : 0.f;
     }
     __syncthreads();
+  }
+}
+
+// Expand a contiguous row tile of W16 → FP32 for cublas (lm_head path).
+// out[rows, K] row-major from W[m0 : m0+rows, :].
+extern "C" __global__ void w16_tile_to_f32(const unsigned short* __restrict__ W, float* __restrict__ out,
+                                          int M, int K, int m0, int rows, int is_f16) {
+  const size_t n = (size_t)rows * (size_t)K;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)gridDim.x * blockDim.x) {
+    const int r = (int)(i / (size_t)K);
+    const int c = (int)(i % (size_t)K);
+    const int m = m0 + r;
+    if (m >= M) {
+      out[i] = 0.f;
+      continue;
+    }
+    out[i] = w16_to_f32(W[(size_t)m * (size_t)K + (size_t)c], is_f16);
   }
 }
 )CUDA";
@@ -1713,12 +1739,58 @@ bool jit_gemv_w16(const uint16_t* d_W, const float* d_x, float* d_y, int M, int 
   int is_f16_i = is_f16 ? 1 : 0;
   void* params[] = {&d_W, &d_x, &d_y, &M, &K, &is_f16_i};
   constexpr unsigned BLOCK = 256;
-  // Cap grid; kernel grid-strides over rows (critical for vocab-sized M > 65535).
   const unsigned grid = static_cast<unsigned>(M < 4096 ? M : 4096);
   return jit_launch(fn, grid, 1, 1, BLOCK, 1, 1, BLOCK * sizeof(float), params);
 }
 
-// Device GEMV for W16: prefer FP32+cublas for mid-size (out/a/b); pack+JIT for lm_head.
+bool ensure_w16_tile(int rows, int K) {
+  const size_t need = static_cast<size_t>(rows) * static_cast<size_t>(K);
+  if (need == 0) return false;
+  if (static_cast<int>(need) <= g_w16_tile_cap && g_w16_tile) return true;
+  if (g_w16_tile) {
+    g_api.cudaFree(g_w16_tile);
+    g_w16_tile = nullptr;
+    g_w16_tile_cap = 0;
+  }
+  void* p = nullptr;
+  if (g_api.cudaMalloc(&p, sizeof(float) * need) != kCudaSuccess) return false;
+  g_w16_tile = static_cast<float*>(p);
+  g_w16_tile_cap = static_cast<int>(need);
+  return true;
+}
+
+// Vocab-scale lm_head: BF16/F16 pack + per-tile FP32 inflate + cublasSgemm.
+// Naive gemv_w16 was wrong/incomplete for M≈248k (blank / sticky first token "Gos").
+bool gemv_w16_tiled_cublas(const uint16_t* d_W, const float* d_x, float* d_y, int M, int K,
+                           bool is_f16) {
+  if (!d_W || !d_x || !d_y || M <= 0 || K <= 0 || !g_cublas || !g_api.cublasSgemm) return false;
+  void* fn = get_jit_kernel(kActSrc, "w16_tile_to_f32");
+  if (!fn) return false;
+  const int tile = (M < kW16TileRows) ? M : kW16TileRows;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_w16_tile(tile, K)) return false;
+  }
+  const float alpha = 1.f, beta = 0.f;
+  int is_f16_i = is_f16 ? 1 : 0;
+  int M_i = M, K_i = K;
+  constexpr unsigned BLOCK = 256;
+  for (int m0 = 0; m0 < M; m0 += tile) {
+    int rows = (m0 + tile <= M) ? tile : (M - m0);
+    void* params[] = {&d_W, &g_w16_tile, &M_i, &K_i, &m0, &rows, &is_f16_i};
+    const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(K);
+    const unsigned grid = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+    const unsigned grid_cap = grid < 65535u ? grid : 65535u;
+    if (!jit_launch(fn, grid_cap, 1, 1, BLOCK, 1, 1, 0, params)) return false;
+    float* d_yt = d_y + m0;
+    if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, rows, 1, K, &alpha, g_w16_tile, K, d_x,
+                          K, &beta, d_yt, rows) != kCublasSuccess)
+      return false;
+  }
+  return true;
+}
+
+// Device GEMV for W16: mid-size → FP32+cublas; vocab-scale → pack tile+cublas.
 bool gemv_w16_dev_x(const uint16_t* pass, bool is_f16w, const float* d_x, float* d_y, int M,
                     int K) {
   if (!pass || !d_x || !d_y || M <= 0 || K <= 0) return false;
@@ -1728,11 +1800,10 @@ bool gemv_w16_dev_x(const uint16_t* pass, bool is_f16w, const float* d_x, float*
       std::lock_guard<std::mutex> lock(g_mu);
       dW = ensure_w16_fp32(pass, M, K, is_f16w);
     }
-    if (dW) {
-      const float alpha = 1.f, beta0 = 0.f;
-      return g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, M, 1, K, &alpha, dW, K, d_x, K,
-                               &beta0, d_y, M) == kCublasSuccess;
-    }
+    if (!dW) return false;
+    const float alpha = 1.f, beta0 = 0.f;
+    return g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, M, 1, K, &alpha, dW, K, d_x, K,
+                             &beta0, d_y, M) == kCublasSuccess;
   }
   const W16Pack* pack = nullptr;
   {
@@ -1740,12 +1811,12 @@ bool gemv_w16_dev_x(const uint16_t* pass, bool is_f16w, const float* d_x, float*
     pack = ensure_w16_pack(pass, M, K, is_f16w);
     if (!pack) return false;
   }
-  return jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), d_x, d_y, M, K, pack->is_f16);
+  return gemv_w16_tiled_cublas(static_cast<const uint16_t*>(pack->d_w), d_x, d_y, M, K, pack->is_f16);
 }
 
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {
   if (!g_enabled || !x || !W || !y || M <= 0 || K <= 0) return false;
-  // Mid-size: FP32 + cublas (decode out/a/b). Large: pack + gemv_w16 (lm_head).
+  // Mid-size (out/a/b): full FP32 mirror + cublas.
   if (M < kW16PackMinRows) {
     const float* dW = nullptr;
     {
@@ -1755,6 +1826,7 @@ bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, boo
       return gemm_dev(dW, x, y, M, K);
     }
   }
+  // Vocab-scale lm_head: pack + tiled FP32 cublas (not naive gemv_w16).
   const W16Pack* pack = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -1763,8 +1835,9 @@ bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, boo
     if (!ensure_xy(M, K, 1)) return false;
     if (!upload_x_sticky(x, K)) return false;
   }
-  if (!jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), reinterpret_cast<const float*>(g_dx),
-                    reinterpret_cast<float*>(g_dy), M, K, pack->is_f16))
+  if (!gemv_w16_tiled_cublas(static_cast<const uint16_t*>(pack->d_w),
+                             reinterpret_cast<const float*>(g_dx), reinterpret_cast<float*>(g_dy), M,
+                             K, pack->is_f16))
     return false;
   std::lock_guard<std::mutex> lock(g_mu);
   return g_api.cudaMemcpy(y, g_dy, sizeof(float) * static_cast<size_t>(M), kCudaMemcpyD2H) ==
@@ -1788,27 +1861,13 @@ bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int 
     }
   }
 
-  const W16Pack* pack = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    pack = ensure_w16_pack(W, M, K, is_f16);
-    if (!pack) return false;
-    if (!ensure_xy(M, K, n)) return false;
-    if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(n) * K, kCudaMemcpyH2D) !=
-        kCudaSuccess)
-      return false;
-    g_sticky_x = nullptr;
-    g_sticky_k = 0;
-  }
+  // Vocab × batch: reuse single-vector tiled path per column (rare for lm_head).
   for (int i = 0; i < n; ++i) {
-    const float* dx = reinterpret_cast<const float*>(g_dx) + static_cast<size_t>(i) * K;
-    float* dy = reinterpret_cast<float*>(g_dy) + static_cast<size_t>(i) * M;
-    if (!jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), dx, dy, M, K, pack->is_f16))
+    if (!try_gemm_w16(X + static_cast<size_t>(i) * K, W, Y + static_cast<size_t>(i) * M, M, K,
+                      is_f16))
       return false;
   }
-  std::lock_guard<std::mutex> lock(g_mu);
-  return g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(n) * M, kCudaMemcpyD2H) ==
-         kCudaSuccess;
+  return true;
 }
 
 bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16) {
@@ -2991,15 +3050,14 @@ bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pas
   void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
   if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
 
-  if (!jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), g_mlp_norm,
-                    reinterpret_cast<float*>(g_dy), V, H, pack->is_f16))
+  if (!gemv_w16_tiled_cublas(static_cast<const uint16_t*>(pack->d_w), g_mlp_norm,
+                             reinterpret_cast<float*>(g_dy), V, H, pack->is_f16))
     return false;
 
   std::lock_guard<std::mutex> lock(g_mu);
   if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(V),
                        kCudaMemcpyD2H) != kCudaSuccess)
     return false;
-  // Reject NaN/Inf-dominated logits (bad kernel/launch) so caller can host-fallback.
   int bad = 0;
   const int probe = (V < 4096) ? V : 4096;
   for (int i = 0; i < probe; ++i) {
