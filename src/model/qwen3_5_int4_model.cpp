@@ -8,6 +8,7 @@
 #include <cstring>
 #include <chrono>
 #include <fstream>
+#include <numeric>
 #include <stdexcept>
 
 #include "hal/cpu_ops.h"
@@ -79,7 +80,7 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
   cfg_.n_heads = tc.value("num_attention_heads", 16);
   cfg_.n_kv = tc.value("num_key_value_heads", 4);
   cfg_.head_dim = tc.value("head_dim", 256);
-  cfg_.intermediate = tc.value("intermediate_size", 9216);
+  cfg_.intermediate = tc.value("intermediate_size", 0);
   cfg_.vocab = tc.value("vocab_size", 248320);
   cfg_.rms_eps = static_cast<float>(tc.value("rms_norm_eps", 1e-6));
   cfg_.tie_embeddings = tc.value("tie_word_embeddings", true);
@@ -88,6 +89,22 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
   cfg_.linear_dk = tc.value("linear_key_head_dim", 128);
   cfg_.linear_dv = tc.value("linear_value_head_dim", 128);
   cfg_.conv_k = tc.value("linear_conv_kernel_dim", 4);
+  cfg_.n_experts = tc.value("num_experts", tc.value("n_routed_experts", 0));
+  cfg_.topk = tc.value("num_experts_per_tok", 0);
+  cfg_.moe_intermediate = tc.value("moe_intermediate_size", 0);
+  cfg_.shared_expert_intermediate =
+      tc.value("shared_expert_intermediate_size", cfg_.moe_intermediate);
+  cfg_.first_k_dense = tc.value("first_k_dense_replace", 0);
+  cfg_.is_moe = cfg_.n_experts > 0;
+  if (cfg_.is_moe) {
+    if (cfg_.topk <= 0) cfg_.topk = 8;
+    if (cfg_.moe_intermediate <= 0) cfg_.moe_intermediate = 512;
+    if (cfg_.shared_expert_intermediate <= 0)
+      cfg_.shared_expert_intermediate = cfg_.moe_intermediate;
+    if (cfg_.intermediate <= 0) cfg_.intermediate = cfg_.moe_intermediate;
+  } else if (cfg_.intermediate <= 0) {
+    cfg_.intermediate = 9216;
+  }
   if (tc.contains("rope_parameters")) {
     const auto& rp = tc["rope_parameters"];
     cfg_.rope_theta = rp.value("rope_theta", 10000000.f);
@@ -130,8 +147,39 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
   meta_.conv_k = cfg_.conv_k;
   meta_.conv_dim =
       cfg_.linear_num_k * cfg_.linear_dk * 2 + cfg_.linear_num_v * cfg_.linear_dv;
-  meta_.is_moe = false;
-  meta_.kind = "qwen3_5_int4";
+  meta_.is_moe = cfg_.is_moe;
+  meta_.kind = cfg_.is_moe ? "qwen3_5_moe_int4" : "qwen3_5_int4";
+
+  // Weight-based MoE detect (config may omit num_experts on some AWQ dumps).
+  if (!cfg_.is_moe) {
+    const std::string probe0 = prefix_ + "layers.0.mlp.experts.0.gate_proj.weight";
+    const std::string probe_gate = prefix_ + "layers.0.mlp.gate.weight";
+    if (store_->has(probe0) || store_->has(probe_gate)) {
+      cfg_.is_moe = true;
+      meta_.is_moe = true;
+      meta_.kind = "qwen3_5_moe_int4";
+      if (cfg_.n_experts <= 0) {
+        int max_e = 0;
+        const std::string pref = prefix_ + "layers.0.mlp.experts.";
+        for (const auto& tm : store_->header().tensors) {
+          if (tm.name.rfind(pref, 0) != 0) continue;
+          const auto rest = tm.name.substr(pref.size());
+          const auto dot = rest.find('.');
+          if (dot == std::string::npos) continue;
+          try {
+            max_e = std::max(max_e, std::stoi(rest.substr(0, dot)) + 1);
+          } catch (...) {
+          }
+        }
+        cfg_.n_experts = max_e;
+      }
+      if (cfg_.topk <= 0) cfg_.topk = 8;
+      if (cfg_.moe_intermediate <= 0) cfg_.moe_intermediate = 512;
+      if (cfg_.shared_expert_intermediate <= 0)
+        cfg_.shared_expert_intermediate = cfg_.moe_intermediate;
+      if (cfg_.intermediate <= 0) cfg_.intermediate = cfg_.moe_intermediate;
+    }
+  }
 
   if (store_->has("visual.patch_embed.proj.weight") && root.contains("vision_config")) {
     const auto& vc = root["vision_config"];
@@ -193,8 +241,9 @@ void Qwen35Int4Model::build_layer_packs() {
   }
   for (int L = 0; L < cfg_.layers; ++L) fill_layer_pack(L);
   build_global_packs();
-  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d", cfg_.layers, cfg_.hidden,
-           cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0);
+  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d moe=%d experts=%d topk=%d",
+           cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
+           cfg_.is_moe ? 1 : 0, cfg_.n_experts, cfg_.topk);
 }
 
 void Qwen35Int4Model::build_global_packs() {
@@ -240,9 +289,6 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
   lp.is_full = (cfg_.layer_types[L] == "full_attention");
   lp.ln1 = pass(base + "input_layernorm.weight");
   lp.ln2 = pass(base + "post_attention_layernorm.weight");
-  lp.wgate = store_->get_int4(base + "mlp.gate_proj.weight");
-  lp.wup = store_->get_int4(base + "mlp.up_proj.weight");
-  lp.wdown = store_->get_int4(base + "mlp.down_proj.weight");
   if (lp.is_full) {
     lp.wq = store_->get_int4(base + "self_attn.q_proj.weight");
     lp.wk = store_->get_int4(base + "self_attn.k_proj.weight");
@@ -271,22 +317,66 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
       const auto pa = store_->get_pass(a_name);
       const auto pd = store_->get_pass(d_name);
       const auto pc = store_->get_pass(c_name);
-      const auto dta = pa.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
-      const auto dtd = pd.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
-      const auto dtc = pc.dtype == qlwc::PassDtype::kF16 ? hal::WDtype::kF16 : hal::WDtype::kBF16;
+      const auto dta = pa.dtype == qlwc::PassDtype::kF16 ?hal::WDtype::kF16 :hal::WDtype::kBF16;
+      const auto dtd = pd.dtype == qlwc::PassDtype::kF16 ?hal::WDtype::kF16 :hal::WDtype::kBF16;
+      const auto dtc = pc.dtype == qlwc::PassDtype::kF16 ?hal::WDtype::kF16 :hal::WDtype::kBF16;
       lp.A_log_f.resize(nv);
       lp.dt_bias_f.resize(nv);
       for (int h = 0; h < nv; ++h) {
-        lp.A_log_f[h] = hal::load_w(pa.data + h, dta);
-        lp.dt_bias_f[h] = hal::load_w(pd.data + h, dtd);
+        lp.A_log_f[h] =hal::load_w(pa.data + h, dta);
+        lp.dt_bias_f[h] =hal::load_w(pd.data + h, dtd);
       }
       lp.conv_w_f.resize(static_cast<size_t>(conv_dim) * cfg_.conv_k);
       for (int c = 0; c < conv_dim; ++c)
         for (int k = 0; k < cfg_.conv_k; ++k)
           lp.conv_w_f[c * cfg_.conv_k + k] =
-              hal::load_w(pc.data + c * cfg_.conv_k + k, dtc);
+            hal::load_w(pc.data + c * cfg_.conv_k + k, dtc);
     }
   }
+
+  const bool has_dense = store_->has(base + "mlp.gate_proj.weight");
+  const bool has_router = store_->has(base + "mlp.gate.weight");
+  const bool has_expert0 = store_->has(base + "mlp.experts.0.gate_proj.weight");
+  const bool use_dense =
+      has_dense && (L < cfg_.first_k_dense || (!has_router && !has_expert0));
+  if (use_dense) {
+    if (store_->lazy()) {
+      store_->ensure(base + "mlp.gate_proj.weight");
+      store_->ensure(base + "mlp.up_proj.weight");
+      store_->ensure(base + "mlp.down_proj.weight");
+    }
+    lp.wgate = store_->get_int4(base + "mlp.gate_proj.weight");
+    lp.wup = store_->get_int4(base + "mlp.up_proj.weight");
+    lp.wdown = store_->get_int4(base + "mlp.down_proj.weight");
+    return;
+  }
+
+  if (!has_expert0) {
+    if (store_->has(base + "mlp.experts.gate_up_proj") ||
+        store_->has(base + "mlp.experts.gate_up_proj.weight")) {
+      throw std::runtime_error(
+          "QLWC has fused mlp.experts.gate_up_proj (3D); re-import AWQ with per-expert "
+          "2D gate/up/down_proj: " +
+          base);
+    }
+    throw std::runtime_error("MoE layer missing mlp.experts.0.gate_proj.weight: " + base);
+  }
+  if (!has_router) throw std::runtime_error("MoE layer missing mlp.gate.weight: " + base);
+  lp.is_moe = true;
+  const int E = cfg_.n_experts > 0 ? cfg_.n_experts : 1;
+  const int Is = cfg_.shared_expert_intermediate > 0 ? cfg_.shared_expert_intermediate
+                                                     : cfg_.moe_intermediate;
+  lp.router = load_opt_w(base + "mlp.gate.weight", E, cfg_.hidden);
+  const std::string sg = base + "mlp.shared_expert.gate_proj.weight";
+  const std::string su = base + "mlp.shared_expert.up_proj.weight";
+  const std::string sd = base + "mlp.shared_expert.down_proj.weight";
+  const std::string sgg = base + "mlp.shared_expert_gate.weight";
+  if (store_->has(sg) && store_->has(su) && store_->has(sd)) {
+    lp.shared_gate = load_opt_w(sg, Is, cfg_.hidden);
+    lp.shared_up = load_opt_w(su, Is, cfg_.hidden);
+    lp.shared_down = load_opt_w(sd, cfg_.hidden, Is);
+  }
+  if (store_->has(sgg)) lp.shared_expert_gate = load_opt_w(sgg, 1, cfg_.hidden);
 }
 
 void Qwen35Int4Model::enable_layer_stream(wt::ILayerStreamLoader* loader) {
@@ -426,9 +516,16 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
       try_pass(lp.wa);
       try_pass(lp.wout);
     }
-    try_one(lp.wgate);
-    try_one(lp.wup);
-    try_one(lp.wdown);
+    if (!lp.is_moe) {
+      try_one(lp.wgate);
+      try_one(lp.wup);
+      try_one(lp.wdown);
+    } else {
+      if (lp.router.is_int4) try_one(lp.router.i4);
+      if (lp.shared_gate.is_int4) try_one(lp.shared_gate.i4);
+      if (lp.shared_up.is_int4) try_one(lp.shared_up.i4);
+      if (lp.shared_down.is_int4) try_one(lp.shared_down.i4);
+    }
   }
   // lm_head resident: INT4 → ensure_int4_resident; BF16 pass → packed W16 (no FP32 inflate)
   LOG_INFO("Qwen35Int4: warm_gpu_int4 layers=%d fail=%d used=%.2fGiB / budget=%.2fGiB (lm_int4=%d lm_pass=%d tie=%d)",
@@ -611,6 +708,69 @@ void Qwen35Int4Model::prepare_mrope_positions(const std::vector<int32_t>& tokens
   for (int i = 0; i < n; ++i)
     mx = std::max(mx, std::max(cur_pos_t_[i], std::max(cur_pos_h_[i], cur_pos_w_[i])));
   mrope_next_ = mx + 1;
+}
+
+void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_acc) {
+  const auto& lp = layers_[layer];
+  const int H = cfg_.hidden;
+  const int E = cfg_.n_experts;
+  const int K = cfg_.topk;
+  const int I = cfg_.moe_intermediate > 0 ? cfg_.moe_intermediate : cfg_.intermediate;
+  if (E <= 0 || K <= 0) throw std::runtime_error("moe_ffn: invalid experts/topk");
+  if (K > 64) throw std::runtime_error("moe_ffn: topk > 64");
+
+  std::vector<float> logits(static_cast<size_t>(E));
+  gemm_opt(normed, lp.router, logits.data());
+  float m = *std::max_element(logits.begin(), logits.end());
+  double s = 0.0;
+  for (int i = 0; i < E; ++i) {
+    logits[i] = std::exp(logits[i] - m);
+    s += logits[i];
+  }
+  for (int i = 0; i < E; ++i) logits[i] = static_cast<float>(logits[i] / s);
+
+  std::vector<int> order(E);
+  std::iota(order.begin(), order.end(), 0);
+  std::partial_sort(order.begin(), order.begin() + K, order.end(),
+                    [&](int a, int b) { return logits[a] > logits[b]; });
+  double wsum = 0.0;
+  for (int i = 0; i < K; ++i) wsum += logits[order[i]];
+  if (wsum < 1e-12) wsum = 1.0;
+
+  std::fill(down_acc, down_acc + H, 0.f);
+  std::vector<float> g(static_cast<size_t>(I)), u(static_cast<size_t>(I)), mid(static_cast<size_t>(I)),
+      down(static_cast<size_t>(H));
+  const std::string base = prefix_ + "layers." + std::to_string(layer) + ".mlp.experts.";
+  for (int i = 0; i < K; ++i) {
+    const int e = order[i];
+    const float ww = static_cast<float>(logits[e] / wsum);
+    const std::string eb = base + std::to_string(e) + ".";
+    gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
+    gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
+    hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
+    gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
+    for (int d = 0; d < H; ++d) down_acc[d] += ww * down[d];
+  }
+
+  if (lp.shared_gate.pass || lp.shared_gate.is_int4) {
+    const int Is = lp.shared_gate.M > 0 ? lp.shared_gate.M : I;
+    if (static_cast<int>(g.size()) < Is) {
+      g.resize(static_cast<size_t>(Is));
+      u.resize(static_cast<size_t>(Is));
+      mid.resize(static_cast<size_t>(Is));
+    }
+    gemm_opt(normed, lp.shared_gate, g.data());
+    gemm_opt(normed, lp.shared_up, u.data());
+    hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
+    gemm_opt(mid.data(), lp.shared_down, down.data());
+    float scale = 1.f;
+    if (lp.shared_expert_gate.pass || lp.shared_expert_gate.is_int4) {
+      float gate_logit = 0.f;
+      gemm_opt(normed, lp.shared_expert_gate, &gate_logit);
+      scale = sigmoid(gate_logit);
+    }
+    for (int d = 0; d < H; ++d) down_acc[d] += scale * down[d];
+  }
 }
 
 void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, int pos_start, int n_tok,
@@ -854,7 +1014,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       }
     }
     // Fuse wout + MLP on device (linear decode): skip host residual/mlp tail.
-    if (n_tok == 1 && resident_gpu_ && lp.wout.is_int4 && lp.ln2 &&
+    if (n_tok == 1 && !lp.is_moe && resident_gpu_ && lp.wout.is_int4 && lp.ln2 &&
         hal::cuda::try_out_mlp_resident(sc.residual.data(), sc.core.data(), lp.wout.i4, lp.ln2,
                                         lp.wgate, lp.wup, lp.wdown, x, H, I, cfg_.rms_eps,
                                         pass_wd_ == hal::WDtype::kF16)) {
@@ -869,12 +1029,22 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   for (size_t i = 0; i < nH; ++i) x[i] = sc.residual[i] + sc.attn_out[i];
 
   std::memcpy(sc.residual.data(), x, sizeof(float) * nH);
+  if (lp.is_moe) {
+    Int4Scratch::fit(sc.normed, static_cast<size_t>(n_tok) * H);
+    Int4Scratch::fit(sc.down, static_cast<size_t>(n_tok) * H);
+    for (int t = 0; t < n_tok; ++t) {
+     hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
+      moe_ffn_token(layer, sc.normed.data() + t * H, sc.down.data() + t * H);
+      for (int i = 0; i < H; ++i) x[t * H + i] = sc.residual[t * H + i] + sc.down[t * H + i];
+    }
+    return;
+  }
   Int4Scratch::fit(sc.gproj, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.uproj, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.mid, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.down, static_cast<size_t>(n_tok) * H);
   if (n_tok == 1 && resident_gpu_ && lp.ln2 &&
-      hal::cuda::try_mlp_decode_resident(x, lp.ln2, lp.wgate, lp.wup, lp.wdown, x, H, I,
+     hal::cuda::try_mlp_decode_resident(x, lp.ln2, lp.wgate, lp.wup, lp.wdown, x, H, I,
                                          cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16)) {
     // x already = residual + down
   } else if (n_tok > 1) {
@@ -905,7 +1075,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
 bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   if (!resident_gpu_ || !hal::cuda::decode_act_valid()) return false;
   const auto& lp = layers_[layer];
-  if (lp.is_full || !lp.ln1 || !lp.ln2) return false;
+  if (lp.is_moe || lp.is_full || !lp.ln1 || !lp.ln2) return false;
 
   const int H = cfg_.hidden;
   const int I = cfg_.intermediate;
@@ -1042,6 +1212,7 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
 bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int pos_start) {
   if (!resident_gpu_ || !hal::cuda::decode_act_valid()) return false;
   const auto& lp = layers_[layer];
+  if (lp.is_moe) return false;
   if (!lp.is_full || !lp.ln1 || !lp.ln2) return false;
   hal::cuda::note_full_attn_try();
 

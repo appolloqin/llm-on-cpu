@@ -1,0 +1,38 @@
+# Qwen3.6-35B-A3B (MoE) INT4 / QLWC — hybrid GDN+GQA + sparse FFN
+# Requires: import_awq_hf_qlwc with per-expert 2D gate/up/down_proj (not fused 3D).
+#
+# node tools/import_awq_hf_qlwc.mjs --src models/Qwen3.6-35B-A3B-AWQ-4bit-hf --out models/Qwen3.6-35B-A3B-AWQ-4bit.int4.qlwc
+# .\build\bin\Release\llmoc_server_int4.exe --config configs\engine_int4_qwen3_6a3b.yaml
+
+model:
+  path: models/Qwen3.6-35B-A3B-AWQ-4bit.int4.qlwc
+  dtype: int4
+  mtp: false
+  tokenizer_dir: models/Qwen3.6-35B-A3B-AWQ-4bit-hf
+
+# MoE weights are large; prefer hybrid_gpu or layer_stream if DRAM is tight.
+mode: hybrid_gpu
+
+layer_stream:
+  window_layers: 2
+  device: cpu
+  max_window_mb: 0
+  auto: true
+
+tiers:
+  dram_hot_gb: 24
+  kv_pool_gb: 2
+  prefetch_buf_gb: 1
+  gpu_vram_gb: 20
+
+decode:
+  spec_k: 0
+  max_seq: 4096
+  max_new_tokens: 1024
+
+io:
+  workers: 2
+
+server:
+  port: 15085
+  api_key_env: LLMOC_API_KEY

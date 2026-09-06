@@ -32,6 +32,13 @@ struct Qwen35Int4Config {
   int linear_dv = 128;
   int conv_k = 4;
   bool tie_embeddings = true;
+  // Qwen3.5/3.6 MoE (e.g. 35B-A3B): hybrid attn + sparse FFN
+  bool is_moe = false;
+  int n_experts = 0;
+  int topk = 0;
+  int moe_intermediate = 0;
+  int shared_expert_intermediate = 0;
+  int first_k_dense = 0;
   std::vector<std::string> layer_types;
   int32_t image_token_id = 248056;
   int32_t vision_start_id = 248053;
@@ -90,6 +97,7 @@ class Qwen35Int4Model final : public ICausalLM {
 
   struct LayerPack {
     bool is_full = false;
+    bool is_moe = false;
     const uint16_t* ln1 = nullptr;
     const uint16_t* ln2 = nullptr;
     // full attention
@@ -103,8 +111,14 @@ class Qwen35Int4Model final : public ICausalLM {
     std::vector<float> A_log_f;
     std::vector<float> dt_bias_f;
     std::vector<float> conv_w_f;  // [conv_dim * conv_k]
-    // mlp
+    // dense mlp
     qlwc::Int4View wgate, wup, wdown;
+    // MoE FFN (router + shared; routed experts loaded on demand)
+    OptW router;              // [E, H]
+    OptW shared_gate;         // [I_s, H]
+    OptW shared_up;
+    OptW shared_down;         // [H, I_s]
+    OptW shared_expert_gate;  // [1, H] → sigmoid scale
   };
 
   qlwc::QlwcStore* store_ = nullptr;
@@ -146,6 +160,7 @@ class Qwen35Int4Model final : public ICausalLM {
   bool layer_forward_linear_act(int layer, SessionCache& cache);
   // Path A S3: full-attn decode with residual on device (QKV/attn host; out+MLP on act).
   bool layer_forward_full_act(int layer, SessionCache& cache, int pos_start);
+  void moe_ffn_token(int layer, const float* normed, float* down_acc);
   void forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache, bool is_prefill,
                          float* h_out, double* ms_lin = nullptr, double* ms_full = nullptr);
   void prepare_mrope_positions(const std::vector<int32_t>& tokens, bool is_prefill);
