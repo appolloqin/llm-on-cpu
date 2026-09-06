@@ -448,19 +448,16 @@ bool ensure_xy(int M, int K, int n = 1) {
   return true;
 }
 
-// Upload host x→g_dx unless resident path already has the same vector.
+// Upload host x→g_dx.
+// NOTE: Do NOT skip H2D based on pointer equality. Decode scratch (normed/mid/…) is reused
+// in-place across layers/experts; same address with new contents caused stale GPU x and
+// sticky garbage tokens (ici/endah/…) on MoE INT4 fallback paths.
 bool upload_x_sticky(const float* x, int K) {
-  if (g_resident && g_sticky_x == x && g_sticky_k == K && g_dx) return true;
   if (g_api.cudaMemcpy(g_dx, x, sizeof(float) * static_cast<size_t>(K), kCudaMemcpyH2D) !=
       kCudaSuccess)
     return false;
-  if (g_resident) {
-    g_sticky_x = x;
-    g_sticky_k = K;
-  } else {
-    g_sticky_x = nullptr;
-    g_sticky_k = 0;
-  }
+  g_sticky_x = x;
+  g_sticky_k = K;
   return true;
 }
 

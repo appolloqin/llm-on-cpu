@@ -2,6 +2,7 @@
 #include "model/qwen3_5_int4_model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -190,6 +191,37 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
       if (cfg_.shared_expert_intermediate <= 0)
         cfg_.shared_expert_intermediate = cfg_.moe_intermediate;
       if (cfg_.intermediate <= 0) cfg_.intermediate = cfg_.moe_intermediate;
+    }
+  }
+
+  // AutoAWQ (zero_point:true) must be imported as gptq_asym. awq_sym drops qzeros → sticky garbage.
+  {
+    const auto sch = store_->header().scheme;
+    nlohmann::json qc = nlohmann::json::object();
+    if (root.contains("quantization_config")) qc = root["quantization_config"];
+    else if (root.contains("text_config") && root["text_config"].contains("quantization_config"))
+      qc = root["text_config"]["quantization_config"];
+    const bool hf_zp = qc.value("zero_point", false);
+    const std::string qmethod = qc.value("quant_method", "");
+    size_t int4_n = 0, zeros_n = 0;
+    for (const auto& tm : store_->header().tensors) {
+      if (tm.kind != qlwc::TensorKind::kInt4) continue;
+      ++int4_n;
+      if (tm.zeros_nbytes > 0) ++zeros_n;
+    }
+    LOG_INFO("Qwen35Int4 qlwc: scheme=%s int4=%zu with_zeros=%zu hf_quant=%s zero_point=%d",
+             sch == qlwc::Scheme::kAwqSym ? "awq_sym" : "gptq_asym", int4_n, zeros_n, qmethod.c_str(),
+             hf_zp ? 1 : 0);
+    if (cfg_.is_moe && hf_zp && sch == qlwc::Scheme::kAwqSym) {
+      throw std::runtime_error(
+          "MoE QLWC scheme=awq_sym but HF quantization_config.zero_point=true — qzeros were "
+          "dropped at import, decode collapses (ici/endah/…). Re-import with current "
+          "tools/import_awq_hf_qlwc.mjs (expect scheme=gptq), then: node tools/qlwc_info.mjs "
+          "<file.qlwc>");
+    }
+    if (cfg_.is_moe && sch == qlwc::Scheme::kGptqAsym && zeros_n == 0 && int4_n > 0) {
+      throw std::runtime_error(
+          "MoE QLWC scheme=gptq_asym but no zeros blobs — corrupt import; re-run import_awq_hf_qlwc");
     }
   }
 
@@ -835,7 +867,7 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
     }
     if (hal::cuda::try_moe_ffn_int4(normed, H, I, exp_views, K, sg, su, sd, shared_scale,
                                     down_acc)) {
-      // Shared was BF16/pass or missing from fused path — add on host/GPU via gemm_opt.
+      // Shared was BF16/F16 pass (common in AutoAWQ ignore lists) — add via gemm_opt.
       if (!shared_i4 && (lp.shared_gate.pass || lp.shared_gate.is_int4)) {
         const int Is = lp.shared_gate.M > 0 ? lp.shared_gate.M : I;
         std::vector<float> g(static_cast<size_t>(Is)), u(static_cast<size_t>(Is)),
@@ -853,6 +885,10 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
         for (int d = 0; d < H; ++d) down_acc[d] += scale * down[static_cast<size_t>(d)];
       }
       return;
+    }
+    static std::atomic<int> moe_fuse_fail_logs{0};
+    if (moe_fuse_fail_logs.fetch_add(1) < 3) {
+      LOG_WARN("MoE fused GPU FFN failed (layer=%d); falling back to per-GEMV", layer);
     }
   }
 
