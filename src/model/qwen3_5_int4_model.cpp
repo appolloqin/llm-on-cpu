@@ -290,16 +290,18 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
   lp.ln1 = pass(base + "input_layernorm.weight");
   lp.ln2 = pass(base + "post_attention_layernorm.weight");
   if (lp.is_full) {
-    lp.wq = store_->get_int4(base + "self_attn.q_proj.weight");
-    lp.wk = store_->get_int4(base + "self_attn.k_proj.weight");
-    lp.wv = store_->get_int4(base + "self_attn.v_proj.weight");
-    lp.wo = store_->get_int4(base + "self_attn.o_proj.weight");
+    const int nh = cfg_.n_heads, nkv = cfg_.n_kv, hd = cfg_.head_dim;
+    lp.wq = load_opt_w(base + "self_attn.q_proj.weight", nh * hd * 2, cfg_.hidden);
+    lp.wk = load_opt_w(base + "self_attn.k_proj.weight", nkv * hd, cfg_.hidden);
+    lp.wv = load_opt_w(base + "self_attn.v_proj.weight", nkv * hd, cfg_.hidden);
+    lp.wo = load_opt_w(base + "self_attn.o_proj.weight", cfg_.hidden, nh * hd);
     lp.qn = pass(base + "self_attn.q_norm.weight");
     lp.kn = pass(base + "self_attn.k_norm.weight");
   } else {
     const int value_dim = nv * dv;
-    lp.wqkv = store_->get_int4(base + "linear_attn.in_proj_qkv.weight");
-    lp.wz = store_->get_int4(base + "linear_attn.in_proj_z.weight");
+    const int conv_dim_w = nk * dk * 2 + nv * dv;
+    lp.wqkv = load_opt_w(base + "linear_attn.in_proj_qkv.weight", conv_dim_w, cfg_.hidden);
+    lp.wz = load_opt_w(base + "linear_attn.in_proj_z.weight", value_dim, cfg_.hidden);
     // cyankiwi AWQ: in_proj_a/b 常在 ignore 中保持 BF16；out_proj 仅部分层量化
     lp.wb = load_opt_w(base + "linear_attn.in_proj_b.weight", nv, cfg_.hidden);
     lp.wa = load_opt_w(base + "linear_attn.in_proj_a.weight", nv, cfg_.hidden);
@@ -494,24 +496,25 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
       ++n_fail;
   };
   for (const auto& lp : layers_) {
+    auto try_pass = [&](const OptW& W) {
+      if (W.is_int4) {
+        try_one(W.i4);
+        return;
+      }
+      if (!W.pass || W.M <= 0 || W.K <= 0) return;
+      if (hal::cuda::prefetch_w16(W.pass, W.M, W.K, W.dt ==hal::WDtype::kF16))
+        ++n_ok;
+      else
+        ++n_fail;
+    };
     if (lp.is_full) {
-      try_one(lp.wq);
-      try_one(lp.wk);
-      try_one(lp.wv);
-      try_one(lp.wo);
+      try_pass(lp.wq);
+      try_pass(lp.wk);
+      try_pass(lp.wv);
+      try_pass(lp.wo);
     } else {
-      try_one(lp.wqkv);
-      try_one(lp.wz);
-      if (lp.wb.is_int4) try_one(lp.wb.i4);
-      if (lp.wa.is_int4) try_one(lp.wa.i4);
-      if (lp.wout.is_int4) try_one(lp.wout.i4);
-      auto try_pass = [&](const OptW& W) {
-        if (W.is_int4 || !W.pass || W.M <= 0 || W.K <= 0) return;
-        if (hal::cuda::prefetch_w16(W.pass, W.M, W.K, W.dt == hal::WDtype::kF16))
-          ++n_ok;
-        else
-          ++n_fail;
-      };
+      try_pass(lp.wqkv);
+      try_pass(lp.wz);
       try_pass(lp.wb);
       try_pass(lp.wa);
       try_pass(lp.wout);
@@ -802,18 +805,21 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     Int4Scratch::fit(sc.gate, static_cast<size_t>(n_tok) * nh * hd);
     Int4Scratch::fit(sc.attn_heads, static_cast<size_t>(n_tok) * nh * hd);
     if (n_tok > 1) {
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wq, sc.qg.data());
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wk, sc.kk.data());
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wv, sc.vv.data());
-    } else {
-      // Fused 3-GEMV: q+k+v share sc.normed → 1 launch + 1 H2D
-      const qlwc::Int4View* ws3[3] = {&lp.wq, &lp.wk, &lp.wv};
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wq, sc.qg.data());
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wk, sc.kk.data());
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wv, sc.vv.data());
+    } else if (lp.wq.is_int4 && lp.wk.is_int4 && lp.wv.is_int4) {
+      const qlwc::Int4View* ws3[3] = {&lp.wq.i4, &lp.wk.i4, &lp.wv.i4};
       float* ys3[3] = {sc.qg.data(), sc.kk.data(), sc.vv.data()};
       if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws3, ys3, 3)) {
-        gemm_view(sc.normed.data(), lp.wq, sc.qg.data());
-        gemm_view(sc.normed.data(), lp.wk, sc.kk.data());
-        gemm_view(sc.normed.data(), lp.wv, sc.vv.data());
+        gemm_opt(sc.normed.data(), lp.wq, sc.qg.data());
+        gemm_opt(sc.normed.data(), lp.wk, sc.kk.data());
+        gemm_opt(sc.normed.data(), lp.wv, sc.vv.data());
       }
+    } else {
+      gemm_opt(sc.normed.data(), lp.wq, sc.qg.data());
+      gemm_opt(sc.normed.data(), lp.wk, sc.kk.data());
+      gemm_opt(sc.normed.data(), lp.wv, sc.vv.data());
     }
     for (int t = 0; t < n_tok; ++t) {
       const int idx = (static_cast<int>(cur_pos_t_.size()) == n_tok) ? t : (pos_start + t);
@@ -873,9 +879,9 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
         sc.attn_heads[t * nh * hd + i] *= sigmoid(sc.gate[t * nh * hd + i]);
     }
     if (n_tok > 1)
-      gemm_view_batch(sc.attn_heads.data(), n_tok, lp.wo, sc.attn_out.data());
+      gemm_opt_batch(sc.attn_heads.data(), n_tok, lp.wo, sc.attn_out.data());
     else
-      gemm_view(sc.attn_heads.data(), lp.wo, sc.attn_out.data());
+      gemm_opt(sc.attn_heads.data(), lp.wo, sc.attn_out.data());
   } else {
     const int nk = cfg_.linear_num_k, nv = cfg_.linear_num_v;
     const int dk = cfg_.linear_dk, dv = cfg_.linear_dv;
@@ -894,48 +900,24 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     Int4Scratch::fit(sc.core, static_cast<size_t>(n_tok) * value_dim);
 
     if (n_tok > 1) {
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wqkv, sc.mixed.data());
-      gemm_view_batch(sc.normed.data(), n_tok, lp.wz, sc.z.data());
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wqkv, sc.mixed.data());
+      gemm_opt_batch(sc.normed.data(), n_tok, lp.wz, sc.z.data());
       gemm_opt_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
       gemm_opt_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
+    } else if (lp.wqkv.is_int4 && lp.wz.is_int4 && lp.wb.is_int4 && lp.wa.is_int4) {
+      const qlwc::Int4View* ws4[4] = {&lp.wqkv.i4, &lp.wz.i4, &lp.wb.i4, &lp.wa.i4};
+      float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
+      if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
+        gemm_opt(sc.normed.data(), lp.wqkv, sc.mixed.data());
+        gemm_opt(sc.normed.data(), lp.wz, sc.z.data());
+        gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+        gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
+      }
     } else {
-      bool in_ok = false;
-      if (resident_gpu_ && lp.ln1 && lp.wb.is_int4 && lp.wa.is_int4) {
-        const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
-        float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
-        in_ok = hal::cuda::try_rmsnorm_gemm_multi_resident(
-            x, lp.ln1, ws4, ys4, 4, H, cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16);
-      } else if (resident_gpu_ && lp.ln1) {
-        const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
-        float* ys2[2] = {sc.mixed.data(), sc.z.data()};
-        if (hal::cuda::try_rmsnorm_gemm_multi_resident(
-                x, lp.ln1, ws2, ys2, 2, H, cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16)) {
-          gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
-          gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
-          in_ok = true;
-        }
-      }
-      if (!in_ok) {
-        if (lp.wb.is_int4 && lp.wa.is_int4) {
-          const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
-          float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
-          if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws4, ys4, 4)) {
-            gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
-            gemm_view(sc.normed.data(), lp.wz, sc.z.data());
-            gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
-            gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
-          }
-        } else {
-          const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
-          float* ys2[2] = {sc.mixed.data(), sc.z.data()};
-          if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {
-            gemm_view(sc.normed.data(), lp.wqkv, sc.mixed.data());
-            gemm_view(sc.normed.data(), lp.wz, sc.z.data());
-          }
-          gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
-          gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
-        }
-      }
+      gemm_opt(sc.normed.data(), lp.wqkv, sc.mixed.data());
+      gemm_opt(sc.normed.data(), lp.wz, sc.z.data());
+      gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
+      gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
     }
 
     auto& conv_state = Lkv.linear.conv;
@@ -1087,7 +1069,7 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   auto& Lkv = cache.layer(layer);
 
   const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
-  {
+  if (lp.wqkv.is_int4 && lp.wz.is_int4) {
     const qlwc::Int4View* wb_i4 = lp.wb.is_int4 ? &lp.wb.i4 : nullptr;
     const uint16_t* wb_pass = lp.wb.is_int4 ? nullptr : lp.wb.pass;
     const qlwc::Int4View* wa_i4 = lp.wa.is_int4 ? &lp.wa.i4 : nullptr;
@@ -1095,11 +1077,11 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
     const qlwc::Int4View* wout_i4 = lp.wout.is_int4 ? &lp.wout.i4 : nullptr;
     const uint16_t* wout_pass = lp.wout.is_int4 ? nullptr : lp.wout.pass;
     if (hal::cuda::try_linear_decode_on_act(
-            lp.ln1, lp.wqkv, lp.wz, wb_i4, wb_pass, lp.wb.dt == hal::WDtype::kF16, wa_i4, wa_pass,
-            lp.wa.dt == hal::WDtype::kF16, lp.conv_w_f.data(), Lkv.linear.conv.data(), cfg_.conv_k,
-            lp.A_log_f.data(), lp.dt_bias_f.data(), Lkv.linear.recurrent.data(), lp.nrm, wout_i4,
-            wout_pass, lp.wout.dt == hal::WDtype::kF16, lp.ln2, lp.wgate, lp.wup, lp.wdown, nk, nv,
-            dk, dv, I, cfg_.rms_eps, ln_f16, ln_f16)) {
+            lp.ln1, lp.wqkv.i4, lp.wz.i4, wb_i4, wb_pass, lp.wb.dt ==hal::WDtype::kF16, wa_i4,
+            wa_pass, lp.wa.dt ==hal::WDtype::kF16, lp.conv_w_f.data(), Lkv.linear.conv.data(),
+            cfg_.conv_k, lp.A_log_f.data(), lp.dt_bias_f.data(), Lkv.linear.recurrent.data(), lp.nrm,
+            wout_i4, wout_pass, lp.wout.dt ==hal::WDtype::kF16, lp.ln2, lp.wgate, lp.wup, lp.wdown,
+            nk, nv, dk, dv, I, cfg_.rms_eps, ln_f16, ln_f16)) {
       Lkv.linear.has_state = true;
       return true;
     }
@@ -1122,12 +1104,12 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   Int4Scratch::fit(sc.normed, static_cast<size_t>(H));
 
   bool in_ok = false;
-    if (lp.wb.is_int4 && lp.wa.is_int4) {
-    const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
+  if (lp.wqkv.is_int4 && lp.wz.is_int4 && lp.wb.is_int4 && lp.wa.is_int4) {
+    const qlwc::Int4View* ws4[4] = {&lp.wqkv.i4, &lp.wz.i4, &lp.wb.i4, &lp.wa.i4};
     float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
     in_ok = hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws4, ys4, 4, cfg_.rms_eps, ln_f16);
-  } else {
-    const qlwc::Int4View* ws2[2] = {&lp.wqkv, &lp.wz};
+  } else if (lp.wqkv.is_int4 && lp.wz.is_int4) {
+    const qlwc::Int4View* ws2[2] = {&lp.wqkv.i4, &lp.wz.i4};
     float* ys2[2] = {sc.mixed.data(), sc.z.data()};
     if (hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws2, ys2, 2, cfg_.rms_eps, ln_f16)) {
       if (!hal::cuda::decode_act_sync_to_host(sc.normed.data(), H)) return false;
@@ -1232,7 +1214,8 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
   Int4Scratch::fit(sc.attn_heads, static_cast<size_t>(nh) * hd);
 
   // Residual stays on device: only Q/K/V projections D2H.
-  const qlwc::Int4View* ws3[3] = {&lp.wq, &lp.wk, &lp.wv};
+  if (!(lp.wq.is_int4 && lp.wk.is_int4 && lp.wv.is_int4)) return false;
+  const qlwc::Int4View* ws3[3] = {&lp.wq.i4, &lp.wk.i4, &lp.wv.i4};
   float* ys3[3] = {sc.qg.data(), sc.kk.data(), sc.vv.data()};
   if (!hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws3, ys3, 3, cfg_.rms_eps, ln_f16))
     return false;
@@ -1272,7 +1255,8 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
   for (int i = 0; i < nh * hd; ++i) sc.attn_heads[i] *= sigmoid(sc.gate[i]);
 
   // o_proj + residual add + MLP on device act (no residual PCIe).
-  if (!hal::cuda::try_ffn_on_act(sc.attn_heads.data(), nh * hd, &lp.wo, nullptr, false, lp.ln2,
+  if (!lp.wo.is_int4) return false;
+  if (!hal::cuda::try_ffn_on_act(sc.attn_heads.data(), nh * hd, &lp.wo.i4, nullptr, false, lp.ln2,
                                  lp.wgate, lp.wup, lp.wdown, I, cfg_.rms_eps, ln_f16)) {
     // Roll back KV slot so host fallback can rewrite the same position.
     (void)kv_pos;

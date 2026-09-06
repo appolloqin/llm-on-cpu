@@ -100,12 +100,12 @@ class Qwen35Int4Model final : public ICausalLM {
     bool is_moe = false;
     const uint16_t* ln1 = nullptr;
     const uint16_t* ln2 = nullptr;
-    // full attention
-    qlwc::Int4View wq, wk, wv, wo;
+    // full attention (INT4 or BF16 pass — AWQ often leaves attn in ignore)
+    OptW wq, wk, wv, wo;
     const uint16_t* qn = nullptr;
     const uint16_t* kn = nullptr;
-    // linear / GDN（a/b/out 在 AWQ ignore 列表里常为 BF16 透传）
-    qlwc::Int4View wqkv, wz;
+    // linear / GDN（qkv/z/a/b/out 均可 INT4 或 BF16 透传）
+    OptW wqkv, wz;
     OptW wb, wa, wout;
     const uint16_t* nrm = nullptr;
     std::vector<float> A_log_f;
