@@ -151,7 +151,10 @@ int g_sticky_k = 0;
 std::unordered_map<const void*, CacheEntry> g_cache;
 std::unordered_map<const void*, W16Pack> g_w16_pack;
 // Leave headroom for workspace / KV / act (Path A S2).
+// Only enforced for large W16 packs (lm_head); small out/a/b use FP32+cublas.
 constexpr size_t kVramHeadroom = 1536ull << 20;  // 1.5 GiB
+constexpr int kW16PackMinRows = 65536;           // lm_head-scale → pack; else FP32 inflate
+std::string g_act_lin_last_err;
 std::unordered_map<const void*, Int4Resident> g_int4_cache;
 uint64_t g_lru_tick = 0;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
@@ -708,7 +711,7 @@ bool try_enable_resident_gpu(size_t workspace_bytes) {
 }
 
 void log_resident_stats() {
-  LOG_INFO("resident_gdn: ok=%llu fail=%llu last_err=%s act=%d ffn=%llu/%llu lm=%llu lin=%llu/%llu full=%llu/%llu",
+  LOG_INFO("resident_gdn: ok=%llu fail=%llu last_err=%s act=%d ffn=%llu/%llu lm=%llu lin=%llu/%llu full=%llu/%llu lin_err=%s",
            static_cast<unsigned long long>(g_gdn_ok),
            static_cast<unsigned long long>(g_gdn_fail),
            g_gdn_last_err.empty() ? "-" : g_gdn_last_err.c_str(), g_act_valid ? 1 : 0,
@@ -718,7 +721,8 @@ void log_resident_stats() {
            static_cast<unsigned long long>(g_act_lin_ok),
            static_cast<unsigned long long>(g_act_lin_try),
            static_cast<unsigned long long>(g_act_full_ok),
-           static_cast<unsigned long long>(g_act_full_try));
+           static_cast<unsigned long long>(g_act_full_try),
+           g_act_lin_last_err.empty() ? "-" : g_act_lin_last_err.c_str());
 }
 
 bool decode_act_begin(const float* h_host, int H) {
@@ -856,6 +860,7 @@ void disable() {
   g_act_ffn_ok = g_act_ffn_try = g_act_lm_ok = 0;
   g_act_lin_ok = g_act_lin_try = 0;
   g_act_full_ok = g_act_full_try = 0;
+  g_act_lin_last_err.clear();
   g_gdn_last_err.clear();
   auto free_f = [&](float*& p) {
     if (p) {
@@ -1632,9 +1637,10 @@ bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
 }
 
 
-bool weight_budget_ok(size_t nbytes) {
+bool weight_budget_ok(size_t nbytes, bool need_headroom) {
   if (g_budget == 0) return true;
-  return g_used + nbytes + kVramHeadroom <= g_budget;
+  const size_t pad = need_headroom ? kVramHeadroom : (256ull << 20);
+  return g_used + nbytes + pad <= g_budget;
 }
 
 // Upload packed BF16/F16 weights (no FP32 inflate). Key = host pass pointer.
@@ -1647,7 +1653,8 @@ const W16Pack* ensure_w16_pack(const uint16_t* W, int M, int K, bool is_f16) {
     return &it->second;
   }
   const size_t nbytes = sizeof(uint16_t) * static_cast<size_t>(M) * static_cast<size_t>(K);
-  if (!weight_budget_ok(nbytes)) return nullptr;
+  // Large packs (lm_head) keep 1.5GiB headroom; smaller packs are uncommon (prefer FP32).
+  if (!weight_budget_ok(nbytes, M >= kW16PackMinRows)) return nullptr;
   void* d = nullptr;
   if (g_api.cudaMalloc(&d, nbytes) != kCudaSuccess) return nullptr;
   if (g_api.cudaMemcpy(d, W, nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
@@ -1665,6 +1672,36 @@ const W16Pack* ensure_w16_pack(const uint16_t* W, int M, int K, bool is_f16) {
   return &g_w16_pack[W];
 }
 
+// FP32 inflate for cublas (out/a/b). Faster than naive gemv_w16; uses more VRAM.
+const float* ensure_w16_fp32(const uint16_t* W, int M, int K, bool is_f16) {
+  if (!g_enabled || !W || M <= 0 || K <= 0) return nullptr;
+  if (M >= kMaxGpuInt4Rows) return nullptr;
+  auto it = g_cache.find(W);
+  if (it != g_cache.end()) {
+    if (it->second.M != M || it->second.K != K) return nullptr;
+    return reinterpret_cast<const float*>(it->second.d_W);
+  }
+  const size_t nbytes = sizeof(float) * static_cast<size_t>(M) * static_cast<size_t>(K);
+  if (!weight_budget_ok(nbytes, /*need_headroom=*/false)) return nullptr;
+  std::vector<float> host(static_cast<size_t>(M) * static_cast<size_t>(K));
+  for (size_t i = 0; i < host.size(); ++i)
+    host[i] = is_f16 ? f16_to_f32(W[i]) : bf16_to_f32(W[i]);
+  void* dW = nullptr;
+  if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(dW);
+    return nullptr;
+  }
+  CacheEntry e;
+  e.d_W = dW;
+  e.M = M;
+  e.K = K;
+  e.bytes = nbytes;
+  g_cache[W] = e;
+  g_used += nbytes;
+  return reinterpret_cast<const float*>(dW);
+}
+
 bool jit_gemv_w16(const uint16_t* d_W, const float* d_x, float* d_y, int M, int K, bool is_f16) {
   if (!d_W || !d_x || !d_y || M <= 0 || K <= 0) return false;
   void* fn = get_jit_kernel(kActSrc, "gemv_w16");
@@ -1675,8 +1712,43 @@ bool jit_gemv_w16(const uint16_t* d_W, const float* d_x, float* d_y, int M, int 
   return jit_launch(fn, static_cast<unsigned>(M), 1, 1, BLOCK, 1, 1, BLOCK * sizeof(float), params);
 }
 
+// Device GEMV for W16: prefer FP32+cublas for mid-size (out/a/b); pack+JIT for lm_head.
+bool gemv_w16_dev_x(const uint16_t* pass, bool is_f16w, const float* d_x, float* d_y, int M,
+                    int K) {
+  if (!pass || !d_x || !d_y || M <= 0 || K <= 0) return false;
+  if (M < kW16PackMinRows) {
+    const float* dW = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      dW = ensure_w16_fp32(pass, M, K, is_f16w);
+    }
+    if (dW) {
+      const float alpha = 1.f, beta0 = 0.f;
+      return g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, M, 1, K, &alpha, dW, K, d_x, K,
+                               &beta0, d_y, M) == kCublasSuccess;
+    }
+  }
+  const W16Pack* pack = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    pack = ensure_w16_pack(pass, M, K, is_f16w);
+    if (!pack) return false;
+  }
+  return jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), d_x, d_y, M, K, pack->is_f16);
+}
+
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {
   if (!g_enabled || !x || !W || !y || M <= 0 || K <= 0) return false;
+  // Mid-size: FP32 + cublas (decode out/a/b). Large: pack + gemv_w16 (lm_head).
+  if (M < kW16PackMinRows) {
+    const float* dW = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      dW = ensure_w16_fp32(W, M, K, is_f16);
+      if (!dW) return false;
+      return gemm_dev(dW, x, y, M, K);
+    }
+  }
   const W16Pack* pack = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -1699,6 +1771,16 @@ bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int 
   if (n == 1) return try_gemm_w16(X, W, Y, M, K, is_f16);
   constexpr int kMaxGpuBatch = 128;
   if (n > kMaxGpuBatch) return false;
+
+  if (M < kW16PackMinRows) {
+    const float* dW = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      dW = ensure_w16_fp32(W, M, K, is_f16);
+      if (!dW) return false;
+      return gemm_dev_batch(dW, X, n, Y, M, K);
+    }
+  }
 
   const W16Pack* pack = nullptr;
   {
@@ -1726,7 +1808,8 @@ bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int 
 bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16) {
   if (!g_enabled || !W || M <= 0 || K <= 0) return false;
   std::lock_guard<std::mutex> lock(g_mu);
-  return ensure_w16_pack(W, M, K, is_f16) != nullptr;
+  if (M >= kW16PackMinRows) return ensure_w16_pack(W, M, K, is_f16) != nullptr;
+  return ensure_w16_fp32(W, M, K, is_f16) != nullptr;
 }
 
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
@@ -2489,13 +2572,17 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
   void* fn_prep = get_jit_kernel(kActSrc, "gdn_prep_gb");
   void* fn_gn = get_jit_kernel(kActSrc, "rmsnorm_gated_heads");
   void* fn_gdn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
-  if (!fn_rms || !fn_multi || !fn_conv || !fn_pack || !fn_prep || !fn_gn || !fn_gdn) return false;
+  if (!fn_rms || !fn_multi || !fn_conv || !fn_pack || !fn_prep || !fn_gn || !fn_gdn) {
+    g_act_lin_last_err = "jit_kernels";
+    return false;
+  }
 
   const size_t nrm_bytes = sizeof(uint16_t) * static_cast<size_t>(value_dim);
+  // Layout: mixed,z,b,a,mixed_c,q,k,v,g,beta,A,dt,cw,nrm  — b/a/g/beta/A/dt = 6*nv
   const size_t floats_need =
-      static_cast<size_t>(conv_dim) * 2 + static_cast<size_t>(value_dim) +
-      static_cast<size_t>(nv) * 4 + static_cast<size_t>(nv) * dk * 2 +
-      static_cast<size_t>(value_dim) + static_cast<size_t>(conv_dim) * static_cast<size_t>(conv_k) +
+      static_cast<size_t>(conv_dim) * 2 + static_cast<size_t>(value_dim) * 2 +
+      static_cast<size_t>(nv) * 6 + static_cast<size_t>(nv) * dk * 2 +
+      static_cast<size_t>(conv_dim) * static_cast<size_t>(conv_k) +
       (nrm_bytes + sizeof(float) - 1) / sizeof(float);
   const size_t bytes_need = floats_need * sizeof(float);
 
@@ -2507,20 +2594,32 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
   float* d_state = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
-    if (!ensure_mlp_caps(H, I)) return false;
-    if (!ensure_mlp_core(value_dim)) return false;
+    if (!ensure_mlp_caps(H, I)) {
+      g_act_lin_last_err = "mlp_caps";
+      return false;
+    }
+    if (!ensure_mlp_core(value_dim)) {
+      g_act_lin_last_err = "mlp_core";
+      return false;
+    }
     if (bytes_need > g_lin_ws_cap || !g_lin_ws) {
       if (g_lin_ws) g_api.cudaFree(g_lin_ws);
       g_lin_ws = nullptr;
       g_lin_ws_cap = 0;
       void* v = nullptr;
-      if (g_api.cudaMalloc(&v, bytes_need) != kCudaSuccess) return false;
+      if (g_api.cudaMalloc(&v, bytes_need) != kCudaSuccess) {
+        g_act_lin_last_err = "lin_ws_malloc";
+        return false;
+      }
       g_lin_ws = static_cast<float*>(v);
       g_lin_ws_cap = bytes_need;
     }
     rq = ensure_int4_resident(wqkv);
     rz = ensure_int4_resident(wz);
-    if (!rq || !rz) return false;
+    if (!rq || !rz) {
+      g_act_lin_last_err = "qkv_z_resident";
+      return false;
+    }
     if (wb_i4) {
       rb = ensure_int4_resident(*wb_i4);
       if (!rb) return false;
@@ -2593,7 +2692,10 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
   int is_f16 = ln_is_f16 ? 1 : 0;
   const unsigned blk = 256;
   void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
-  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) {
+    g_act_lin_last_err = "rmsnorm";
+    return false;
+  }
 
   auto run_multi = [&](const Int4Resident* const* resv, float* const* ydev, int nproj,
                        int total_m) -> bool {
@@ -2630,13 +2732,7 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
   };
 
   auto gemv_w16_dev = [&](const uint16_t* pass, bool is_f16w, float* d_y, int M) -> bool {
-    const W16Pack* pack = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(g_mu);
-      pack = ensure_w16_pack(pass, M, H, is_f16w);
-      if (!pack) return false;
-    }
-    return jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), g_mlp_norm, d_y, M, H, pack->is_f16);
+    return gemv_w16_dev_x(pass, is_f16w, g_mlp_norm, d_y, M, H);
   };
 
   if (rb && ra) {
@@ -2646,29 +2742,41 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
       return false;
     const Int4Resident* resv[4] = {rq, rz, rb, ra};
     float* ydev[4] = {d_mixed, d_z, d_b, d_a};
-    if (!run_multi(resv, ydev, 4, rq->M + rz->M + rb->M + ra->M)) return false;
+    if (!run_multi(resv, ydev, 4, rq->M + rz->M + rb->M + ra->M)) {
+      g_act_lin_last_err = "multi4";
+      return false;
+    }
   } else {
     if (rq->K != rz->K || rq->ng != rz->ng || rq->gs != rz->gs || rq->is_awq != rz->is_awq)
       return false;
     const Int4Resident* resv[2] = {rq, rz};
     float* ydev[2] = {d_mixed, d_z};
-    if (!run_multi(resv, ydev, 2, rq->M + rz->M)) return false;
+    if (!run_multi(resv, ydev, 2, rq->M + rz->M)) {
+      g_act_lin_last_err = "multi2";
+      return false;
+    }
     if (rb) {
       if (!jit_gemv_int4(static_cast<const uint8_t*>(rb->d_qweight),
                          static_cast<const uint16_t*>(rb->d_scales),
                          static_cast<const uint16_t*>(rb->d_zeros), g_mlp_norm, d_b, rb->M, rb->K,
-                         rb->ng, rb->gs, rb->is_awq))
+                         rb->ng, rb->gs, rb->is_awq)) {
+        g_act_lin_last_err = "b_int4";
         return false;
+      }
     } else if (!gemv_w16_dev(wb_pass, wb_is_f16, d_b, nv)) {
+      g_act_lin_last_err = "b_w16";
       return false;
     }
     if (ra) {
       if (!jit_gemv_int4(static_cast<const uint8_t*>(ra->d_qweight),
                          static_cast<const uint16_t*>(ra->d_scales),
                          static_cast<const uint16_t*>(ra->d_zeros), g_mlp_norm, d_a, ra->M, ra->K,
-                         ra->ng, ra->gs, ra->is_awq))
+                         ra->ng, ra->gs, ra->is_awq)) {
+        g_act_lin_last_err = "a_int4";
         return false;
+      }
     } else if (!gemv_w16_dev(wa_pass, wa_is_f16, d_a, nv)) {
+      g_act_lin_last_err = "a_w16";
       return false;
     }
   }
@@ -2676,35 +2784,51 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
   const unsigned conv_grid = (static_cast<unsigned>(conv_dim) + blk - 1) / blk;
   int conv_dim_i = conv_dim;
   void* prm_conv[] = {&d_mixed, &d_conv_st, &d_cw, &d_mixed_c, &conv_dim_i};
-  if (!jit_launch(fn_conv, conv_grid, 1, 1, blk, 1, 1, 0, prm_conv)) return false;
+  if (!jit_launch(fn_conv, conv_grid, 1, 1, blk, 1, 1, 0, prm_conv)) {
+    g_act_lin_last_err = "conv";
+    return false;
+  }
 
   const int pack_n = (nv * dk > value_dim) ? nv * dk : value_dim;
   const unsigned pack_grid = (static_cast<unsigned>(pack_n) + blk - 1) / blk;
   int nk_i = nk, nv_i = nv, dk_i = dk, dv_i = dv;
   void* prm_pack[] = {&d_mixed_c, &d_q, &d_k, &d_v, &nk_i, &nv_i, &dk_i, &dv_i};
-  if (!jit_launch(fn_pack, pack_grid, 1, 1, blk, 1, 1, 0, prm_pack)) return false;
+  if (!jit_launch(fn_pack, pack_grid, 1, 1, blk, 1, 1, 0, prm_pack)) {
+    g_act_lin_last_err = "pack";
+    return false;
+  }
 
   const unsigned prep_grid = (static_cast<unsigned>(nv) + blk - 1) / blk;
   void* prm_prep[] = {&d_b, &d_a, &d_A, &d_dt, &d_beta, &d_g, &nv_i};
-  if (!jit_launch(fn_prep, prep_grid, 1, 1, blk, 1, 1, 0, prm_prep)) return false;
+  if (!jit_launch(fn_prep, prep_grid, 1, 1, blk, 1, 1, 0, prm_prep)) {
+    g_act_lin_last_err = "prep";
+    return false;
+  }
 
   float scale = 1.f / sqrtf(static_cast<float>(dk));
   float* d_out = g_mlp_core;
   void* prm_gdn[] = {&d_q, &d_k, &d_v, &d_g, &d_beta, &d_state, &d_out, &dk_i, &dv_i, &scale};
   if (!jit_launch(fn_gdn, static_cast<unsigned>(nv), 1, 1, static_cast<unsigned>(dv), 1, 1, 0,
-                  prm_gdn))
+                  prm_gdn)) {
+    g_act_lin_last_err = "gdn";
     return false;
+  }
   ++g_gdn_ok;
 
   int nrm_f16 = nrm_is_f16 ? 1 : 0;
   int hd = dv;
   void* prm_gn[] = {&d_out, &d_z, &d_nrm, &d_out, &hd, &eps, &nrm_f16};
-  if (!jit_launch(fn_gn, static_cast<unsigned>(nv), 1, 1, blk, 1, 1, blk * sizeof(float), prm_gn))
+  if (!jit_launch(fn_gn, static_cast<unsigned>(nv), 1, 1, blk, 1, 1, blk * sizeof(float), prm_gn)) {
+    g_act_lin_last_err = "gated_norm";
     return false;
+  }
 
   if (!try_ffn_on_act(nullptr, value_dim, wout_i4, wout_pass, wout_is_f16, ln2, wgate, wup, wdown, I,
-                      eps, ln_is_f16))
+                      eps, ln_is_f16)) {
+    g_act_lin_last_err = "ffn";
     return false;
+  }
+  g_act_lin_last_err.clear();
   ++g_act_lin_ok;
   return true;
 }
@@ -2737,6 +2861,7 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
   const Int4Resident* rg = nullptr;
   const Int4Resident* ru = nullptr;
   const Int4Resident* rd = nullptr;
+  const float* d_wout_fp32 = nullptr;
   const W16Pack* d_wout_pack = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -2746,10 +2871,12 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
       ro = ensure_int4_resident(*wout_i4);
       if (!ro) return false;
     } else {
-      // Path A S2: packed BF16/F16 (no FP32 inflate).
-      const W16Pack* pack = ensure_w16_pack(wout_pass, H, core_dim, wout_is_f16);
-      if (!pack) return false;
-      d_wout_pack = pack;
+      // Prefer FP32+cublas for out_proj; pack only if inflate won't fit.
+      d_wout_fp32 = ensure_w16_fp32(wout_pass, H, core_dim, wout_is_f16);
+      if (!d_wout_fp32) {
+        d_wout_pack = ensure_w16_pack(wout_pass, H, core_dim, wout_is_f16);
+        if (!d_wout_pack) return false;
+      }
     }
     rg = ensure_int4_resident(wgate);
     ru = ensure_int4_resident(wup);
@@ -2770,6 +2897,13 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
                        static_cast<const uint16_t*>(ro->d_scales),
                        static_cast<const uint16_t*>(ro->d_zeros), g_mlp_core, g_mlp_down, ro->M,
                        ro->K, ro->ng, ro->gs, ro->is_awq))
+      return false;
+  } else if (d_wout_fp32) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_xy(H, core_dim, 1)) return false;
+    const float alpha = 1.f, beta = 0.f;
+    if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, H, 1, core_dim, &alpha, d_wout_fp32,
+                          core_dim, g_mlp_core, core_dim, &beta, g_mlp_down, H) != kCublasSuccess)
       return false;
   } else {
     if (!d_wout_pack) return false;
