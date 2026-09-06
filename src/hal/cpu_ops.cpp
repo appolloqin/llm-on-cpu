@@ -54,9 +54,10 @@ void f32_to_bf16_buf(const float* src, uint16_t* dst, size_t n) {
   for (size_t i = 0; i < n; ++i) dst[i] = f32_to_bf16(src[i]);
 }
 
-void gemm_bias_free(const float* x, const uint16_t* W, float* y, int M, int K, WDtype dt) {
+void gemm_bias_free(const float* x, const uint16_t* W, float* y, int M, int K, WDtype dt,
+                    bool allow_gpu) {
   // M5: optional CUDA path — inactive unless hal::cuda::enable(); pure_cpu identical.
-  if (cuda::try_gemm_w16(x, W, y, M, K, dt == WDtype::kF16)) return;
+  if (allow_gpu && cuda::try_gemm_w16(x, W, y, M, K, dt == WDtype::kF16)) return;
 #if defined(LLMOC_ENABLE_AVX2)
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (M >= 128)

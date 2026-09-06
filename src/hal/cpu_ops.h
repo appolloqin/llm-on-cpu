@@ -58,8 +58,9 @@ void bf16_to_f32_buf(const uint16_t* src, float* dst, size_t n);
 void f32_to_bf16_buf(const float* src, uint16_t* dst, size_t n);
 
 // y[M] = x[K] @ W[M,K]^T  (PyTorch Linear); W 为 BF16 或 F16
+// allow_gpu=false forces host AVX (MoE lm_head / expert bisect; avoids sticky logits).
 void gemm_bias_free(const float* x, const uint16_t* W, float* y, int M, int K,
-                    WDtype dt = WDtype::kBF16);
+                    WDtype dt = WDtype::kBF16, bool allow_gpu = true);
 // Prefill: Y[n,M] = X[n,K] @ W[M,K]^T — weight-stationary (reuse each W row across tokens)
 void gemm_bias_free_batch(const float* X, int n, const uint16_t* W, float* Y, int M, int K,
                           WDtype dt = WDtype::kBF16);

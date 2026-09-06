@@ -39,6 +39,16 @@ float softplus(float x) {
 }
 float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 
+// MoE: default host experts (GPU INT4 upload/D2H thrash ≈3.5 tok/s + sticky logits risk).
+// Set LLMOC_MOE_GPU_EXPERTS=1 to re-enable try_gemm_int4 for routed experts.
+bool moe_gpu_experts_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("LLMOC_MOE_GPU_EXPERTS");
+    return e && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 // decode 热路径复用缓冲，避免每层 vector 分配
 struct Int4Scratch {
   std::vector<float> normed, attn_out, residual;
@@ -244,6 +254,10 @@ void Qwen35Int4Model::build_layer_packs() {
   LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d moe=%d experts=%d topk=%d",
            cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
            cfg_.is_moe ? 1 : 0, cfg_.n_experts, cfg_.topk);
+  if (cfg_.is_moe) {
+    LOG_INFO("Qwen35Int4 MoE path: host_experts=%d host_lm_head=1 stream_act=0 (set LLMOC_MOE_GPU_EXPERTS=1 to try GPU experts)",
+             moe_gpu_experts_enabled() ? 0 : 1);
+  }
 }
 
 void Qwen35Int4Model::build_global_packs() {
@@ -429,7 +443,8 @@ void Qwen35Int4Model::gemm_w(const float* x, const std::string& wname, float* y,
   if (is_int4(wname)) {
     if (store_->lazy()) store_->ensure(wname);
     const qlwc::Int4View W = store_->get_int4(wname);
-    if (hal::cuda::enabled() && hal::cuda::try_gemm_int4(x, W, y)) return;
+    const bool allow_gpu = !cfg_.is_moe || moe_gpu_experts_enabled();
+    if (allow_gpu && hal::cuda::enabled() && hal::cuda::try_gemm_int4(x, W, y)) return;
     hal::gemm_int4(x, W, y);
   } else {
     (void)M;
@@ -459,8 +474,7 @@ void Qwen35Int4Model::gemm_opt(const float* x, const OptW& W, float* y) {
     return;
   }
   if (!W.pass) throw std::runtime_error("gemm_opt: missing passthrough weight");
-  if (hal::cuda::enabled() &&
-      hal::cuda::try_gemm_w16(x, W.pass, y, W.M, W.K, W.dt == hal::WDtype::kF16)) {
+  if (hal::cuda::enabled() && hal::cuda::try_gemm_w16(x, W.pass, y, W.M, W.K, W.dt == hal::WDtype::kF16)) {
     return;
   }
   hal::gemm_bias_free(x, W.pass, y, W.M, W.K, W.dt);
@@ -478,8 +492,7 @@ void Qwen35Int4Model::gemm_opt_batch(const float* X, int n, const OptW& W, float
     return;
   }
   // Weight-stationary batch (serial gemm_opt re-reads full BF16 out_proj every token).
-  if (hal::cuda::enabled() &&
-      hal::cuda::try_gemm_w16_batch(X, n, W.pass, Y, W.M, W.K, W.dt == hal::WDtype::kF16)) {
+  if (hal::cuda::enabled() && hal::cuda::try_gemm_w16_batch(X, n, W.pass, Y, W.M, W.K, W.dt == hal::WDtype::kF16)) {
     return;
   }
   hal::gemm_bias_free_batch(X, n, W.pass, Y, W.M, W.K, W.dt);
@@ -741,38 +754,92 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
   if (wsum < 1e-12) wsum = 1.0;
 
   std::fill(down_acc, down_acc + H, 0.f);
-  std::vector<float> g(static_cast<size_t>(I)), u(static_cast<size_t>(I)), mid(static_cast<size_t>(I)),
-      down(static_cast<size_t>(H));
   const std::string base = prefix_ + "layers." + std::to_string(layer) + ".mlp.experts.";
+  const bool gpu_exp = moe_gpu_experts_enabled();
+
+  // Ensure expert tensors on this thread before any OpenMP region (store ensure not parallel-safe).
   for (int i = 0; i < K; ++i) {
-    const int e = order[i];
-    const float ww = static_cast<float>(logits[e] / wsum);
+    const int e = order[static_cast<size_t>(i)];
     const std::string eb = base + std::to_string(e) + ".";
-    gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
-    gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
+    if (store_->lazy()) {
+      store_->ensure(eb + "gate_proj.weight");
+      store_->ensure(eb + "up_proj.weight");
+      store_->ensure(eb + "down_proj.weight");
+    }
+  }
+
+  if (!gpu_exp) {
+#if defined(_OPENMP)
+#pragma omp parallel
+    {
+      std::vector<float> g(static_cast<size_t>(I)), u(static_cast<size_t>(I)),
+          mid(static_cast<size_t>(I)), down(static_cast<size_t>(H));
+      std::vector<float> local(static_cast<size_t>(H), 0.f);
+#pragma omp for schedule(static)
+      for (int i = 0; i < K; ++i) {
+        const int e = order[static_cast<size_t>(i)];
+        const float ww = static_cast<float>(logits[static_cast<size_t>(e)] / wsum);
+        const std::string eb = base + std::to_string(e) + ".";
+        gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
+        gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
+        hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
+        gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
+        for (int d = 0; d < H; ++d) local[static_cast<size_t>(d)] += ww * down[static_cast<size_t>(d)];
+      }
+#pragma omp critical
+      for (int d = 0; d < H; ++d) down_acc[d] += local[static_cast<size_t>(d)];
+    }
+#else
+    std::vector<float> g(static_cast<size_t>(I)), u(static_cast<size_t>(I)),
+        mid(static_cast<size_t>(I)), down(static_cast<size_t>(H));
+    for (int i = 0; i < K; ++i) {
+      const int e = order[static_cast<size_t>(i)];
+      const float ww = static_cast<float>(logits[static_cast<size_t>(e)] / wsum);
+      const std::string eb = base + std::to_string(e) + ".";
+      gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
+      gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
     hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
-    gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
-    for (int d = 0; d < H; ++d) down_acc[d] += ww * down[d];
+      gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
+      for (int d = 0; d < H; ++d) down_acc[d] += ww * down[static_cast<size_t>(d)];
+    }
+#endif
+  } else {
+    std::vector<float> g(static_cast<size_t>(I)), u(static_cast<size_t>(I)),
+        mid(static_cast<size_t>(I)), down(static_cast<size_t>(H));
+    for (int i = 0; i < K; ++i) {
+      const int e = order[static_cast<size_t>(i)];
+      const float ww = static_cast<float>(logits[static_cast<size_t>(e)] / wsum);
+      const std::string eb = base + std::to_string(e) + ".";
+      gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
+      gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
+    hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
+      gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
+      for (int d = 0; d < H; ++d) down_acc[d] += ww * down[static_cast<size_t>(d)];
+    }
   }
 
   if (lp.shared_gate.pass || lp.shared_gate.is_int4) {
     const int Is = lp.shared_gate.M > 0 ? lp.shared_gate.M : I;
-    if (static_cast<int>(g.size()) < Is) {
-      g.resize(static_cast<size_t>(Is));
-      u.resize(static_cast<size_t>(Is));
-      mid.resize(static_cast<size_t>(Is));
-    }
-    gemm_opt(normed, lp.shared_gate, g.data());
-    gemm_opt(normed, lp.shared_up, u.data());
+    std::vector<float> g(static_cast<size_t>(Is)), u(static_cast<size_t>(Is)),
+        mid(static_cast<size_t>(Is)), down(static_cast<size_t>(H));
+    if (!gpu_exp && lp.shared_gate.is_int4 && lp.shared_up.is_int4 && lp.shared_down.is_int4) {
+    hal::gemm_int4(normed, lp.shared_gate.i4, g.data());
+    hal::gemm_int4(normed, lp.shared_up.i4, u.data());
     hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
-    gemm_opt(mid.data(), lp.shared_down, down.data());
+    hal::gemm_int4(mid.data(), lp.shared_down.i4, down.data());
+    } else {
+      gemm_opt(normed, lp.shared_gate, g.data());
+      gemm_opt(normed, lp.shared_up, u.data());
+    hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
+      gemm_opt(mid.data(), lp.shared_down, down.data());
+    }
     float scale = 1.f;
     if (lp.shared_expert_gate.pass || lp.shared_expert_gate.is_int4) {
       float gate_logit = 0.f;
       gemm_opt(normed, lp.shared_expert_gate, &gate_logit);
       scale = sigmoid(gate_logit);
     }
-    for (int d = 0; d < H; ++d) down_acc[d] += scale * down[d];
+    for (int d = 0; d < H; ++d) down_acc[d] += scale * down[static_cast<size_t>(d)];
   }
 }
 
@@ -996,8 +1063,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       }
     }
     // Fuse wout + MLP on device (linear decode): skip host residual/mlp tail.
-    if (n_tok == 1 && !lp.is_moe && resident_gpu_ && lp.wout.is_int4 && lp.ln2 &&
-        hal::cuda::try_out_mlp_resident(sc.residual.data(), sc.core.data(), lp.wout.i4, lp.ln2,
+    if (n_tok == 1 && !lp.is_moe && resident_gpu_ && lp.wout.is_int4 && lp.ln2 && hal::cuda::try_out_mlp_resident(sc.residual.data(), sc.core.data(), lp.wout.i4, lp.ln2,
                                         lp.wgate, lp.wup, lp.wdown, x, H, I, cfg_.rms_eps,
                                         pass_wd_ == hal::WDtype::kF16)) {
       return;
@@ -1025,8 +1091,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   Int4Scratch::fit(sc.uproj, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.mid, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.down, static_cast<size_t>(n_tok) * H);
-  if (n_tok == 1 && resident_gpu_ && lp.ln2 &&
-     hal::cuda::try_mlp_decode_resident(x, lp.ln2, lp.wgate, lp.wup, lp.wdown, x, H, I,
+  if (n_tok == 1 && resident_gpu_ && lp.ln2 && hal::cuda::try_mlp_decode_resident(x, lp.ln2, lp.wgate, lp.wup, lp.wdown, x, H, I,
                                          cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16)) {
     // x already = residual + down
   } else if (n_tok > 1) {
@@ -1291,9 +1356,9 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
   for (int t = 0; t < n; ++t) embed(tokens[t], x + t * H);
   prepare_mrope_positions(tokens, is_prefill);
 
-  const bool stream_act = resident_gpu_ && !is_prefill && n == 1 &&
-                         hal::cuda::resident_gpu_enabled() &&
-                         hal::cuda::decode_act_begin(x, H);
+  // MoE skips Path-A act stream: fused MLP unavailable; sync sandwich + GPU lm_head
+  // caused sticky garbage (e.g. wall of "Ò") and wasted PCIe every layer.
+  const bool stream_act = !cfg_.is_moe && resident_gpu_ && !is_prefill && n == 1 && hal::cuda::resident_gpu_enabled() && hal::cuda::decode_act_begin(x, H);
 
   double lin = 0, full = 0;
   const bool time_layers = (ms_lin && ms_full);
@@ -1402,7 +1467,8 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   prefix_logits_.clear();
   logits.resize(static_cast<size_t>(V));
   bool lm_from_act = false;
-  if (hal::cuda::enabled() && hal::cuda::decode_act_valid()) {
+  // MoE: force host lm_head (GPU vocab GEMV previously produced sticky garbage tokens).
+  if (!cfg_.is_moe && hal::cuda::enabled() && hal::cuda::decode_act_valid()) {
     const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
     if (lm_is_int4_) {
       lm_from_act = hal::cuda::try_lm_head_int4_from_act(final_norm_, lm_int4_, logits.data(),
@@ -1415,7 +1481,7 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   if (!lm_from_act) {
     if (lm_is_int4_) {
       bool gpu_ok = false;
-      if (hal::cuda::enabled()) {
+      if (!cfg_.is_moe && hal::cuda::enabled()) {
         gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
       }
       if (!gpu_ok) {
@@ -1428,15 +1494,15 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
                          _MM_HINT_T0);
         }
 #endif
-        hal::gemm_int4(h.data(), lm_int4_, logits.data());
+      hal::gemm_int4(h.data(), lm_int4_, logits.data());
       }
     } else {
-      if (hal::cuda::enabled() && lm_pass_ &&
-          hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
+      if (!cfg_.is_moe && hal::cuda::enabled() && lm_pass_ && hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
                                   pass_wd_ == hal::WDtype::kF16)) {
         /* GPU resident W16 cublas SGEMM */
       } else {
-        hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_);
+      hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_,
+                            /*allow_gpu=*/!cfg_.is_moe);
       }
     }
   }
@@ -1461,7 +1527,8 @@ bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
   Int4Scratch::fit(sc.last, static_cast<size_t>(H));
   forward_to_hidden(tokens, cache, false, sc.last.data());
   // 先尝试 GPU resident INT4 (JIT gemv_int4 M=248320 ~3ms); 失败回退 CPU AVX2 24ms
-  if (hal::cuda::enabled()) {
+  // MoE: skip GPU lm_head (sticky garbage risk).
+  if (!cfg_.is_moe && hal::cuda::enabled()) {
     Int4Scratch::fit(sc.logits, lm_int4_.M);
     if (hal::cuda::try_gemm_int4(sc.last.data(), lm_int4_, sc.logits.data())) {
       const float* lp = sc.logits.data();
@@ -1592,7 +1659,8 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
 #endif
         hal::gemm_int4(h.data(), lm_int4_, dest);
       } else {
-        hal::gemm_bias_free(h.data(), lm_pass_, dest, V, H, pass_wd_);
+        hal::gemm_bias_free(h.data(), lm_pass_, dest, V, H, pass_wd_,
+                            /*allow_gpu=*/!cfg_.is_moe);
       }
       if (t == n - 1) last_hidden_ = h;
     }
