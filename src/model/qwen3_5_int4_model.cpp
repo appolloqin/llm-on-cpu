@@ -430,7 +430,7 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
     try_one(lp.wup);
     try_one(lp.wdown);
   }
-  // lm_head resident: INT4 走 ensure_int4_resident, BF16 pass-through 走 prefetch_w16 (FP32 → g_cache, M=K=vocab*hidden)
+  // lm_head resident: INT4 → ensure_int4_resident; BF16 pass → packed W16 (no FP32 inflate)
   LOG_INFO("Qwen35Int4: warm_gpu_int4 layers=%d fail=%d used=%.2fGiB / budget=%.2fGiB (lm_int4=%d lm_pass=%d tie=%d)",
            n_ok, n_fail, hal::cuda::vram_used() / double(1ull << 30),
            hal::cuda::vram_budget() / double(1ull << 30), lm_is_int4_ ? 1 : 0,
@@ -438,12 +438,12 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
   if (lm_is_int4_) {
     try_one(lm_int4_);
   } else if (lm_pass_) {
-    const size_t mbytes = static_cast<size_t>(cfg_.vocab) * cfg_.hidden * 4;
+    const size_t mbytes = static_cast<size_t>(cfg_.vocab) * cfg_.hidden * 2;
     if (hal::cuda::prefetch_w16(lm_pass_, cfg_.vocab, cfg_.hidden,
                                 pass_wd_ == hal::WDtype::kF16)) {
-      LOG_INFO("Qwen35Int4: lm_head W16 prefetch OK (%.2fGiB)", mbytes / double(1ull << 30));
+      LOG_INFO("Qwen35Int4: lm_head W16-pack prefetch OK (%.2fGiB)", mbytes / double(1ull << 30));
     } else {
-      LOG_INFO("Qwen35Int4: lm_head W16 prefetch FAILED (%.2fGiB needed; used=%.2fGiB budget=%.2fGiB)",
+      LOG_INFO("Qwen35Int4: lm_head W16-pack prefetch FAILED (%.2fGiB needed; used=%.2fGiB budget=%.2fGiB)",
                mbytes / double(1ull << 30), hal::cuda::vram_used() / double(1ull << 30),
                hal::cuda::vram_budget() / double(1ull << 30));
     }
@@ -916,6 +916,28 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   auto& sc = scratch();
   auto& Lkv = cache.layer(layer);
 
+  const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+  {
+    const qlwc::Int4View* wb_i4 = lp.wb.is_int4 ? &lp.wb.i4 : nullptr;
+    const uint16_t* wb_pass = lp.wb.is_int4 ? nullptr : lp.wb.pass;
+    const qlwc::Int4View* wa_i4 = lp.wa.is_int4 ? &lp.wa.i4 : nullptr;
+    const uint16_t* wa_pass = lp.wa.is_int4 ? nullptr : lp.wa.pass;
+    const qlwc::Int4View* wout_i4 = lp.wout.is_int4 ? &lp.wout.i4 : nullptr;
+    const uint16_t* wout_pass = lp.wout.is_int4 ? nullptr : lp.wout.pass;
+    if (hal::cuda::try_linear_decode_on_act(
+            lp.ln1, lp.wqkv, lp.wz, wb_i4, wb_pass, lp.wb.dt == hal::WDtype::kF16, wa_i4, wa_pass,
+            lp.wa.dt == hal::WDtype::kF16, lp.conv_w_f.data(), Lkv.linear.conv.data(), cfg_.conv_k,
+            lp.A_log_f.data(), lp.dt_bias_f.data(), Lkv.linear.recurrent.data(), lp.nrm, wout_i4,
+            wout_pass, lp.wout.dt == hal::WDtype::kF16, lp.ln2, lp.wgate, lp.wup, lp.wdown, nk, nv,
+            dk, dv, I, cfg_.rms_eps, ln_f16, ln_f16)) {
+      Lkv.linear.has_state = true;
+      return true;
+    }
+  }
+
+  // Fallback to host sandwich: pull device-owned conv/GDN state back if present.
+  hal::cuda::flush_conv_state_to_host(Lkv.linear.conv.data(), conv_dim, cfg_.conv_k);
+  hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
   Int4Scratch::fit(sc.mixed, static_cast<size_t>(conv_dim));
   Int4Scratch::fit(sc.z, static_cast<size_t>(value_dim));
   Int4Scratch::fit(sc.b, static_cast<size_t>(nv));
@@ -930,8 +952,7 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   Int4Scratch::fit(sc.normed, static_cast<size_t>(H));
 
   bool in_ok = false;
-  const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
-  if (lp.wb.is_int4 && lp.wa.is_int4) {
+    if (lp.wb.is_int4 && lp.wa.is_int4) {
     const qlwc::Int4View* ws4[4] = {&lp.wqkv, &lp.wz, &lp.wb.i4, &lp.wa.i4};
     float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
     in_ok = hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws4, ys4, 4, cfg_.rms_eps, ln_f16);
@@ -1018,6 +1039,75 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
                                    lp.wdown, I, cfg_.rms_eps, ln_f16);
 }
 
+bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int pos_start) {
+  if (!resident_gpu_ || !hal::cuda::decode_act_valid()) return false;
+  const auto& lp = layers_[layer];
+  if (!lp.is_full || !lp.ln1 || !lp.ln2) return false;
+  hal::cuda::note_full_attn_try();
+
+  const int I = cfg_.intermediate;
+  const int nh = cfg_.n_heads, nkv = cfg_.n_kv, hd = cfg_.head_dim;
+  const int rotary_dim = static_cast<int>(hd * cfg_.partial_rotary) / 2 * 2;
+  const float scale = 1.f / std::sqrt(static_cast<float>(hd));
+  const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+  auto& sc = scratch();
+  auto& Lkv = cache.layer(layer);
+
+  Int4Scratch::fit(sc.qg, static_cast<size_t>(nh) * hd * 2);
+  Int4Scratch::fit(sc.kk, static_cast<size_t>(nkv) * hd);
+  Int4Scratch::fit(sc.vv, static_cast<size_t>(nkv) * hd);
+  Int4Scratch::fit(sc.qq, static_cast<size_t>(nh) * hd);
+  Int4Scratch::fit(sc.gate, static_cast<size_t>(nh) * hd);
+  Int4Scratch::fit(sc.attn_heads, static_cast<size_t>(nh) * hd);
+
+  // Residual stays on device: only Q/K/V projections D2H.
+  const qlwc::Int4View* ws3[3] = {&lp.wq, &lp.wk, &lp.wv};
+  float* ys3[3] = {sc.qg.data(), sc.kk.data(), sc.vv.data()};
+  if (!hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws3, ys3, 3, cfg_.rms_eps, ln_f16))
+    return false;
+
+  const int idx = (static_cast<int>(cur_pos_t_.size()) == 1) ? 0 : pos_start;
+  const int pt = (idx < static_cast<int>(cur_pos_t_.size())) ? cur_pos_t_[idx] : pos_start;
+  const int ph = (idx < static_cast<int>(cur_pos_h_.size())) ? cur_pos_h_[idx] : pt;
+  const int pw = (idx < static_cast<int>(cur_pos_w_.size())) ? cur_pos_w_[idx] : pt;
+
+  for (int h = 0; h < nh; ++h) {
+    float* qh = sc.qq.data() + h * hd;
+    float* gh = sc.gate.data() + h * hd;
+    const float* src = sc.qg.data() + h * hd * 2;
+    std::memcpy(qh, src, sizeof(float) * hd);
+    std::memcpy(gh, src + hd, sizeof(float) * hd);
+    hal::rmsnorm(qh, lp.qn, qh, hd, cfg_.rms_eps, pass_wd_, true);
+    hal::apply_mrope_freqs(qh, hd, rotary_dim, pt, ph, pw, cfg_.rope_theta, mrope_section_,
+                           mrope_interleaved_);
+  }
+  for (int h = 0; h < nkv; ++h) {
+    float* kh = sc.kk.data() + h * hd;
+    float* vh = sc.vv.data() + h * hd;
+    hal::rmsnorm(kh, lp.kn, kh, hd, cfg_.rms_eps, pass_wd_, true);
+    hal::apply_mrope_freqs(kh, hd, rotary_dim, pt, ph, pw, cfg_.rope_theta, mrope_section_,
+                           mrope_interleaved_);
+    float* kdst = Lkv.k.data() + (static_cast<size_t>(h) * cache.max_seq() + Lkv.seq) * hd;
+    float* vdst = Lkv.v.data() + (static_cast<size_t>(h) * cache.max_seq() + Lkv.seq) * hd;
+    std::memcpy(kdst, kh, sizeof(float) * hd);
+    std::memcpy(vdst, vh, sizeof(float) * hd);
+  }
+
+  const int seq_len = Lkv.seq + 1;
+  hal::attn_decode_one(sc.qq.data(), Lkv.k.data(), Lkv.v.data(), sc.attn_heads.data(), nh, nkv, hd,
+                       seq_len, cache.max_seq(), scale);
+  Lkv.seq += 1;
+
+  for (int i = 0; i < nh * hd; ++i) sc.attn_heads[i] *= sigmoid(sc.gate[i]);
+
+  // o_proj + residual add + MLP on device act (no residual PCIe).
+  if (!hal::cuda::try_ffn_on_act(sc.attn_heads.data(), nh * hd, &lp.wo, nullptr, false, lp.ln2,
+                                 lp.wgate, lp.wup, lp.wdown, I, cfg_.rms_eps, ln_f16))
+    return false;
+  hal::cuda::note_full_attn_ok();
+  return true;
+}
+
 void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache,
                                         bool is_prefill, float* h_out, double* ms_lin,
                                         double* ms_full) {
@@ -1073,13 +1163,14 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
         return;
       }
       if (stream_act && is_full) {
+        if (layer_forward_full_act(L, cache, pos_start)) return;
         if (!hal::cuda::decode_act_sync_to_host(x, H)) {
-         hal::cuda::decode_act_invalidate();
+          hal::cuda::decode_act_invalidate();
           layer_forward(L, x, cache, pos_start, n, is_prefill);
           return;
         }
         layer_forward(L, x, cache, pos_start, n, is_prefill);
-       hal::cuda::decode_act_load_from_host(x, H);
+        hal::cuda::decode_act_load_from_host(x, H);
         return;
       }
       layer_forward(L, x, cache, pos_start, n, is_prefill);

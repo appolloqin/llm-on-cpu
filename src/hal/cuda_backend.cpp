@@ -109,6 +109,15 @@ struct CacheEntry {
   size_t bytes = 0;
 };
 
+// Packed BF16/F16 weights on device (Path A S2 — half the VRAM of FP32 inflate).
+struct W16Pack {
+  void* d_w = nullptr;  // uint16_t[M*K]
+  int M = 0;
+  int K = 0;
+  bool is_f16 = false;
+  size_t bytes = 0;
+};
+
 // INT4 量化形态驻留条目: 权重按 packed uint8 + fp16 scales/zeros 上传, GEMV 时 kernel 内反量化。
 // bytes 计入 VRAM 用量。预算按量化后字节数, 比 FP32(M*K*4) 省 8x。
 struct Int4Resident {
@@ -140,6 +149,9 @@ int g_cap_n = 0;  // batch columns for X/Y
 const float* g_sticky_x = nullptr;  // skip repeat H2D of same host x when resident_gpu
 int g_sticky_k = 0;
 std::unordered_map<const void*, CacheEntry> g_cache;
+std::unordered_map<const void*, W16Pack> g_w16_pack;
+// Leave headroom for workspace / KV / act (Path A S2).
+constexpr size_t kVramHeadroom = 1536ull << 20;  // 1.5 GiB
 std::unordered_map<const void*, Int4Resident> g_int4_cache;
 uint64_t g_lru_tick = 0;
 std::unordered_map<void*, void*> g_jit_modules;  // CUfunction -> CUmodule (JIT 句柄, disable 时卸载)
@@ -173,6 +185,15 @@ int g_mlp_cap_core = 0;
 float* g_act_h = nullptr;
 int g_act_h_dim = 0;
 bool g_act_valid = false;
+
+// Linear-attn decode workspace (Path A: stay on device)
+float* g_lin_ws = nullptr;
+size_t g_lin_ws_cap = 0;
+std::unordered_map<const float*, float*> g_conv_state;  // host conv ptr → device state
+uint64_t g_act_lin_ok = 0;
+uint64_t g_act_lin_try = 0;
+uint64_t g_act_full_ok = 0;
+uint64_t g_act_full_try = 0;
 
 // Prefill attention scratch (host↔device per call; only used when cuda enabled)
 void* g_attn_q = nullptr;
@@ -687,13 +708,17 @@ bool try_enable_resident_gpu(size_t workspace_bytes) {
 }
 
 void log_resident_stats() {
-  LOG_INFO("resident_gdn: ok=%llu fail=%llu last_err=%s act=%d ffn=%llu/%llu lm=%llu",
+  LOG_INFO("resident_gdn: ok=%llu fail=%llu last_err=%s act=%d ffn=%llu/%llu lm=%llu lin=%llu/%llu full=%llu/%llu",
            static_cast<unsigned long long>(g_gdn_ok),
            static_cast<unsigned long long>(g_gdn_fail),
            g_gdn_last_err.empty() ? "-" : g_gdn_last_err.c_str(), g_act_valid ? 1 : 0,
            static_cast<unsigned long long>(g_act_ffn_ok),
            static_cast<unsigned long long>(g_act_ffn_try),
-           static_cast<unsigned long long>(g_act_lm_ok));
+           static_cast<unsigned long long>(g_act_lm_ok),
+           static_cast<unsigned long long>(g_act_lin_ok),
+           static_cast<unsigned long long>(g_act_lin_try),
+           static_cast<unsigned long long>(g_act_full_ok),
+           static_cast<unsigned long long>(g_act_full_try));
 }
 
 bool decode_act_begin(const float* h_host, int H) {
@@ -810,6 +835,10 @@ void disable() {
     if (kv.second.d_W) g_api.cudaFree(kv.second.d_W);
   }
   g_cache.clear();
+  for (auto& kv : g_w16_pack) {
+    if (kv.second.d_w) g_api.cudaFree(kv.second.d_w);
+  }
+  g_w16_pack.clear();
   for (auto& kv : g_int4_cache) {
     if (kv.second.d_qweight) g_api.cudaFree(kv.second.d_qweight);
     if (kv.second.d_scales) g_api.cudaFree(kv.second.d_scales);
@@ -825,6 +854,8 @@ void disable() {
   g_gdn_buf_cap = 0;
   g_gdn_ok = g_gdn_fail = 0;
   g_act_ffn_ok = g_act_ffn_try = g_act_lm_ok = 0;
+  g_act_lin_ok = g_act_lin_try = 0;
+  g_act_full_ok = g_act_full_try = 0;
   g_gdn_last_err.clear();
   auto free_f = [&](float*& p) {
     if (p) {
@@ -850,6 +881,15 @@ void disable() {
   }
   g_act_h_dim = 0;
   g_act_valid = false;
+  for (auto& kv : g_conv_state) {
+    if (kv.second) g_api.cudaFree(kv.second);
+  }
+  g_conv_state.clear();
+  if (g_lin_ws) {
+    g_api.cudaFree(g_lin_ws);
+    g_lin_ws = nullptr;
+    g_lin_ws_cap = 0;
+  }
   if (g_attn_q) g_api.cudaFree(g_attn_q);
   if (g_attn_k) g_api.cudaFree(g_attn_k);
   if (g_attn_v) g_api.cudaFree(g_attn_v);
@@ -1375,6 +1415,119 @@ extern "C" __global__ void vec_add(const float* __restrict__ a, const float* __r
   if (i >= n) return;
   y[i] = a[i] + b[i];
 }
+
+// Depthwise conv_k=4 + SiLU (matches CPU linear_attn path).
+extern "C" __global__ void dwconv_silu_k4(const float* __restrict__ xin, float* __restrict__ state,
+                                         const float* __restrict__ w, float* __restrict__ xout,
+                                         int conv_dim) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= conv_dim) return;
+  float* st = state + (size_t)c * 4;
+  const float* wk = w + (size_t)c * 4;
+  st[3] = st[2];
+  st[2] = st[1];
+  st[1] = st[0];
+  st[0] = xin[c];
+  const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
+  xout[c] = acc / (1.f + expf(-acc));
+}
+
+// Pack GDN q/k (repeat nk→nv) and copy v from mixed_c.
+extern "C" __global__ void gdn_pack_qkv(const float* __restrict__ mixed_c, float* __restrict__ q,
+                                       float* __restrict__ k, float* __restrict__ v, int nk, int nv,
+                                       int dk, int dv) {
+  const int key_dim = nk * dk;
+  const int value_dim = nv * dv;
+  const int rep = nv / nk;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nq = nv * dk;
+  if (tid < nq) {
+    const int hh = tid / dk;
+    const int d = tid % dk;
+    const int h = hh / rep;
+    q[tid] = mixed_c[h * dk + d];
+    k[tid] = mixed_c[key_dim + h * dk + d];
+  }
+  if (tid < value_dim) v[tid] = mixed_c[2 * key_dim + tid];
+}
+
+// beta = sigmoid(b); g = -clamp(exp(A_log)) * softplus(a + dt_bias)
+extern "C" __global__ void gdn_prep_gb(const float* __restrict__ b, const float* __restrict__ a,
+                                      const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+                                      float* __restrict__ beta, float* __restrict__ g, int nv) {
+  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+  if (h >= nv) return;
+  beta[h] = 1.f / (1.f + expf(-b[h]));
+  float A = expf(A_log[h]);
+  if (!(A == A) || A > 1e4f) A = 1e4f;
+  if (A < 1e-6f) A = 1e-6f;
+  const float x = a[h] + dt_bias[h];
+  // softplus
+  float sp;
+  if (x > 20.f) sp = x;
+  else if (x < -20.f) sp = expf(x);
+  else sp = logf(1.f + expf(x));
+  if (!(sp == sp)) sp = 0.f;
+  g[h] = -A * sp;
+}
+
+// Per-head rmsnorm_gated (CPU: scale = w, NOT 1+w).
+extern "C" __global__ void rmsnorm_gated_heads(const float* __restrict__ x,
+                                               const float* __restrict__ gate,
+                                               const unsigned short* __restrict__ w,
+                                               float* __restrict__ y, int hd, float eps,
+                                               int is_f16) {
+  extern __shared__ float smem[];
+  const int h = blockIdx.x;
+  const int tid = threadIdx.x;
+  const float* xh = x + (size_t)h * hd;
+  const float* gh = gate + (size_t)h * hd;
+  const unsigned short* wh = w + (size_t)h * hd;
+  float* yh = y + (size_t)h * hd;
+  float sum = 0.f;
+  for (int i = tid; i < hd; i += blockDim.x) {
+    float v = xh[i];
+    if (!(v == v)) v = 0.f;
+    sum += v * v;
+  }
+  smem[tid] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) smem[tid] += smem[tid + s];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(smem[0] / (float)hd + eps);
+  for (int i = tid; i < hd; i += blockDim.x) {
+    float v = xh[i];
+    if (!(v == v)) v = 0.f;
+    float gg = gh[i];
+    if (!(gg == gg)) gg = 0.f;
+    const float silu = gg / (1.f + expf(-gg));
+    yh[i] = v * inv * w16_to_f32(wh[i], is_f16) * silu;
+  }
+}
+
+// GEMV with packed BF16/F16 weights (no FP32 inflate). y[M] = W[M,K] @ x[K]
+extern "C" __global__ void gemv_w16(const unsigned short* __restrict__ W, const float* __restrict__ x,
+                                    float* __restrict__ y, int M, int K, int is_f16) {
+  const int m = blockIdx.x;
+  if (m >= M) return;
+  const unsigned short* row = W + (size_t)m * K;
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  float sum = 0.f;
+  for (int k = tid; k < K; k += blockDim.x) sum += w16_to_f32(row[k], is_f16) * x[k];
+  smem[tid] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) smem[tid] += smem[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float o = smem[0];
+    y[m] = (o == o) ? o : 0.f;
+  }
+}
 )CUDA";
 
 // Prefill causal attention (GPU modes only). Validated vs CPU in prefill_ops_bench (~13x @1064).
@@ -1478,77 +1631,102 @@ bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
                     static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
 }
 
+
+bool weight_budget_ok(size_t nbytes) {
+  if (g_budget == 0) return true;
+  return g_used + nbytes + kVramHeadroom <= g_budget;
+}
+
+// Upload packed BF16/F16 weights (no FP32 inflate). Key = host pass pointer.
+const W16Pack* ensure_w16_pack(const uint16_t* W, int M, int K, bool is_f16) {
+  if (!g_enabled || !W || M <= 0 || K <= 0) return nullptr;
+  if (M >= kMaxGpuInt4Rows) return nullptr;
+  auto it = g_w16_pack.find(W);
+  if (it != g_w16_pack.end()) {
+    if (it->second.M != M || it->second.K != K || it->second.is_f16 != is_f16) return nullptr;
+    return &it->second;
+  }
+  const size_t nbytes = sizeof(uint16_t) * static_cast<size_t>(M) * static_cast<size_t>(K);
+  if (!weight_budget_ok(nbytes)) return nullptr;
+  void* d = nullptr;
+  if (g_api.cudaMalloc(&d, nbytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(d, W, nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(d);
+    return nullptr;
+  }
+  W16Pack e;
+  e.d_w = d;
+  e.M = M;
+  e.K = K;
+  e.is_f16 = is_f16;
+  e.bytes = nbytes;
+  g_w16_pack[W] = e;
+  g_used += nbytes;
+  return &g_w16_pack[W];
+}
+
+bool jit_gemv_w16(const uint16_t* d_W, const float* d_x, float* d_y, int M, int K, bool is_f16) {
+  if (!d_W || !d_x || !d_y || M <= 0 || K <= 0) return false;
+  void* fn = get_jit_kernel(kActSrc, "gemv_w16");
+  if (!fn) return false;
+  int is_f16_i = is_f16 ? 1 : 0;
+  void* params[] = {&d_W, &d_x, &d_y, &M, &K, &is_f16_i};
+  constexpr unsigned BLOCK = 256;
+  return jit_launch(fn, static_cast<unsigned>(M), 1, 1, BLOCK, 1, 1, BLOCK * sizeof(float), params);
+}
+
 bool try_gemm_w16(const float* x, const uint16_t* W, float* y, int M, int K, bool is_f16) {
   if (!g_enabled || !x || !W || !y || M <= 0 || K <= 0) return false;
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_cache.find(W);
-  if (it == g_cache.end()) {
-    const size_t nbytes = sizeof(float) * static_cast<size_t>(M) * K;
-    if (g_budget > 0 && g_used + nbytes > g_budget) return false;
-    if (M >= kMaxGpuInt4Rows) return false;
-    std::vector<float> host(static_cast<size_t>(M) * K);
-    for (size_t i = 0; i < host.size(); ++i)
-      host[i] = is_f16 ? f16_to_f32(W[i]) : bf16_to_f32(W[i]);
-    void* dW = nullptr;
-    if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return false;
-    if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
-      g_api.cudaFree(dW);
-      return false;
-    }
-    CacheEntry e;
-    e.d_W = dW;
-    e.M = M;
-    e.K = K;
-    e.bytes = nbytes;
-    g_cache[W] = e;
-    g_used += nbytes;
-    it = g_cache.find(W);
+  const W16Pack* pack = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    pack = ensure_w16_pack(W, M, K, is_f16);
+    if (!pack) return false;
+    if (!ensure_xy(M, K, 1)) return false;
+    if (!upload_x_sticky(x, K)) return false;
   }
-  if (it->second.M != M || it->second.K != K) return false;
-  return gemm_dev(reinterpret_cast<const float*>(it->second.d_W), x, y, M, K);
+  if (!jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), reinterpret_cast<const float*>(g_dx),
+                    reinterpret_cast<float*>(g_dy), M, K, pack->is_f16))
+    return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(y, g_dy, sizeof(float) * static_cast<size_t>(M), kCudaMemcpyD2H) ==
+         kCudaSuccess;
 }
 
 bool try_gemm_w16_batch(const float* X, int n, const uint16_t* W, float* Y, int M, int K,
                         bool is_f16) {
   if (!g_enabled || !X || !W || !Y || M <= 0 || K <= 0 || n <= 0) return false;
   if (n == 1) return try_gemm_w16(X, W, Y, M, K, is_f16);
-  // Long prefill under tight VRAM: CPU weight-stationary is safer/faster than growing g_dx/g_dy.
   constexpr int kMaxGpuBatch = 128;
   if (n > kMaxGpuBatch) return false;
 
-  std::lock_guard<std::mutex> lock(g_mu);
-  auto it = g_cache.find(W);
-  if (it == g_cache.end()) {
-    const size_t nbytes = sizeof(float) * static_cast<size_t>(M) * K;
-    if (g_budget > 0 && g_used + nbytes > g_budget) return false;
-    if (M >= kMaxGpuInt4Rows) return false;
-    std::vector<float> host(static_cast<size_t>(M) * K);
-    for (size_t i = 0; i < host.size(); ++i)
-      host[i] = is_f16 ? f16_to_f32(W[i]) : bf16_to_f32(W[i]);
-    void* dW = nullptr;
-    if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return false;
-    if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
-      g_api.cudaFree(dW);
+  const W16Pack* pack = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    pack = ensure_w16_pack(W, M, K, is_f16);
+    if (!pack) return false;
+    if (!ensure_xy(M, K, n)) return false;
+    if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(n) * K, kCudaMemcpyH2D) !=
+        kCudaSuccess)
       return false;
-    }
-    CacheEntry e;
-    e.d_W = dW;
-    e.M = M;
-    e.K = K;
-    e.bytes = nbytes;
-    g_cache[W] = e;
-    g_used += nbytes;
-    it = g_cache.find(W);
+    g_sticky_x = nullptr;
+    g_sticky_k = 0;
   }
-  if (it->second.M != M || it->second.K != K) return false;
-  return gemm_dev_batch(reinterpret_cast<const float*>(it->second.d_W), X, n, Y, M, K);
+  for (int i = 0; i < n; ++i) {
+    const float* dx = reinterpret_cast<const float*>(g_dx) + static_cast<size_t>(i) * K;
+    float* dy = reinterpret_cast<float*>(g_dy) + static_cast<size_t>(i) * M;
+    if (!jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), dx, dy, M, K, pack->is_f16))
+      return false;
+  }
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(n) * M, kCudaMemcpyD2H) ==
+         kCudaSuccess;
 }
 
 bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16) {
   if (!g_enabled || !W || M <= 0 || K <= 0) return false;
-  std::vector<float> dummy(static_cast<size_t>(K), 0.f);
-  std::vector<float> out(static_cast<size_t>(M));
-  return try_gemm_w16(dummy.data(), W, out.data(), M, K, is_f16);
+  std::lock_guard<std::mutex> lock(g_mu);
+  return ensure_w16_pack(W, M, K, is_f16) != nullptr;
 }
 
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
@@ -1894,6 +2072,17 @@ void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv) {
   if (g_api.cudaMemcpy(host_state, it->second, state_bytes, kCudaMemcpyD2H) != kCudaSuccess) return;
   g_api.cudaFree(it->second);
   g_gdn_state.erase(it);
+}
+
+void flush_conv_state_to_host(float* host_conv, int conv_dim, int conv_k) {
+  if (!g_enabled || !host_conv || conv_dim <= 0 || conv_k <= 0) return;
+  const size_t bytes = sizeof(float) * static_cast<size_t>(conv_dim) * conv_k;
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_conv_state.find(host_conv);
+  if (it == g_conv_state.end() || !it->second) return;
+  if (g_api.cudaMemcpy(host_conv, it->second, bytes, kCudaMemcpyD2H) != kCudaSuccess) return;
+  g_api.cudaFree(it->second);
+  g_conv_state.erase(it);
 }
 
 namespace {
@@ -2267,11 +2456,267 @@ bool try_rmsnorm_gemm_multi_from_act(const uint16_t* ln1, const qlwc::Int4View* 
   return true;
 }
 
+bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
+                              const qlwc::Int4View& wz, const qlwc::Int4View* wb_i4,
+                              const uint16_t* wb_pass, bool wb_is_f16, const qlwc::Int4View* wa_i4,
+                              const uint16_t* wa_pass, bool wa_is_f16, const float* conv_w_host,
+                              float* conv_state_host, int conv_k, const float* A_log_host,
+                              const float* dt_bias_host, float* recurrent_host,
+                              const uint16_t* nrm, const qlwc::Int4View* wout_i4,
+                              const uint16_t* wout_pass, bool wout_is_f16, const uint16_t* ln2,
+                              const qlwc::Int4View& wgate, const qlwc::Int4View& wup,
+                              const qlwc::Int4View& wdown, int nk, int nv, int dk, int dv, int I,
+                              float eps, bool ln_is_f16, bool nrm_is_f16) {
+  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !ln1 || !ln2 || !nrm) return false;
+  if (!conv_w_host || !conv_state_host || !A_log_host || !dt_bias_host || !recurrent_host)
+    return false;
+  if (nk <= 0 || nv <= 0 || dk <= 0 || dv <= 0 || I <= 0 || conv_k != 4) return false;
+  if (nv % nk != 0) return false;
+  if (!wb_i4 && !wb_pass) return false;
+  if (!wa_i4 && !wa_pass) return false;
+  if (!wout_i4 && !wout_pass) return false;
+  ++g_act_lin_try;
+
+  int H = g_act_h_dim;
+  const int key_dim = nk * dk;
+  const int value_dim = nv * dv;
+  const int conv_dim = key_dim * 2 + value_dim;
+
+  void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
+  void* fn_multi = get_jit_kernel(kGemvInt4Src, "gemv_multi4_int4");
+  void* fn_conv = get_jit_kernel(kActSrc, "dwconv_silu_k4");
+  void* fn_pack = get_jit_kernel(kActSrc, "gdn_pack_qkv");
+  void* fn_prep = get_jit_kernel(kActSrc, "gdn_prep_gb");
+  void* fn_gn = get_jit_kernel(kActSrc, "rmsnorm_gated_heads");
+  void* fn_gdn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
+  if (!fn_rms || !fn_multi || !fn_conv || !fn_pack || !fn_prep || !fn_gn || !fn_gdn) return false;
+
+  const size_t nrm_bytes = sizeof(uint16_t) * static_cast<size_t>(value_dim);
+  const size_t floats_need =
+      static_cast<size_t>(conv_dim) * 2 + static_cast<size_t>(value_dim) +
+      static_cast<size_t>(nv) * 4 + static_cast<size_t>(nv) * dk * 2 +
+      static_cast<size_t>(value_dim) + static_cast<size_t>(conv_dim) * static_cast<size_t>(conv_k) +
+      (nrm_bytes + sizeof(float) - 1) / sizeof(float);
+  const size_t bytes_need = floats_need * sizeof(float);
+
+  const Int4Resident* rq = nullptr;
+  const Int4Resident* rz = nullptr;
+  const Int4Resident* rb = nullptr;
+  const Int4Resident* ra = nullptr;
+  float* d_conv_st = nullptr;
+  float* d_state = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, I)) return false;
+    if (!ensure_mlp_core(value_dim)) return false;
+    if (bytes_need > g_lin_ws_cap || !g_lin_ws) {
+      if (g_lin_ws) g_api.cudaFree(g_lin_ws);
+      g_lin_ws = nullptr;
+      g_lin_ws_cap = 0;
+      void* v = nullptr;
+      if (g_api.cudaMalloc(&v, bytes_need) != kCudaSuccess) return false;
+      g_lin_ws = static_cast<float*>(v);
+      g_lin_ws_cap = bytes_need;
+    }
+    rq = ensure_int4_resident(wqkv);
+    rz = ensure_int4_resident(wz);
+    if (!rq || !rz) return false;
+    if (wb_i4) {
+      rb = ensure_int4_resident(*wb_i4);
+      if (!rb) return false;
+    }
+    if (wa_i4) {
+      ra = ensure_int4_resident(*wa_i4);
+      if (!ra) return false;
+    }
+    auto cit = g_conv_state.find(conv_state_host);
+    if (cit == g_conv_state.end()) {
+      void* cs = nullptr;
+      const size_t csb = sizeof(float) * static_cast<size_t>(conv_dim) * conv_k;
+      if (g_api.cudaMalloc(&cs, csb) != kCudaSuccess) return false;
+      if (g_api.cudaMemcpy(cs, conv_state_host, csb, kCudaMemcpyH2D) != kCudaSuccess) {
+        g_api.cudaFree(cs);
+        return false;
+      }
+      g_conv_state[conv_state_host] = static_cast<float*>(cs);
+      cit = g_conv_state.find(conv_state_host);
+    }
+    d_conv_st = cit->second;
+    auto git = g_gdn_state.find(recurrent_host);
+    if (git == g_gdn_state.end()) {
+      void* ds = nullptr;
+      const size_t sb = sizeof(float) * static_cast<size_t>(nv) * dk * dv;
+      if (g_api.cudaMalloc(&ds, sb) != kCudaSuccess) return false;
+      if (g_api.cudaMemcpy(ds, recurrent_host, sb, kCudaMemcpyH2D) != kCudaSuccess) {
+        g_api.cudaFree(ds);
+        return false;
+      }
+      g_gdn_state[recurrent_host] = static_cast<float*>(ds);
+      git = g_gdn_state.find(recurrent_host);
+    }
+    d_state = git->second;
+    if (g_api.cudaMemcpy(g_mlp_ln, ln1, sizeof(uint16_t) * static_cast<size_t>(H),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+  }
+
+  float* d_mixed = g_lin_ws;
+  float* d_z = d_mixed + conv_dim;
+  float* d_b = d_z + value_dim;
+  float* d_a = d_b + nv;
+  float* d_mixed_c = d_a + nv;
+  float* d_q = d_mixed_c + conv_dim;
+  float* d_k = d_q + nv * dk;
+  float* d_v = d_k + nv * dk;
+  float* d_g = d_v + value_dim;
+  float* d_beta = d_g + nv;
+  float* d_A = d_beta + nv;
+  float* d_dt = d_A + nv;
+  float* d_cw = d_dt + nv;
+  auto* d_nrm = reinterpret_cast<uint16_t*>(d_cw + conv_dim * conv_k);
+
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_api.cudaMemcpy(d_A, A_log_host, sizeof(float) * static_cast<size_t>(nv),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(d_dt, dt_bias_host, sizeof(float) * static_cast<size_t>(nv),
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(d_cw, conv_w_host,
+                         sizeof(float) * static_cast<size_t>(conv_dim) * conv_k,
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return false;
+    if (g_api.cudaMemcpy(d_nrm, nrm, nrm_bytes, kCudaMemcpyH2D) != kCudaSuccess) return false;
+  }
+
+  int is_f16 = ln_is_f16 ? 1 : 0;
+  const unsigned blk = 256;
+  void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
+  if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
+
+  auto run_multi = [&](const Int4Resident* const* resv, float* const* ydev, int nproj,
+                       int total_m) -> bool {
+    const uint8_t* q[4] = {};
+    const uint16_t* s[4] = {};
+    const uint16_t* z[4] = {};
+    float* yd[4] = {};
+    int m[4] = {};
+    for (int i = 0; i < nproj; ++i) {
+      q[i] = static_cast<const uint8_t*>(resv[i]->d_qweight);
+      s[i] = static_cast<const uint16_t*>(resv[i]->d_scales);
+      z[i] = static_cast<const uint16_t*>(resv[i]->d_zeros);
+      yd[i] = ydev[i];
+      m[i] = resv[i]->M;
+    }
+    for (int i = nproj; i < 4; ++i) {
+      q[i] = q[0];
+      s[i] = s[0];
+      z[i] = z[0];
+      yd[i] = yd[0];
+      m[i] = 0;
+    }
+    int K = resv[0]->K, ng = resv[0]->ng, gs = resv[0]->gs;
+    int is_awq_i = resv[0]->is_awq ? 1 : 0;
+    const float* dx = g_mlp_norm;
+    int nn = nproj;
+    void* params[] = {&q[0], &s[0], &z[0], &yd[0], &m[0], &q[1], &s[1], &z[1], &yd[1], &m[1],
+                      &q[2], &s[2], &z[2], &yd[2], &m[2], &q[3], &s[3], &z[3], &yd[3], &m[3],
+                      &nn,   &K,    &ng,   &gs,      &is_awq_i, &dx};
+    constexpr int RPB = 8;
+    const int blocks = (total_m + RPB - 1) / RPB;
+    const unsigned shmem = sizeof(unsigned short) * RPB * ng * 2;
+    return jit_launch(fn_multi, static_cast<unsigned>(blocks), 1, 1, RPB * 32, 1, 1, shmem, params);
+  };
+
+  auto gemv_w16_dev = [&](const uint16_t* pass, bool is_f16w, float* d_y, int M) -> bool {
+    const W16Pack* pack = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      pack = ensure_w16_pack(pass, M, H, is_f16w);
+      if (!pack) return false;
+    }
+    return jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), g_mlp_norm, d_y, M, H, pack->is_f16);
+  };
+
+  if (rb && ra) {
+    if (rq->K != rz->K || rq->ng != rz->ng || rq->gs != rz->gs || rq->is_awq != rz->is_awq ||
+        rb->K != rq->K || rb->ng != rq->ng || rb->gs != rq->gs || rb->is_awq != rq->is_awq ||
+        ra->K != rq->K || ra->ng != rq->ng || ra->gs != rq->gs || ra->is_awq != rq->is_awq)
+      return false;
+    const Int4Resident* resv[4] = {rq, rz, rb, ra};
+    float* ydev[4] = {d_mixed, d_z, d_b, d_a};
+    if (!run_multi(resv, ydev, 4, rq->M + rz->M + rb->M + ra->M)) return false;
+  } else {
+    if (rq->K != rz->K || rq->ng != rz->ng || rq->gs != rz->gs || rq->is_awq != rz->is_awq)
+      return false;
+    const Int4Resident* resv[2] = {rq, rz};
+    float* ydev[2] = {d_mixed, d_z};
+    if (!run_multi(resv, ydev, 2, rq->M + rz->M)) return false;
+    if (rb) {
+      if (!jit_gemv_int4(static_cast<const uint8_t*>(rb->d_qweight),
+                         static_cast<const uint16_t*>(rb->d_scales),
+                         static_cast<const uint16_t*>(rb->d_zeros), g_mlp_norm, d_b, rb->M, rb->K,
+                         rb->ng, rb->gs, rb->is_awq))
+        return false;
+    } else if (!gemv_w16_dev(wb_pass, wb_is_f16, d_b, nv)) {
+      return false;
+    }
+    if (ra) {
+      if (!jit_gemv_int4(static_cast<const uint8_t*>(ra->d_qweight),
+                         static_cast<const uint16_t*>(ra->d_scales),
+                         static_cast<const uint16_t*>(ra->d_zeros), g_mlp_norm, d_a, ra->M, ra->K,
+                         ra->ng, ra->gs, ra->is_awq))
+        return false;
+    } else if (!gemv_w16_dev(wa_pass, wa_is_f16, d_a, nv)) {
+      return false;
+    }
+  }
+
+  const unsigned conv_grid = (static_cast<unsigned>(conv_dim) + blk - 1) / blk;
+  int conv_dim_i = conv_dim;
+  void* prm_conv[] = {&d_mixed, &d_conv_st, &d_cw, &d_mixed_c, &conv_dim_i};
+  if (!jit_launch(fn_conv, conv_grid, 1, 1, blk, 1, 1, 0, prm_conv)) return false;
+
+  const int pack_n = (nv * dk > value_dim) ? nv * dk : value_dim;
+  const unsigned pack_grid = (static_cast<unsigned>(pack_n) + blk - 1) / blk;
+  int nk_i = nk, nv_i = nv, dk_i = dk, dv_i = dv;
+  void* prm_pack[] = {&d_mixed_c, &d_q, &d_k, &d_v, &nk_i, &nv_i, &dk_i, &dv_i};
+  if (!jit_launch(fn_pack, pack_grid, 1, 1, blk, 1, 1, 0, prm_pack)) return false;
+
+  const unsigned prep_grid = (static_cast<unsigned>(nv) + blk - 1) / blk;
+  void* prm_prep[] = {&d_b, &d_a, &d_A, &d_dt, &d_beta, &d_g, &nv_i};
+  if (!jit_launch(fn_prep, prep_grid, 1, 1, blk, 1, 1, 0, prm_prep)) return false;
+
+  float scale = 1.f / sqrtf(static_cast<float>(dk));
+  float* d_out = g_mlp_core;
+  void* prm_gdn[] = {&d_q, &d_k, &d_v, &d_g, &d_beta, &d_state, &d_out, &dk_i, &dv_i, &scale};
+  if (!jit_launch(fn_gdn, static_cast<unsigned>(nv), 1, 1, static_cast<unsigned>(dv), 1, 1, 0,
+                  prm_gdn))
+    return false;
+  ++g_gdn_ok;
+
+  int nrm_f16 = nrm_is_f16 ? 1 : 0;
+  int hd = dv;
+  void* prm_gn[] = {&d_out, &d_z, &d_nrm, &d_out, &hd, &eps, &nrm_f16};
+  if (!jit_launch(fn_gn, static_cast<unsigned>(nv), 1, 1, blk, 1, 1, blk * sizeof(float), prm_gn))
+    return false;
+
+  if (!try_ffn_on_act(nullptr, value_dim, wout_i4, wout_pass, wout_is_f16, ln2, wgate, wup, wdown, I,
+                      eps, ln_is_f16))
+    return false;
+  ++g_act_lin_ok;
+  return true;
+}
+
+
 bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* wout_i4,
                     const uint16_t* wout_pass, bool wout_is_f16, const uint16_t* ln2,
                     const qlwc::Int4View& wgate, const qlwc::Int4View& wup,
                     const qlwc::Int4View& wdown, int I, float eps, bool ln_is_f16) {
-  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !host_core || !ln2) return false;
+  if (!g_enabled || !g_resident || !g_act_valid || !g_act_h || !ln2) return false;
+  // host_core==nullptr → g_mlp_core already holds device core (Path A linear decode).
+  if (!host_core && !g_mlp_core) return false;
   int H = g_act_h_dim;
   if (H <= 0 || I <= 0 || core_dim <= 0) return false;
   if (wgate.K != H || wup.K != H || wdown.K != I || wgate.M != I || wup.M != I || wdown.M != H)
@@ -2292,7 +2737,7 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
   const Int4Resident* rg = nullptr;
   const Int4Resident* ru = nullptr;
   const Int4Resident* rd = nullptr;
-  const float* d_wout_fp32 = nullptr;
+  const W16Pack* d_wout_pack = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     if (!ensure_mlp_caps(H, I)) return false;
@@ -2301,39 +2746,20 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
       ro = ensure_int4_resident(*wout_i4);
       if (!ro) return false;
     } else {
-      // Upload BF16→FP32 into g_cache keyed by pass pointer (same as try_gemm_w16).
-      auto it = g_cache.find(wout_pass);
-      if (it == g_cache.end()) {
-        const size_t nbytes = sizeof(float) * static_cast<size_t>(H) * core_dim;
-        if (g_budget > 0 && g_used + nbytes > g_budget) return false;
-        std::vector<float> host(static_cast<size_t>(H) * core_dim);
-        for (size_t i = 0; i < host.size(); ++i)
-          host[i] = wout_is_f16 ? f16_to_f32(wout_pass[i]) : bf16_to_f32(wout_pass[i]);
-        void* dW = nullptr;
-        if (g_api.cudaMalloc(&dW, nbytes) != kCudaSuccess) return false;
-        if (g_api.cudaMemcpy(dW, host.data(), nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
-          g_api.cudaFree(dW);
-          return false;
-        }
-        CacheEntry e;
-        e.d_W = dW;
-        e.M = H;
-        e.K = core_dim;
-        e.bytes = nbytes;
-        g_cache[wout_pass] = e;
-        g_used += nbytes;
-        it = g_cache.find(wout_pass);
-      }
-      if (it->second.M != H || it->second.K != core_dim) return false;
-      d_wout_fp32 = reinterpret_cast<const float*>(it->second.d_W);
+      // Path A S2: packed BF16/F16 (no FP32 inflate).
+      const W16Pack* pack = ensure_w16_pack(wout_pass, H, core_dim, wout_is_f16);
+      if (!pack) return false;
+      d_wout_pack = pack;
     }
     rg = ensure_int4_resident(wgate);
     ru = ensure_int4_resident(wup);
     rd = ensure_int4_resident(wdown);
     if (!rg || !ru || !rd) return false;
-    if (g_api.cudaMemcpy(g_mlp_core, host_core, sizeof(float) * static_cast<size_t>(core_dim),
-                         kCudaMemcpyH2D) != kCudaSuccess)
-      return false;
+    if (host_core) {
+      if (g_api.cudaMemcpy(g_mlp_core, host_core, sizeof(float) * static_cast<size_t>(core_dim),
+                           kCudaMemcpyH2D) != kCudaSuccess)
+        return false;
+    }
     if (g_api.cudaMemcpy(g_mlp_ln, ln2, sizeof(uint16_t) * static_cast<size_t>(H),
                          kCudaMemcpyH2D) != kCudaSuccess)
       return false;
@@ -2346,11 +2772,9 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
                        ro->K, ro->ng, ro->gs, ro->is_awq))
       return false;
   } else {
-    std::lock_guard<std::mutex> lock(g_mu);
-    if (!ensure_xy(H, core_dim, 1)) return false;
-    const float alpha = 1.f, beta = 0.f;
-    if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, H, 1, core_dim, &alpha, d_wout_fp32,
-                          core_dim, g_mlp_core, core_dim, &beta, g_mlp_down, H) != kCublasSuccess)
+    if (!d_wout_pack) return false;
+    if (!jit_gemv_w16(static_cast<const uint16_t*>(d_wout_pack->d_w), g_mlp_core, g_mlp_down, H,
+                      core_dim, d_wout_pack->is_f16))
       return false;
   }
 
@@ -2409,14 +2833,12 @@ bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pas
   void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
   if (!fn_rms) return false;
 
-  const float* d_W = nullptr;
+  const W16Pack* pack = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_mu);
     if (!ensure_mlp_caps(H, H)) return false;
-    auto it = g_cache.find(lm_pass);
-    if (it == g_cache.end()) return false;  // expect warm prefetch
-    if (it->second.M != V || it->second.K != H) return false;
-    d_W = reinterpret_cast<const float*>(it->second.d_W);
+    pack = ensure_w16_pack(lm_pass, V, H, lm_is_f16);
+    if (!pack) return false;
     if (g_api.cudaMemcpy(g_mlp_ln, final_norm, sizeof(uint16_t) * static_cast<size_t>(H),
                          kCudaMemcpyH2D) != kCudaSuccess)
       return false;
@@ -2428,19 +2850,16 @@ bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pas
   void* prm_rms[] = {&g_act_h, &g_mlp_ln, &g_mlp_norm, &H, &eps, &is_f16};
   if (!jit_launch(fn_rms, 1, 1, 1, blk, 1, 1, blk * sizeof(float), prm_rms)) return false;
 
-  {
-    std::lock_guard<std::mutex> lock(g_mu);
-    const float alpha = 1.f, beta = 0.f;
-    if (g_api.cublasSgemm(g_cublas, kCublasOpT, kCublasOpN, V, 1, H, &alpha, d_W, H, g_mlp_norm, H,
-                          &beta, reinterpret_cast<float*>(g_dy), V) != kCublasSuccess)
-      return false;
-    (void)lm_is_f16;
-    if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(V),
-                         kCudaMemcpyD2H) != kCudaSuccess)
-      return false;
-    ++g_act_lm_ok;
-    return true;
-  }
+  if (!jit_gemv_w16(static_cast<const uint16_t*>(pack->d_w), g_mlp_norm,
+                    reinterpret_cast<float*>(g_dy), V, H, pack->is_f16))
+    return false;
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(V),
+                       kCudaMemcpyD2H) != kCudaSuccess)
+    return false;
+  ++g_act_lm_ok;
+  return true;
 }
 
 bool try_lm_head_int4_from_act(const uint16_t* final_norm, const qlwc::Int4View& lm,
@@ -2478,6 +2897,9 @@ bool try_lm_head_int4_from_act(const uint16_t* final_norm, const qlwc::Int4View&
   ++g_act_lm_ok;
   return true;
 }
+
+void note_full_attn_try() { ++g_act_full_try; }
+void note_full_attn_ok() { ++g_act_full_ok; }
 
 bool prefetch_int4_weight(const qlwc::Int4View& W) {
   if (!g_enabled) return false;

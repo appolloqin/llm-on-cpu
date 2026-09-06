@@ -49,6 +49,20 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
                     const qlwc::Int4View& wgate, const qlwc::Int4View& wup,
                     const qlwc::Int4View& wdown, int I, float eps, bool ln_is_f16);
 
+// Path A / Ollama-style: full linear decode on device residual (no mid-layer D2H).
+// Additive — returns false → caller keeps CPU/host sandwich. pure_cpu never calls this.
+bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
+                              const qlwc::Int4View& wz, const qlwc::Int4View* wb_i4,
+                              const uint16_t* wb_pass, bool wb_is_f16, const qlwc::Int4View* wa_i4,
+                              const uint16_t* wa_pass, bool wa_is_f16, const float* conv_w_host,
+                              float* conv_state_host, int conv_k, const float* A_log_host,
+                              const float* dt_bias_host, float* recurrent_host,
+                              const uint16_t* nrm, const qlwc::Int4View* wout_i4,
+                              const uint16_t* wout_pass, bool wout_is_f16, const uint16_t* ln2,
+                              const qlwc::Int4View& wgate, const qlwc::Int4View& wup,
+                              const qlwc::Int4View& wdown, int nk, int nv, int dk, int dv, int I,
+                              float eps, bool ln_is_f16, bool nrm_is_f16);
+
 // Final RMSNorm + lm_head; D2H logits only (hidden stays on device until invalidate).
 bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pass, int V,
                               float* logits_host, float eps, bool ln_is_f16, bool lm_is_f16);
@@ -94,6 +108,11 @@ bool try_attn_prefill(const float* q, const float* k, const float* v, float* out
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out, int n_heads, int dk, int dv);
 void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv);
+void flush_conv_state_to_host(float* host_conv, int conv_dim, int conv_k);
+
+// Path A S3 stats (full-attn act residual path).
+void note_full_attn_try();
+void note_full_attn_ok();
 
 bool jit_available();
 bool jit_compile(const char* cuda_src, const char* kernel_name, void** out_fn);
