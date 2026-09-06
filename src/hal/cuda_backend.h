@@ -91,6 +91,20 @@ bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y);
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
 bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float* const* ys, int n);
 bool prefetch_int4_weight(const qlwc::Int4View& W);
+// Prefetch + pin so MoE expert LRU cannot evict attn/shared/router warm weights.
+bool pin_int4_weight(const qlwc::Int4View& W);
+
+// Device-side MoE FFN for one token: H2D(x) once → top-k SwiGLU experts (+ optional shared) → D2H(y).
+// experts[i] = {gate, up, down, routing_weight}; all INT4; dims gate/up IxH, down HxI.
+struct MoeExpertInt4 {
+  const qlwc::Int4View* gate = nullptr;
+  const qlwc::Int4View* up = nullptr;
+  const qlwc::Int4View* down = nullptr;
+  float weight = 0.f;
+};
+bool try_moe_ffn_int4(const float* x, int H, int I, const MoeExpertInt4* experts, int n_experts,
+                      const qlwc::Int4View* shared_gate, const qlwc::Int4View* shared_up,
+                      const qlwc::Int4View* shared_down, float shared_scale, float* y);
 
 bool try_gemm_awq(const float* x, const AwqView& W, float* y);
 bool prefetch_awq_weight(const AwqView& W);

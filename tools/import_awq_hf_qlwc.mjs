@@ -678,17 +678,33 @@ function loadConfig(hfDir) {
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 
+/** Infer INT4 symmetry for QLWC scheme selection.
+ *  - compressed-tensors: honor weights.symmetric / qc.symmetric
+ *  - AutoAWQ: zero_point:true ⇒ asymmetric (store GPTQ zeros); do NOT default true
+ *    (meganovaai/Qwen3.6-*-AWQ has zero_point without config_groups → old default dropped qzeros)
+ */
+function inferSymmetric(qc, wg, method) {
+  if (typeof wg.symmetric === "boolean") return wg.symmetric;
+  if (typeof qc.symmetric === "boolean") return qc.symmetric;
+  if (typeof qc.zero_point === "boolean") return !qc.zero_point;
+  // Classic AutoAWQ is almost always asymmetric when qzeros exist; prefer GPTQ path.
+  if (method === "awq") return false;
+  return true;
+}
+
 function quantOptsFromConfig(cfg) {
   const qc = cfg.quantization_config || cfg.compression_config || cfg.text_config?.quantization_config || {};
   const groups = qc.config_groups || {};
   const g0 = groups.group_0 || groups[Object.keys(groups)[0]] || {};
   const wg = g0.weights || {};
+  const method = String(qc.quant_method || qc.quantization_method || "").toLowerCase();
   return {
     format: String(qc.format || qc.quant_method || "").toLowerCase(),
-    method: String(qc.quant_method || qc.quantization_method || "").toLowerCase(),
+    method,
     groupSize: wg.group_size ?? qc.group_size ?? 128,
-    symmetric: wg.symmetric ?? true,
+    symmetric: inferSymmetric(qc, wg, method),
     numBits: wg.num_bits ?? qc.bits ?? 4,
+    zeroPoint: qc.zero_point,
   };
 }
 
@@ -990,9 +1006,23 @@ async function main() {
   const gs = opt.groupSize > 0 ? opt.groupSize : cfgOpts.groupSize;
   const index = await buildIndex(opt.src);
   const format = detectFormat(index, cfgOpts, opt.format);
-  const scheme = cfgOpts.symmetric ? SCHEME_AWQ : SCHEME_GPTQ;
+  let symmetric = cfgOpts.symmetric;
+  // Safety: AutoAWQ dumps with .qzeros must keep zero-points (classic AWQ is asymmetric).
+  if (format === "autoawq" && symmetric) {
+    const hasQzeros = Object.keys(index).some((n) => n.endsWith(".qzeros"));
+    if (hasQzeros) {
+      console.warn(
+        "[import-awq] AutoAWQ has .qzeros but config looked symmetric; forcing asymmetric (GPTQ zeros)",
+      );
+      symmetric = false;
+    }
+  }
+  const scheme = symmetric ? SCHEME_AWQ : SCHEME_GPTQ;
 
-  console.log(`[import-awq] format=${format} scheme=${cfgOpts.symmetric ? "awq" : "gptq"} group=${gs}`);
+  console.log(
+    `[import-awq] format=${format} scheme=${symmetric ? "awq" : "gptq"} group=${gs}` +
+      (cfgOpts.zeroPoint != null ? ` zero_point=${cfgOpts.zeroPoint}` : ""),
+  );
   console.log(`[import-awq] indexing ${Object.keys(index).length} tensors`);
 
   const tmpDir = path.join(path.dirname(opt.out), `.import-awq-tmp-${process.pid}`);
@@ -1043,8 +1073,8 @@ async function main() {
       const tag = `t${nQ}`;
       const qres =
         format === "compressed-tensors"
-          ? importCtToQlwc(packedE, scaleE, zpE, M, K, gs, cfgOpts.symmetric, tmpDir, tag)
-          : importAwqToQlwc(packedE, scaleE, zpE, M, K, gs, cfgOpts.symmetric, tmpDir, tag);
+          ? importCtToQlwc(packedE, scaleE, zpE, M, K, gs, symmetric, tmpDir, tag)
+          : importAwqToQlwc(packedE, scaleE, zpE, M, K, gs, symmetric, tmpDir, tag);
       const usedGs = qres.gs ?? gs;
       if (nQ === 0) {
         fileGs = usedGs;

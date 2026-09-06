@@ -127,6 +127,7 @@ struct Int4Resident {
   void* d_zeros = nullptr;
   int M = 0, K = 0, ng = 0, gs = 0;
   bool is_awq = true;
+  bool pinned = false;  // warm attn/shared: MoE expert LRU must not evict
   size_t bytes = 0;
   uint64_t last_use = 0;
 };
@@ -547,15 +548,18 @@ const Int4Resident* ensure_int4_resident(const qlwc::Int4View& W) {
   const size_t nz = is_awq ? 0 : ns;
   const size_t total = nw + ns * sizeof(uint16_t) + nz * sizeof(uint16_t);
   if (g_budget > 0 && g_used + total > g_budget) {
-    // LRU 腾出空间
+    // LRU 腾出空间（跳过 pinned：attn/shared/router 热权重）
     std::vector<std::pair<uint64_t, const void*>> items;
     items.reserve(g_int4_cache.size());
-    for (auto& kv : g_int4_cache) items.push_back({kv.second.last_use, kv.first});
+    for (auto& kv : g_int4_cache) {
+      if (kv.second.pinned) continue;
+      items.push_back({kv.second.last_use, kv.first});
+    }
     std::sort(items.begin(), items.end());
     for (auto& p : items) {
       if (g_used + total <= g_budget) break;
       auto it2 = g_int4_cache.find(p.second);
-      if (it2 == g_int4_cache.end()) continue;
+      if (it2 == g_int4_cache.end() || it2->second.pinned) continue;
       if (it2->second.d_qweight) g_api.cudaFree(it2->second.d_qweight);
       if (it2->second.d_scales) g_api.cudaFree(it2->second.d_scales);
       if (it2->second.d_zeros) g_api.cudaFree(it2->second.d_zeros);
@@ -1428,6 +1432,19 @@ extern "C" __global__ void vec_add(const float* __restrict__ a, const float* __r
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   y[i] = a[i] + b[i];
+}
+
+extern "C" __global__ void vec_fill(float* __restrict__ y, float v, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  y[i] = v;
+}
+
+extern "C" __global__ void vec_axpy(const float* __restrict__ x, float* __restrict__ y, float a,
+                                   int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  y[i] += a * x[i];
 }
 
 // Depthwise conv_k=4 + SiLU (matches CPU linear_attn path).
@@ -3113,6 +3130,119 @@ bool prefetch_int4_weight(const qlwc::Int4View& W) {
   std::lock_guard<std::mutex> lock(g_mu);
   if (ensure_int4_resident(W)) return true;
   return ensure_int4_device(W) != nullptr;
+}
+
+bool pin_int4_weight(const qlwc::Int4View& W) {
+  if (!g_enabled || !W.qweight) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  const Int4Resident* res = ensure_int4_resident(W);
+  if (!res) return false;
+  auto it = g_int4_cache.find(W.qweight);
+  if (it == g_int4_cache.end()) return false;
+  it->second.pinned = true;
+  return true;
+}
+
+bool try_moe_ffn_int4(const float* x, int H, int I, const MoeExpertInt4* experts, int n_experts,
+                      const qlwc::Int4View* shared_gate, const qlwc::Int4View* shared_up,
+                      const qlwc::Int4View* shared_down, float shared_scale, float* y) {
+  if (!g_enabled || !jit_available() || !x || !y || !experts || n_experts <= 0 || H <= 0 || I <= 0)
+    return false;
+  const bool has_shared =
+      shared_gate && shared_up && shared_down && shared_gate->qweight && shared_up->qweight &&
+      shared_down->qweight && std::fabs(shared_scale) > 0.f;
+  if (has_shared) {
+    if (shared_gate->M != I || shared_up->M != I || shared_down->M != H || shared_gate->K != H ||
+        shared_up->K != H || shared_down->K != I)
+      return false;
+  }
+  for (int i = 0; i < n_experts; ++i) {
+    const auto& e = experts[i];
+    if (!e.gate || !e.up || !e.down || !e.gate->qweight || !e.up->qweight || !e.down->qweight)
+      return false;
+    if (e.gate->M != I || e.up->M != I || e.down->M != H || e.gate->K != H || e.up->K != H ||
+        e.down->K != I)
+      return false;
+  }
+
+  void* fn_silu = get_jit_kernel(kActSrc, "silu_mul");
+  void* fn_fill = get_jit_kernel(kActSrc, "vec_fill");
+  void* fn_axpy = get_jit_kernel(kActSrc, "vec_axpy");
+  if (!fn_silu || !fn_fill || !fn_axpy) return false;
+
+  const Int4Resident* rg[64] = {};
+  const Int4Resident* ru[64] = {};
+  const Int4Resident* rd[64] = {};
+  if (n_experts > 64) return false;
+  const Int4Resident* sg = nullptr;
+  const Int4Resident* su = nullptr;
+  const Int4Resident* sd = nullptr;
+
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!ensure_mlp_caps(H, I)) return false;
+    if (!ensure_mlp_core(H)) return false;  // per-expert down temp
+    for (int i = 0; i < n_experts; ++i) {
+      rg[i] = ensure_int4_resident(*experts[i].gate);
+      ru[i] = ensure_int4_resident(*experts[i].up);
+      rd[i] = ensure_int4_resident(*experts[i].down);
+      if (!rg[i] || !ru[i] || !rd[i]) return false;
+    }
+    if (has_shared) {
+      sg = ensure_int4_resident(*shared_gate);
+      su = ensure_int4_resident(*shared_up);
+      sd = ensure_int4_resident(*shared_down);
+      if (!sg || !su || !sd) return false;
+    }
+    if (g_api.cudaMemcpy(g_mlp_x, x, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyH2D) !=
+        kCudaSuccess)
+      return false;
+    g_sticky_x = x;
+    g_sticky_k = H;
+  }
+
+  const unsigned blk = 256;
+  const unsigned grid_h = (static_cast<unsigned>(H) + blk - 1) / blk;
+  const unsigned grid_i = (static_cast<unsigned>(I) + blk - 1) / blk;
+  float zero = 0.f;
+  void* prm_fill[] = {&g_mlp_down, &zero, &H};
+  if (!jit_launch(fn_fill, grid_h, 1, 1, blk, 1, 1, 0, prm_fill)) return false;
+
+  auto run_one = [&](const Int4Resident* g, const Int4Resident* u, const Int4Resident* d,
+                     float w) -> bool {
+    if (std::fabs(w) < 1e-12f) return true;
+    if (!jit_gemv_int4(static_cast<const uint8_t*>(g->d_qweight),
+                       static_cast<const uint16_t*>(g->d_scales),
+                       static_cast<const uint16_t*>(g->d_zeros), g_mlp_x, g_mlp_g, g->M, g->K, g->ng,
+                       g->gs, g->is_awq))
+      return false;
+    if (!jit_gemv_int4(static_cast<const uint8_t*>(u->d_qweight),
+                       static_cast<const uint16_t*>(u->d_scales),
+                       static_cast<const uint16_t*>(u->d_zeros), g_mlp_x, g_mlp_u, u->M, u->K, u->ng,
+                       u->gs, u->is_awq))
+      return false;
+    void* prm_silu[] = {&g_mlp_g, &g_mlp_u, &g_mlp_mid, &I};
+    if (!jit_launch(fn_silu, grid_i, 1, 1, blk, 1, 1, 0, prm_silu)) return false;
+    if (!jit_gemv_int4(static_cast<const uint8_t*>(d->d_qweight),
+                       static_cast<const uint16_t*>(d->d_scales),
+                       static_cast<const uint16_t*>(d->d_zeros), g_mlp_mid, g_mlp_core, d->M, d->K,
+                       d->ng, d->gs, d->is_awq))
+      return false;
+    float aw = w;
+    void* prm_axpy[] = {&g_mlp_core, &g_mlp_down, &aw, &H};
+    return jit_launch(fn_axpy, grid_h, 1, 1, blk, 1, 1, 0, prm_axpy);
+  };
+
+  for (int i = 0; i < n_experts; ++i) {
+    if (!run_one(rg[i], ru[i], rd[i], experts[i].weight)) return false;
+  }
+  if (has_shared) {
+    if (!run_one(sg, su, sd, shared_scale)) return false;
+  }
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(y, g_mlp_down, sizeof(float) * static_cast<size_t>(H), kCudaMemcpyD2H) ==
+         kCudaSuccess;
 }
 
 bool try_gemm_awq(const float* x, const AwqView& W, float* y) {

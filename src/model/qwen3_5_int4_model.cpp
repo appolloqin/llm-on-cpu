@@ -39,14 +39,16 @@ float softplus(float x) {
 }
 float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 
-// MoE: default host experts (GPU INT4 upload/D2H thrash ≈3.5 tok/s + sticky logits risk).
-// Set LLMOC_MOE_GPU_EXPERTS=1 to re-enable try_gemm_int4 for routed experts.
+// MoE experts: GPU fused path by default when CUDA on.
+// LLMOC_MOE_GPU_EXPERTS=0 → force host OpenMP; =1 → force GPU (same as default).
 bool moe_gpu_experts_enabled() {
-  static const bool on = [] {
+  static const int mode = [] {
     const char* e = std::getenv("LLMOC_MOE_GPU_EXPERTS");
-    return e && e[0] == '1' && e[1] == '\0';
+    if (!e || !e[0]) return 1;  // default on
+    if (e[0] == '0' && e[1] == '\0') return 0;
+    return 1;
   }();
-  return on;
+  return mode != 0;
 }
 
 // decode 热路径复用缓冲，避免每层 vector 分配
@@ -255,8 +257,17 @@ void Qwen35Int4Model::build_layer_packs() {
            cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
            cfg_.is_moe ? 1 : 0, cfg_.n_experts, cfg_.topk);
   if (cfg_.is_moe) {
-    LOG_INFO("Qwen35Int4 MoE path: host_experts=%d stream_act=0 awq_zp=8 (AutoAWQ); LLMOC_MOE_GPU_EXPERTS=1 enables GPU experts",
-             moe_gpu_experts_enabled() ? 0 : 1);
+    const auto sch = store_->header().scheme;
+    const char* sch_s = sch == qlwc::Scheme::kAwqSym ? "awq_sym_zp8" : "gptq_asym";
+    LOG_INFO(
+        "Qwen35Int4 MoE path: gpu_experts=%d stream_act=0 qlwc_scheme=%s; "
+        "LLMOC_MOE_GPU_EXPERTS=0 forces host experts",
+        moe_gpu_experts_enabled() ? 1 : 0, sch_s);
+    if (sch == qlwc::Scheme::kAwqSym) {
+      LOG_INFO(
+          "Qwen35Int4 MoE note: AutoAWQ with zero_point:true must be imported as gptq_asym "
+          "(re-run import_awq_hf_qlwc); awq_sym drops qzeros and collapses decode");
+    }
   }
 }
 
@@ -501,9 +512,10 @@ void Qwen35Int4Model::gemm_opt_batch(const float* X, int n, const OptW& W, float
 void Qwen35Int4Model::warm_gpu_int4_weights() {
   if (!hal::cuda::enabled()) return;
   int n_ok = 0, n_fail = 0;
-  auto try_one = [&](const qlwc::Int4View& W) {
+  auto try_one = [&](const qlwc::Int4View& W, bool pin = false) {
     if (!W.qweight || W.M <= 0 || W.K <= 0) return;
-    if (hal::cuda::prefetch_int4_weight(W))
+    const bool ok = pin ?hal::cuda::pin_int4_weight(W) :hal::cuda::prefetch_int4_weight(W);
+    if (ok)
       ++n_ok;
     else
       ++n_fail;
@@ -511,7 +523,7 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
   for (const auto& lp : layers_) {
     auto try_pass = [&](const OptW& W) {
       if (W.is_int4) {
-        try_one(W.i4);
+        try_one(W.i4, /*pin=*/true);
         return;
       }
       if (!W.pass || W.M <= 0 || W.K <= 0) return;
@@ -533,14 +545,14 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
       try_pass(lp.wout);
     }
     if (!lp.is_moe) {
-      try_one(lp.wgate);
-      try_one(lp.wup);
-      try_one(lp.wdown);
+      try_one(lp.wgate, true);
+      try_one(lp.wup, true);
+      try_one(lp.wdown, true);
     } else {
-      if (lp.router.is_int4) try_one(lp.router.i4);
-      if (lp.shared_gate.is_int4) try_one(lp.shared_gate.i4);
-      if (lp.shared_up.is_int4) try_one(lp.shared_up.i4);
-      if (lp.shared_down.is_int4) try_one(lp.shared_down.i4);
+      if (lp.router.is_int4) try_one(lp.router.i4, true);
+      if (lp.shared_gate.is_int4) try_one(lp.shared_gate.i4, true);
+      if (lp.shared_up.is_int4) try_one(lp.shared_up.i4, true);
+      if (lp.shared_down.is_int4) try_one(lp.shared_down.i4, true);
     }
   }
   // lm_head resident: INT4 → ensure_int4_resident; BF16 pass → packed W16 (no FP32 inflate)
@@ -755,9 +767,12 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
 
   std::fill(down_acc, down_acc + H, 0.f);
   const std::string base = prefix_ + "layers." + std::to_string(layer) + ".mlp.experts.";
-  const bool gpu_exp = moe_gpu_experts_enabled();
+  const bool gpu_exp = moe_gpu_experts_enabled() &&hal::cuda::enabled();
 
   // Ensure expert tensors on this thread before any OpenMP region (store ensure not parallel-safe).
+  qlwc::Int4View gates[64], ups[64], downs[64];
+  hal::cuda::MoeExpertInt4 exp_views[64];
+  bool all_int4 = true;
   for (int i = 0; i < K; ++i) {
     const int e = order[static_cast<size_t>(i)];
     const std::string eb = base + std::to_string(e) + ".";
@@ -765,6 +780,73 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
       store_->ensure(eb + "gate_proj.weight");
       store_->ensure(eb + "up_proj.weight");
       store_->ensure(eb + "down_proj.weight");
+    }
+  }
+  for (int i = 0; i < K; ++i) {
+    const int e = order[static_cast<size_t>(i)];
+    const std::string eb = base + std::to_string(e) + ".";
+    const std::string gn = eb + "gate_proj.weight";
+    const std::string un = eb + "up_proj.weight";
+    const std::string dn = eb + "down_proj.weight";
+    if (!is_int4(gn) || !is_int4(un) || !is_int4(dn)) {
+      all_int4 = false;
+      continue;
+    }
+    gates[i] = store_->get_int4(gn);
+    ups[i] = store_->get_int4(un);
+    downs[i] = store_->get_int4(dn);
+    // Shape must match MoE intermediate (import/config mismatch → host fallback).
+    if (gates[i].M != I || gates[i].K != H || ups[i].M != I || ups[i].K != H ||
+        downs[i].M != H || downs[i].K != I) {
+      all_int4 = false;
+      continue;
+    }
+    exp_views[i].gate = &gates[i];
+    exp_views[i].up = &ups[i];
+    exp_views[i].down = &downs[i];
+    exp_views[i].weight = static_cast<float>(logits[static_cast<size_t>(e)] / wsum);
+  }
+
+  // Device fused MoE: one H2D(x) + top-k SwiGLU (+ INT4 shared) + one D2H.
+  if (gpu_exp && all_int4) {
+    const qlwc::Int4View* sg = nullptr;
+    const qlwc::Int4View* su = nullptr;
+    const qlwc::Int4View* sd = nullptr;
+    float shared_scale = 0.f;
+    const bool shared_i4 =
+        lp.shared_gate.is_int4 && lp.shared_up.is_int4 && lp.shared_down.is_int4 &&
+        lp.shared_gate.i4.M == I && lp.shared_up.i4.M == I && lp.shared_down.i4.M == H;
+    if (shared_i4) {
+      shared_scale = 1.f;
+      if (lp.shared_expert_gate.pass || lp.shared_expert_gate.is_int4) {
+        float gate_logit = 0.f;
+        gemm_opt(normed, lp.shared_expert_gate, &gate_logit);
+        shared_scale = sigmoid(gate_logit);
+      }
+      sg = &lp.shared_gate.i4;
+      su = &lp.shared_up.i4;
+      sd = &lp.shared_down.i4;
+    }
+    if (hal::cuda::try_moe_ffn_int4(normed, H, I, exp_views, K, sg, su, sd, shared_scale,
+                                    down_acc)) {
+      // Shared was BF16/pass or missing from fused path — add on host/GPU via gemm_opt.
+      if (!shared_i4 && (lp.shared_gate.pass || lp.shared_gate.is_int4)) {
+        const int Is = lp.shared_gate.M > 0 ? lp.shared_gate.M : I;
+        std::vector<float> g(static_cast<size_t>(Is)), u(static_cast<size_t>(Is)),
+            mid(static_cast<size_t>(Is)), down(static_cast<size_t>(H));
+        gemm_opt(normed, lp.shared_gate, g.data());
+        gemm_opt(normed, lp.shared_up, u.data());
+        hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
+        gemm_opt(mid.data(), lp.shared_down, down.data());
+        float scale = 1.f;
+        if (lp.shared_expert_gate.pass || lp.shared_expert_gate.is_int4) {
+          float gate_logit = 0.f;
+          gemm_opt(normed, lp.shared_expert_gate, &gate_logit);
+          scale = sigmoid(gate_logit);
+        }
+        for (int d = 0; d < H; ++d) down_acc[d] += scale * down[static_cast<size_t>(d)];
+      }
+      return;
     }
   }
 
@@ -798,12 +880,13 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
       const std::string eb = base + std::to_string(e) + ".";
       gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
       gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
-    hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
+      hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
       gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
       for (int d = 0; d < H; ++d) down_acc[d] += ww * down[static_cast<size_t>(d)];
     }
 #endif
   } else {
+    // Fallback: per-GEMV GPU (sticky x) if fused MoE failed.
     std::vector<float> g(static_cast<size_t>(I)), u(static_cast<size_t>(I)),
         mid(static_cast<size_t>(I)), down(static_cast<size_t>(H));
     for (int i = 0; i < K; ++i) {
@@ -812,7 +895,7 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
       const std::string eb = base + std::to_string(e) + ".";
       gemm_w(normed, eb + "gate_proj.weight", g.data(), I, H);
       gemm_w(normed, eb + "up_proj.weight", u.data(), I, H);
-    hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
+     hal::silu_and_mul(g.data(), u.data(), mid.data(), I);
       gemm_w(mid.data(), eb + "down_proj.weight", down.data(), H, I);
       for (int d = 0; d < H; ++d) down_acc[d] += ww * down[static_cast<size_t>(d)];
     }
@@ -823,14 +906,14 @@ void Qwen35Int4Model::moe_ffn_token(int layer, const float* normed, float* down_
     std::vector<float> g(static_cast<size_t>(Is)), u(static_cast<size_t>(Is)),
         mid(static_cast<size_t>(Is)), down(static_cast<size_t>(H));
     if (!gpu_exp && lp.shared_gate.is_int4 && lp.shared_up.is_int4 && lp.shared_down.is_int4) {
-    hal::gemm_int4(normed, lp.shared_gate.i4, g.data());
-    hal::gemm_int4(normed, lp.shared_up.i4, u.data());
-    hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
-    hal::gemm_int4(mid.data(), lp.shared_down.i4, down.data());
+     hal::gemm_int4(normed, lp.shared_gate.i4, g.data());
+     hal::gemm_int4(normed, lp.shared_up.i4, u.data());
+     hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
+     hal::gemm_int4(mid.data(), lp.shared_down.i4, down.data());
     } else {
       gemm_opt(normed, lp.shared_gate, g.data());
       gemm_opt(normed, lp.shared_up, u.data());
-    hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
+     hal::silu_and_mul(g.data(), u.data(), mid.data(), Is);
       gemm_opt(mid.data(), lp.shared_down, down.data());
     }
     float scale = 1.f;

@@ -188,12 +188,18 @@ function detectHfPreQuantized(hfDir) {
     const g0 = groups.group_0 || groups[Object.keys(groups)[0]] || {};
     const wg = g0.weights || {};
     const fmt = String(qc.format || "").toLowerCase();
+    const m = String(method || "").toLowerCase();
+    let symmetric = true;
+    if (typeof wg.symmetric === "boolean") symmetric = wg.symmetric;
+    else if (typeof qc.symmetric === "boolean") symmetric = qc.symmetric;
+    else if (typeof qc.zero_point === "boolean") symmetric = !qc.zero_point;
+    else if (m === "awq") symmetric = false;
     return {
       method: method || fmt || `bits=${bits}`,
       bits,
       format: fmt,
       groupSize: wg.group_size ?? qc.group_size ?? 128,
-      symmetric: wg.symmetric ?? true,
+      symmetric,
     };
   }
   return null;
