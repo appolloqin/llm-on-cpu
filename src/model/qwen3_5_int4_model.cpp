@@ -251,7 +251,13 @@ void Qwen35Int4Model::build_layer_packs() {
              cfg_.tie_embeddings ? 1 : 0);
     return;
   }
-  for (int L = 0; L < cfg_.layers; ++L) fill_layer_pack(L);
+  for (int L = 0; L < cfg_.layers; ++L) {
+    fill_layer_pack(L);
+    if (cfg_.is_moe && ((L + 1) % 10 == 0 || L + 1 == cfg_.layers)) {
+      LOG_INFO("Qwen35Int4: fill_layer_pack %d/%d (lazy experts not loaded yet)", L + 1,
+               cfg_.layers);
+    }
+  }
   build_global_packs();
   LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d moe=%d experts=%d topk=%d",
            cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,

@@ -142,9 +142,20 @@ int main(int argc, char** argv) {
       LOG_INFO("layer_stream: window=%d device=%s loaded_bootstrap", lsc.window_layers,
                lsc.device.c_str());
     } else {
-      store.open(cfg.model_path);
+      // MoE / 大 QLWC：全量 open 会把全部专家读进 DRAM（可卡数分钟且无日志）。
+      // >4GiB 默认 lazy：只装目录 + 非 layers.*；专家按需 ensure。
+      llmoc::qlwc::OpenOptions oopt;
+      oopt.lazy = weight_bytes > (4ull << 30);
+      LOG_INFO("qlwc open: %s (%.2f GiB, lazy=%d) — MoE may take a while on first decode",
+               cfg.model_path.c_str(), weight_bytes / (1024.0 * 1024.0 * 1024.0),
+               oopt.lazy ? 1 : 0);
+      store.open(cfg.model_path, oopt);
+      LOG_INFO("qlwc open done: tensors=%zu loaded=%.2f GiB lazy=%d",
+               store.header().tensors.size(), store.loaded_bytes() / (1024.0 * 1024.0 * 1024.0),
+               store.lazy() ? 1 : 0);
     }
 
+    LOG_INFO("loading tokenizer + model config…");
     llmoc::model::HfTokenizer tok;
     tok.load(tok_dir + "/tokenizer.json");
 
@@ -154,6 +165,7 @@ int main(int argc, char** argv) {
       model.enable_layer_stream(streamer.get());
     }
     if (llmoc::hal::cuda::enabled() && !use_stream) {
+      LOG_INFO("warm_gpu_int4: pinning attn/shared/router (experts stay LRU)…");
       model.warm_gpu_int4_weights();
       const size_t need = model.resident_workspace_bytes();
       const double need_g = need / double(1ull << 30);
@@ -170,14 +182,16 @@ int main(int argc, char** argv) {
       }
     }
 
-    // 预热
+    // 预热（MoE+GPU：首次会按需从盘装专家并 H2D，可能数分钟）
     {
+      LOG_INFO("int4 warmup starting (MoE first run loads top-k experts from disk→VRAM)…");
       llmoc::model::SessionCache wc;
       model.init_cache(wc, 256);
       std::vector<float> logits;
       const auto warm_ids = tok.encode("hi");
       if (!warm_ids.empty()) {
         model.forward(warm_ids, wc, logits, true);
+        LOG_INFO("int4 warmup: prefill done, decode x4…");
         for (int i = 0; i < 4; ++i) model.forward({warm_ids.back()}, wc, logits, false);
       }
       LOG_INFO("int4 warmup: %d prefill + 4 decode forwards", static_cast<int>(warm_ids.size()));
