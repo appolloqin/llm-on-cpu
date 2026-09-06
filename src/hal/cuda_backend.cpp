@@ -1478,7 +1478,8 @@ extern "C" __global__ void gdn_prep_gb(const float* __restrict__ b, const float*
 }
 
 // Per-head rmsnorm_gated (CPU: scale = w, NOT 1+w).
-extern "C" __global__ void rmsnorm_gated_heads(const float* __restrict__ x,
+// Weight w is SHARED across heads and has length hd (matches CPU: always pass lp.nrm base).
+extern "C" __global__ void rmsnorm_gated_heads_v2(const float* __restrict__ x,
                                                const float* __restrict__ gate,
                                                const unsigned short* __restrict__ w,
                                                float* __restrict__ y, int hd, float eps,
@@ -1488,7 +1489,6 @@ extern "C" __global__ void rmsnorm_gated_heads(const float* __restrict__ x,
   const int tid = threadIdx.x;
   const float* xh = x + (size_t)h * hd;
   const float* gh = gate + (size_t)h * hd;
-  const unsigned short* wh = w + (size_t)h * hd;
   float* yh = y + (size_t)h * hd;
   float sum = 0.f;
   for (int i = tid; i < hd; i += blockDim.x) {
@@ -1509,7 +1509,8 @@ extern "C" __global__ void rmsnorm_gated_heads(const float* __restrict__ x,
     float gg = gh[i];
     if (!(gg == gg)) gg = 0.f;
     const float silu = gg / (1.f + expf(-gg));
-    yh[i] = v * inv * w16_to_f32(wh[i], is_f16) * silu;
+    // Shared norm weight (not per-head): matches host rmsnorm_gated(lp.nrm, ..., dv).
+    yh[i] = v * inv * w16_to_f32(w[i], is_f16) * silu;
   }
 }
 
@@ -2575,15 +2576,16 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
   void* fn_conv = get_jit_kernel(kActSrc, "dwconv_silu_k4");
   void* fn_pack = get_jit_kernel(kActSrc, "gdn_pack_qkv");
   void* fn_prep = get_jit_kernel(kActSrc, "gdn_prep_gb");
-  void* fn_gn = get_jit_kernel(kActSrc, "rmsnorm_gated_heads");
+  void* fn_gn = get_jit_kernel(kActSrc, "rmsnorm_gated_heads_v2");
   void* fn_gdn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
   if (!fn_rms || !fn_multi || !fn_conv || !fn_pack || !fn_prep || !fn_gn || !fn_gdn) {
     g_act_lin_last_err = "jit_kernels";
     return false;
   }
 
-  const size_t nrm_bytes = sizeof(uint16_t) * static_cast<size_t>(value_dim);
-  // Layout: mixed,z,b,a,mixed_c,q,k,v,g,beta,A,dt,cw,nrm  — b/a/g/beta/A/dt = 6*nv
+  // CPU always passes lp.nrm base with n=dv — shared weight of length dv, NOT nv*dv.
+  const size_t nrm_bytes = sizeof(uint16_t) * static_cast<size_t>(dv);
+  // Layout: mixed,z,b,a,mixed_c,q,k,v,g,beta,A,dt,cw,nrm
   const size_t floats_need =
       static_cast<size_t>(conv_dim) * 2 + static_cast<size_t>(value_dim) * 2 +
       static_cast<size_t>(nv) * 6 + static_cast<size_t>(nv) * dk * 2 +
