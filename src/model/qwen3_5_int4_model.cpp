@@ -255,7 +255,7 @@ void Qwen35Int4Model::build_layer_packs() {
            cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
            cfg_.is_moe ? 1 : 0, cfg_.n_experts, cfg_.topk);
   if (cfg_.is_moe) {
-    LOG_INFO("Qwen35Int4 MoE path: host_experts=%d host_lm_head=1 stream_act=0 (set LLMOC_MOE_GPU_EXPERTS=1 to try GPU experts)",
+    LOG_INFO("Qwen35Int4 MoE path: host_experts=%d stream_act=0 awq_zp=8 (AutoAWQ); LLMOC_MOE_GPU_EXPERTS=1 enables GPU experts",
              moe_gpu_experts_enabled() ? 0 : 1);
   }
 }
@@ -1467,8 +1467,7 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   prefix_logits_.clear();
   logits.resize(static_cast<size_t>(V));
   bool lm_from_act = false;
-  // MoE: force host lm_head (GPU vocab GEMV previously produced sticky garbage tokens).
-  if (!cfg_.is_moe && hal::cuda::enabled() && hal::cuda::decode_act_valid()) {
+  if (hal::cuda::enabled() && hal::cuda::decode_act_valid()) {
     const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
     if (lm_is_int4_) {
       lm_from_act = hal::cuda::try_lm_head_int4_from_act(final_norm_, lm_int4_, logits.data(),
@@ -1481,7 +1480,7 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   if (!lm_from_act) {
     if (lm_is_int4_) {
       bool gpu_ok = false;
-      if (!cfg_.is_moe && hal::cuda::enabled()) {
+      if (hal::cuda::enabled()) {
         gpu_ok = hal::cuda::try_gemm_int4(h.data(), lm_int4_, logits.data());
       }
       if (!gpu_ok) {
@@ -1497,12 +1496,12 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
       hal::gemm_int4(h.data(), lm_int4_, logits.data());
       }
     } else {
-      if (!cfg_.is_moe && hal::cuda::enabled() && lm_pass_ && hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
+      if (hal::cuda::enabled() && lm_pass_ && hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
                                   pass_wd_ == hal::WDtype::kF16)) {
         /* GPU resident W16 cublas SGEMM */
       } else {
       hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_,
-                            /*allow_gpu=*/!cfg_.is_moe);
+                            /*allow_gpu=*/true);
       }
     }
   }
@@ -1527,8 +1526,7 @@ bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
   Int4Scratch::fit(sc.last, static_cast<size_t>(H));
   forward_to_hidden(tokens, cache, false, sc.last.data());
   // 先尝试 GPU resident INT4 (JIT gemv_int4 M=248320 ~3ms); 失败回退 CPU AVX2 24ms
-  // MoE: skip GPU lm_head (sticky garbage risk).
-  if (!cfg_.is_moe && hal::cuda::enabled()) {
+  if (hal::cuda::enabled()) {
     Int4Scratch::fit(sc.logits, lm_int4_.M);
     if (hal::cuda::try_gemm_int4(sc.last.data(), lm_int4_, sc.logits.data())) {
       const float* lp = sc.logits.data();
@@ -1660,7 +1658,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
         hal::gemm_int4(h.data(), lm_int4_, dest);
       } else {
         hal::gemm_bias_free(h.data(), lm_pass_, dest, V, H, pass_wd_,
-                            /*allow_gpu=*/!cfg_.is_moe);
+                            /*allow_gpu=*/true);
       }
       if (t == n - 1) last_hidden_ = h;
     }

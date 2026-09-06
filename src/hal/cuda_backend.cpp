@@ -1036,7 +1036,7 @@ namespace {
 
 // kernel 源: 与 CPU hal::gemm_int4 语义一致。
 // 打包格式: qweight 行主序 M×rb(rb=(K+1)/2), 偶数 k 取低 4 位, 奇数 k 取高 4 位。
-// awq: w=(q-7)*scale; gptq: w=q*scale+zero。每 block 算一行, 256 线程, warp shuffle 归约。
+// awq: w=(q-8)*scale (AutoAWQ); gptq: w=q*scale+zero。每 block 算一行, 256 线程, warp shuffle 归约。
 const char* kGemvInt4Src = R"CUDA(
 __device__ __forceinline__ float f16_to_f32_dev(unsigned short h) {
   unsigned int sign = (h & 0x8000u) << 16;
@@ -1107,14 +1107,14 @@ extern "C" __global__ void gemv_int4(
       const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
       const float x0 = xr[k + 0], x1 = xr[k + 1], x2 = xr[k + 2], x3 = xr[k + 3];
       const float x4 = xr[k + 4], x5 = xr[k + 5], x6 = xr[k + 6], x7 = xr[k + 7];
-      const float w0 = ((float)((v.x & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w1 = ((float)((v.x >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w2 = ((float)((v.y & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w3 = ((float)((v.y >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w4 = ((float)((v.z & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w5 = ((float)((v.z >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w6 = ((float)((v.w & 0xF) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
-      const float w7 = ((float)((v.w >> 4) - (is_awq ? 7 : 0))) * s + (is_awq ? 0.f : z);
+      const float w0 = ((float)((v.x & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w1 = ((float)((v.x >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w2 = ((float)((v.y & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w3 = ((float)((v.y >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w4 = ((float)((v.z & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w5 = ((float)((v.z >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w6 = ((float)((v.w & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w7 = ((float)((v.w >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
       acc += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
     } else {
       for (int kk = k; kk < k + 8 && kk < K; ++kk) {
@@ -1123,7 +1123,7 @@ extern "C" __global__ void gemv_int4(
         const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
         const unsigned char b = qrow[kk >> 1];
         const int qi = (kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-        const float w = ((float)qi - (is_awq ? 7 : 0)) * ss + (is_awq ? 0.f : zz);
+        const float w = ((float)qi - (is_awq ? 8 : 0)) * ss + (is_awq ? 0.f : zz);
         acc += xr[kk] * w;
       }
     }
@@ -1168,7 +1168,7 @@ extern "C" __global__ void gemm_int4(
   const int m = row0 + warp_id;
   if (m >= M) return;
   const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
-  const int off0 = is_awq ? 7 : 0;
+  const int off0 = is_awq ? 8 : 0;
   constexpr int BT = 8;
   for (int b0 = 0; b0 < n; b0 += BT) {
     const int bn = (b0 + BT <= n) ? BT : (n - b0);
@@ -1303,7 +1303,7 @@ extern "C" __global__ void gemv_multi4_int4(
     if (kp + 3 < rb) {
       const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
       const float x0=x[k],x1=x[k+1],x2=x[k+2],x3=x[k+3],x4=x[k+4],x5=x[k+5],x6=x[k+6],x7=x[k+7];
-      const int off = is_awq ? 7 : 0;
+      const int off = is_awq ? 8 : 0;
       acc += x0*(((float)((v.x&0xF)-off))*s+z) + x1*(((float)((v.x>>4)-off))*s+z)
            + x2*(((float)((v.y&0xF)-off))*s+z) + x3*(((float)((v.y>>4)-off))*s+z)
            + x4*(((float)((v.z&0xF)-off))*s+z) + x5*(((float)((v.z>>4)-off))*s+z)
@@ -1315,7 +1315,7 @@ extern "C" __global__ void gemv_multi4_int4(
         const float zzv = is_awq ? 0.f : f16_to_f32_dev(my_z[gr]);
         const unsigned char b = qrow[kk >> 1];
         const int qi = (kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-        const int off = is_awq ? 7 : 0;
+        const int off = is_awq ? 8 : 0;
         acc += x[kk] * (((float)(qi - off)) * ss + zzv);
       }
     }

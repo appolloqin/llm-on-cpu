@@ -50,31 +50,31 @@ inline void unpack32_nibbles(const uint8_t* qrow_at_k_div2, __m256i& i0, __m256i
   i3 = _mm256_cvtepu8_epi32(_mm_srli_si128(p1, 8));
 }
 
-// AWQ: 累加 x*(q-7)，scale 在组外乘（减内层 mul）
+// AWQ: 累加 x*(q-8)*scale（对齐 AutoAWQ/vLLM；旧自量化 QLWC 需重量化）
 inline float dot_awq_noscale(const float* x, const uint8_t* qrow, int k0, int k1) {
   __m256 vacc0 = _mm256_setzero_ps();
   __m256 vacc1 = _mm256_setzero_ps();
   __m256 vacc2 = _mm256_setzero_ps();
   __m256 vacc3 = _mm256_setzero_ps();
-  const __m256 v7 = _mm256_set1_ps(7.f);
+  const __m256 v8 = _mm256_set1_ps(8.f);
   int k = k0;
   for (; k + 32 <= k1; k += 32) {
     __m256i i0, i1, i2, i3;
     unpack32_nibbles(qrow + (k / 2), i0, i1, i2, i3);
     vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), vacc0);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), vacc0);
     vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 8),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), vacc1);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), vacc1);
     vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 16),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), vacc2);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), vacc2);
     vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 24),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), vacc3);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), vacc3);
   }
   float acc = hsum256(_mm256_add_ps(_mm256_add_ps(vacc0, vacc1), _mm256_add_ps(vacc2, vacc3)));
   for (; k < k1; ++k) {
     const uint8_t b = qrow[k / 2];
     const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-    acc += x[k] * static_cast<float>(qi - 7);
+    acc += x[k] * static_cast<float>(qi - 8);
   }
   return acc;
 }
@@ -116,7 +116,7 @@ inline void dot_awq_noscale_2row(const float* x, const uint8_t* q0, const uint8_
   __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
   __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
   __m256 d0 = _mm256_setzero_ps(), d1 = _mm256_setzero_ps();
-  const __m256 v7 = _mm256_set1_ps(7.f);
+  const __m256 v8 = _mm256_set1_ps(8.f);
   int k = k0;
   for (; k + 32 <= k1; k += 32) {
     const __m256 x0 = _mm256_loadu_ps(x + k);
@@ -125,15 +125,15 @@ inline void dot_awq_noscale_2row(const float* x, const uint8_t* q0, const uint8_
     const __m256 x3 = _mm256_loadu_ps(x + k + 24);
     __m256i i0, i1, i2, i3;
     unpack32_nibbles(q0 + (k / 2), i0, i1, i2, i3);
-    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), a0);
-    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), b0);
-    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), c0);
-    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), d0);
+    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a0);
+    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b0);
+    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c0);
+    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d0);
     unpack32_nibbles(q1 + (k / 2), i0, i1, i2, i3);
-    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), a1);
-    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), b1);
-    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), c1);
-    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), d1);
+    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a1);
+    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b1);
+    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c1);
+    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d1);
   }
   out0 = hsum256(_mm256_add_ps(_mm256_add_ps(a0, b0), _mm256_add_ps(c0, d0)));
   out1 = hsum256(_mm256_add_ps(_mm256_add_ps(a1, b1), _mm256_add_ps(c1, d1)));
@@ -141,8 +141,8 @@ inline void dot_awq_noscale_2row(const float* x, const uint8_t* q0, const uint8_
     const uint8_t qb0 = q0[k / 2], qb1 = q1[k / 2];
     const int q0i = (k & 1) ? ((qb0 >> 4) & 0xF) : (qb0 & 0xF);
     const int q1i = (k & 1) ? ((qb1 >> 4) & 0xF) : (qb1 & 0xF);
-    out0 += x[k] * static_cast<float>(q0i - 7);
-    out1 += x[k] * static_cast<float>(q1i - 7);
+    out0 += x[k] * static_cast<float>(q0i - 8);
+    out1 += x[k] * static_cast<float>(q1i - 8);
   }
 }
 
@@ -158,7 +158,7 @@ inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_
          c3 = _mm256_setzero_ps();
   __m256 d0 = _mm256_setzero_ps(), d1 = _mm256_setzero_ps(), d2 = _mm256_setzero_ps(),
          d3 = _mm256_setzero_ps();
-  const __m256 v7 = _mm256_set1_ps(7.f);
+  const __m256 v8 = _mm256_set1_ps(8.f);
   int k = k0;
   for (; k + 32 <= k1; k += 32) {
     const __m256 x0 = _mm256_loadu_ps(x + k);
@@ -167,25 +167,25 @@ inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_
     const __m256 x3 = _mm256_loadu_ps(x + k + 24);
     __m256i i0, i1, i2, i3;
     unpack32_nibbles(q0 + (k / 2), i0, i1, i2, i3);
-    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), a0);
-    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), b0);
-    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), c0);
-    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), d0);
+    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a0);
+    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b0);
+    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c0);
+    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d0);
     unpack32_nibbles(q1 + (k / 2), i0, i1, i2, i3);
-    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), a1);
-    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), b1);
-    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), c1);
-    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), d1);
+    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a1);
+    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b1);
+    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c1);
+    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d1);
     unpack32_nibbles(q2 + (k / 2), i0, i1, i2, i3);
-    a2 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), a2);
-    b2 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), b2);
-    c2 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), c2);
-    d2 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), d2);
+    a2 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a2);
+    b2 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b2);
+    c2 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c2);
+    d2 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d2);
     unpack32_nibbles(q3 + (k / 2), i0, i1, i2, i3);
-    a3 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v7), a3);
-    b3 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v7), b3);
-    c3 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v7), c3);
-    d3 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v7), d3);
+    a3 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a3);
+    b3 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b3);
+    c3 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c3);
+    d3 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d3);
   }
   out0 = hsum256(_mm256_add_ps(_mm256_add_ps(a0, b0), _mm256_add_ps(c0, d0)));
   out1 = hsum256(_mm256_add_ps(_mm256_add_ps(a1, b1), _mm256_add_ps(c1, d1)));
@@ -194,10 +194,10 @@ inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_
   for (; k < k1; ++k) {
     const uint8_t qb0 = q0[k / 2], qb1 = q1[k / 2], qb2 = q2[k / 2], qb3 = q3[k / 2];
     const int s = (k & 1) ? 4 : 0;
-    out0 += x[k] * static_cast<float>(((qb0 >> s) & 0xF) - 7);
-    out1 += x[k] * static_cast<float>(((qb1 >> s) & 0xF) - 7);
-    out2 += x[k] * static_cast<float>(((qb2 >> s) & 0xF) - 7);
-    out3 += x[k] * static_cast<float>(((qb3 >> s) & 0xF) - 7);
+    out0 += x[k] * static_cast<float>(((qb0 >> s) & 0xF) - 8);
+    out1 += x[k] * static_cast<float>(((qb1 >> s) & 0xF) - 8);
+    out2 += x[k] * static_cast<float>(((qb2 >> s) & 0xF) - 8);
+    out3 += x[k] * static_cast<float>(((qb3 >> s) & 0xF) - 8);
   }
 }
 
@@ -333,7 +333,7 @@ float gemm_row_scalar(const float* x, const uint8_t* qbase, int M, int K, int m,
     for (int k = k0; k < k1; ++k) {
       const uint8_t b = qrow[k / 2];
       const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-      float w = awq ? static_cast<float>(qi - 7) * scale : static_cast<float>(qi) * scale + zero;
+      float w = awq ? static_cast<float>(qi - 8) * scale : static_cast<float>(qi) * scale + zero;
       acc += static_cast<double>(x[k]) * w;
     }
   }
@@ -584,7 +584,7 @@ void dequant_int4_row(const qlwc::Int4View& W, int row, float* out) {
       const uint8_t b = qrow[k / 2];
       const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
       if (awq)
-        out[k] = static_cast<float>(qi - 7) * scale;
+        out[k] = static_cast<float>(qi - 8) * scale;
       else
         out[k] = static_cast<float>(qi) * scale + zero;
     }

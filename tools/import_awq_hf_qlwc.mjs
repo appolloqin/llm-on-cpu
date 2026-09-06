@@ -189,11 +189,11 @@ function quantAwqSym(W, M, K, groupSize) {
         const a = Math.abs(W[base + k]);
         if (a > amax) amax = a;
       }
-      let scale = amax / 7.0;
+      let scale = amax / 8.0;
       if (scale < 1e-8) scale = 1e-8;
       scales[m * ng + g] = scale;
       for (let k = 0; k < groupSize; ++k) {
-        let qq = Math.round(W[base + k] / scale) + 7;
+        let qq = Math.round(W[base + k] / scale) + 8;
         if (qq < 0) qq = 0;
         if (qq > 15) qq = 15;
         q[base + k] = qq;
@@ -907,7 +907,7 @@ function dequantCt(packed, scales, zeros, M, K, gs, scaleDt, zpDt, symmetric) {
       const g = Math.floor(k / gs);
       const q = unpackCtNibble(packed, M, K, m, k);
       const sc = pickScale(scaleF, M, ng, m, g, scaleLayout);
-      if (symmetric) W[m * K + k] = (q - 7) * sc;
+      if (symmetric) W[m * K + k] = (q - 8) * sc;
       else {
         const zp = zpF ? pickScale(zpF, M, ng, m, g, zpLayout) : 0;
         W[m * K + k] = (q - zp) * sc;
