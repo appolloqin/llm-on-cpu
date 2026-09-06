@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -1513,24 +1514,26 @@ extern "C" __global__ void rmsnorm_gated_heads(const float* __restrict__ x,
 }
 
 // GEMV with packed BF16/F16 weights (no FP32 inflate). y[M] = W[M,K] @ x[K]
+// Grid-stride over rows so M > 65535 (lm_head) is safe on all CC.
 extern "C" __global__ void gemv_w16(const unsigned short* __restrict__ W, const float* __restrict__ x,
                                     float* __restrict__ y, int M, int K, int is_f16) {
-  const int m = blockIdx.x;
-  if (m >= M) return;
-  const unsigned short* row = W + (size_t)m * K;
   extern __shared__ float smem[];
   const int tid = threadIdx.x;
-  float sum = 0.f;
-  for (int k = tid; k < K; k += blockDim.x) sum += w16_to_f32(row[k], is_f16) * x[k];
-  smem[tid] = sum;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) smem[tid] += smem[tid + s];
+  for (int m = (int)blockIdx.x; m < M; m += (int)gridDim.x) {
+    const unsigned short* row = W + (size_t)m * (size_t)K;
+    float sum = 0.f;
+    for (int k = tid; k < K; k += blockDim.x) sum += w16_to_f32(row[k], is_f16) * x[k];
+    smem[tid] = sum;
     __syncthreads();
-  }
-  if (tid == 0) {
-    float o = smem[0];
-    y[m] = (o == o) ? o : 0.f;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      if (tid < s) smem[tid] += smem[tid + s];
+      __syncthreads();
+    }
+    if (tid == 0) {
+      float o = smem[0];
+      y[m] = (o == o) ? o : 0.f;
+    }
+    __syncthreads();
   }
 }
 )CUDA";
@@ -1709,7 +1712,9 @@ bool jit_gemv_w16(const uint16_t* d_W, const float* d_x, float* d_y, int M, int 
   int is_f16_i = is_f16 ? 1 : 0;
   void* params[] = {&d_W, &d_x, &d_y, &M, &K, &is_f16_i};
   constexpr unsigned BLOCK = 256;
-  return jit_launch(fn, static_cast<unsigned>(M), 1, 1, BLOCK, 1, 1, BLOCK * sizeof(float), params);
+  // Cap grid; kernel grid-strides over rows (critical for vocab-sized M > 65535).
+  const unsigned grid = static_cast<unsigned>(M < 4096 ? M : 4096);
+  return jit_launch(fn, grid, 1, 1, BLOCK, 1, 1, BLOCK * sizeof(float), params);
 }
 
 // Device GEMV for W16: prefer FP32+cublas for mid-size (out/a/b); pack+JIT for lm_head.
@@ -2992,6 +2997,14 @@ bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pas
   if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(V),
                        kCudaMemcpyD2H) != kCudaSuccess)
     return false;
+  // Reject NaN/Inf-dominated logits (bad kernel/launch) so caller can host-fallback.
+  int bad = 0;
+  const int probe = (V < 4096) ? V : 4096;
+  for (int i = 0; i < probe; ++i) {
+    const float v = logits_host[i];
+    if (v != v || v > 1e30f || v < -1e30f) ++bad;
+  }
+  if (bad * 4 > probe) return false;
   ++g_act_lm_ok;
   return true;
 }

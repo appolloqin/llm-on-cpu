@@ -1094,16 +1094,20 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
   }
 
   const int seq_len = Lkv.seq + 1;
+  const int kv_pos = Lkv.seq;
   hal::attn_decode_one(sc.qq.data(), Lkv.k.data(), Lkv.v.data(), sc.attn_heads.data(), nh, nkv, hd,
                        seq_len, cache.max_seq(), scale);
-  Lkv.seq += 1;
 
   for (int i = 0; i < nh * hd; ++i) sc.attn_heads[i] *= sigmoid(sc.gate[i]);
 
   // o_proj + residual add + MLP on device act (no residual PCIe).
   if (!hal::cuda::try_ffn_on_act(sc.attn_heads.data(), nh * hd, &lp.wo, nullptr, false, lp.ln2,
-                                 lp.wgate, lp.wup, lp.wdown, I, cfg_.rms_eps, ln_f16))
+                                 lp.wgate, lp.wup, lp.wdown, I, cfg_.rms_eps, ln_f16)) {
+    // Roll back KV slot so host fallback can rewrite the same position.
+    (void)kv_pos;
     return false;
+  }
+  Lkv.seq += 1;
   hal::cuda::note_full_attn_ok();
   return true;
 }
