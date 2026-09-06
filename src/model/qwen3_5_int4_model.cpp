@@ -243,19 +243,19 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
 
 void Qwen35Int4Model::build_layer_packs() {
   layers_.assign(cfg_.layers, {});
-  if (store_->lazy()) {
-    // 层窗口路径：仅装全局；各层在 pin 后 fill_layer_pack
+  // 仅 layer_stream（有 streamer_）延迟装层；QlwcStore::lazy 仍须在此 fill（ensure 按需读盘）。
+  if (streamer_) {
     build_global_packs();
-    LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d (layer_stream lazy)",
+    LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d (layer_stream deferred pack)",
              cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v,
              cfg_.tie_embeddings ? 1 : 0);
     return;
   }
   for (int L = 0; L < cfg_.layers; ++L) {
     fill_layer_pack(L);
-    if (cfg_.is_moe && ((L + 1) % 10 == 0 || L + 1 == cfg_.layers)) {
-      LOG_INFO("Qwen35Int4: fill_layer_pack %d/%d (lazy experts not loaded yet)", L + 1,
-               cfg_.layers);
+    if ((L + 1) % 10 == 0 || L + 1 == cfg_.layers) {
+      LOG_INFO("Qwen35Int4: fill_layer_pack %d/%d lazy_store=%d", L + 1, cfg_.layers,
+               store_->lazy() ? 1 : 0);
     }
   }
   build_global_packs();
