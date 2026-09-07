@@ -52,6 +52,7 @@ add_library(llmoc_weights STATIC
   src/common/omp_tune.cpp
   src/hal/amx_gemm.cpp
   src/hal/cpu_ops.cpp
+  src/hal/cpu_ops_attn.cpp
   src/hal/gated_delta_chunk.cpp
   src/hal/cuda_backend.cpp
   src/hal/int4_ops.cpp
@@ -82,6 +83,8 @@ if(MSVC)
   target_compile_options(llmoc_weights PRIVATE /arch:AVX2)
   target_compile_definitions(llmoc_weights PUBLIC LLMOC_ENABLE_AVX2=1)
   message(STATUS "AVX2/FMA kernels: enabled (/arch:AVX2)")
+  # Softmax/attn prefill stay SSE2 — avoids mixing AVX codegen into libm exp paths on MSVC too.
+  set_source_files_properties(src/hal/cpu_ops_attn.cpp PROPERTIES COMPILE_OPTIONS "/arch:SSE2")
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag("-mavx2 -mfma" LLMOC_HAS_AVX2_FMA)
@@ -89,6 +92,9 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(llmoc_weights PRIVATE -mavx2 -mfma)
     target_compile_definitions(llmoc_weights PUBLIC LLMOC_ENABLE_AVX2=1)
     message(STATUS "AVX2/FMA kernels: enabled (-mavx2 -mfma)")
+    # Override target -mavx2 for attn/softmax (Linux GCC CI: AVX TU + naive ref → ~1e10).
+    set_source_files_properties(src/hal/cpu_ops_attn.cpp PROPERTIES
+      COMPILE_OPTIONS "-mno-avx;-mno-avx2;-mno-fma")
   else()
     message(STATUS "AVX2/FMA kernels: unavailable")
   endif()

@@ -1,5 +1,6 @@
 # llm-on-cpu :: build + package (Windows / Linux / macOS) + source archive
 # push 到 main/master（或 workflow_dispatch）→ 自动 bump patch 并发布 GitHub Release
+# 发布门禁：仅要求 Windows 构建成功；Linux/macOS 失败不阻断 Release。
 name: CI
 
 on:
@@ -78,21 +79,57 @@ jobs:
           path: dist/llm-on-cpu-*-src.zip
           if-no-files-found: error
 
-  build:
+  # ---- Release gate: Windows only ----
+  build-windows:
+    name: Build (windows-x64)
+    needs: [prepare]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        shell: pwsh
+        run: choco install ninja -y
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure & build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure
+      - name: Package application
+        shell: bash
+        env:
+          PKG_VER: ${{ needs.prepare.outputs.pkg_ver }}
+          BUILD_DIR: build
+          PLATFORM_ID: windows-x64
+        run: |
+          set -euo pipefail
+          bash scripts/package_app.sh
+          ls -lh dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llm-on-cpu-windows-x64
+          path: dist/llm-on-cpu-*-windows-x64.zip
+          if-no-files-found: error
+
+  # ---- Best-effort: Linux x86_64 / macOS arm64 (do not block release) ----
+  build-optional:
     name: Build (${{ matrix.id }})
     needs: [prepare]
     runs-on: ${{ matrix.os }}
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             id: linux-x64
-          - os: windows-2022
-            id: windows-x64
           - os: macos-14
             id: macos-arm64
-
     steps:
       - uses: actions/checkout@v4
 
@@ -109,17 +146,6 @@ jobs:
           brew install cmake ninja libomp
           echo "OpenMP_ROOT=$(brew --prefix libomp)" >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=$(brew --prefix libomp)" >> "$GITHUB_ENV"
-
-      - name: Install deps (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install ninja -y
-
-      - name: Setup MSVC (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
 
       - name: Configure & build
         shell: bash
@@ -153,8 +179,13 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [prepare, source, build]
-    if: needs.prepare.outputs.do_release == 'true'
+    # Wait for optional legs too (so their zips can be included), but only Windows is required.
+    needs: [prepare, source, build-windows, build-optional]
+    if: >-
+      always() &&
+      needs.prepare.outputs.do_release == 'true' &&
+      needs.build-windows.result == 'success' &&
+      needs.source.result == 'success'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -162,12 +193,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: llm-on-cpu-*
+          merge-multiple: false
       - name: Collect assets
         run: |
           set -euo pipefail
           mkdir -p release-assets
           find artifacts -type f -name '*.zip' -exec cp -v {} release-assets/ \;
           ls -lh release-assets/
+          test -n "$(find release-assets -name '*windows-x64.zip' | head -n1)"
+          test -n "$(find release-assets -name '*-src.zip' | head -n1)"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
