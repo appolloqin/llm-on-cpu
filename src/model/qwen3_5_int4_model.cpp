@@ -965,29 +965,30 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     auto& conv_state = Lkv.linear.conv;
     const float* cw = lp.conv_w_f.data();
     const int ck = cfg_.conv_k;
-    for (int t = 0; t < n_tok; ++t) {
-      const float* xin = sc.mixed.data() + t * conv_dim;
-      float* xout = sc.mixed_c.data() + t * conv_dim;
+    // Parallelize over channels (state is per-c); tokens stay serial per channel.
+    // Old: omp fork inside for(t) → ~T forks/layer and kills prefill.
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if (conv_dim >= 1024 && !omp_in_parallel())
+#pragma omp parallel for schedule(static) if (conv_dim >= 256 && n_tok >= 1 && !omp_in_parallel())
 #endif
-      for (int c = 0; c < conv_dim; ++c) {
-        float* st = &conv_state[static_cast<size_t>(c) * ck];
-        const float* wk = cw + static_cast<size_t>(c) * ck;
-        // depthwise conv_k=4 展开：shift + silu(dot)
+    for (int c = 0; c < conv_dim; ++c) {
+      float* st = &conv_state[static_cast<size_t>(c) * ck];
+      const float* wk = cw + static_cast<size_t>(c) * ck;
+      for (int t = 0; t < n_tok; ++t) {
+        const float xin = sc.mixed[static_cast<size_t>(t) * conv_dim + c];
+        float* xout = &sc.mixed_c[static_cast<size_t>(t) * conv_dim + c];
         if (ck == 4) {
           st[3] = st[2];
           st[2] = st[1];
           st[1] = st[0];
-          st[0] = xin[c];
+          st[0] = xin;
           const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
-          xout[c] = acc / (1.f + std::exp(-acc));
+          *xout = acc / (1.f + std::exp(-acc));
         } else {
           for (int k = ck - 1; k > 0; --k) st[k] = st[k - 1];
-          st[0] = xin[c];
+          st[0] = xin;
           float acc = 0.f;
           for (int k = 0; k < ck; ++k) acc += st[k] * wk[ck - 1 - k];
-          xout[c] = acc / (1.f + std::exp(-acc));
+          *xout = acc / (1.f + std::exp(-acc));
         }
       }
     }

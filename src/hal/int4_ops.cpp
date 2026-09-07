@@ -463,90 +463,99 @@ void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, fl
   }
   auto scale_at = [&](int m, int g) -> float { return scf[static_cast<size_t>(m) * ng + g]; };
 
-  // 按 M 并行；同一组 weight 行对全部 token 复用
+  // Prefill: tile tokens so an X block stays in L2/L3 while streaming weight rows.
+  // (Old: m-outer then all-t re-read X once per row-group → L3 thrash at T≳1k.)
+  const int Tb = (n >= 256) ? 64 : (n >= 64) ? 32 : n;
+
   if (M >= 4096) {
+    for (int t0 = 0; t0 < n; t0 += Tb) {
+      const int t1 = std::min(n, t0 + Tb);
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
-    for (int m0 = 0; m0 < M; m0 += 4) {
-      if (m0 + 3 < M) {
-        const uint8_t* q0 = W.qweight + static_cast<size_t>(m0) * rb;
-        const uint8_t* q1 = W.qweight + static_cast<size_t>(m0 + 1) * rb;
-        const uint8_t* q2 = W.qweight + static_cast<size_t>(m0 + 2) * rb;
-        const uint8_t* q3 = W.qweight + static_cast<size_t>(m0 + 3) * rb;
-        if (m0 + 4 < M) {
-          _mm_prefetch(reinterpret_cast<const char*>(W.qweight + static_cast<size_t>(m0 + 4) * rb),
-                       _MM_HINT_T0);
-        }
-        for (int t = 0; t < n; ++t) {
-          const float* x = X + static_cast<size_t>(t) * K;
-          float* y = Y + static_cast<size_t>(t) * M;
-          float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
-          for (int g = 0; g < ng; ++g) {
-            const int k0 = g * gs;
-            const int k1 = std::min(K, k0 + gs);
-            float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
-            dot_awq_noscale_4row(x, q0, q1, q2, q3, k0, k1, awq_zp, p0, p1, p2, p3);
-            acc0 += p0 * scale_at(m0, g);
-            acc1 += p1 * scale_at(m0 + 1, g);
-            acc2 += p2 * scale_at(m0 + 2, g);
-            acc3 += p3 * scale_at(m0 + 3, g);
+      for (int m0 = 0; m0 < M; m0 += 4) {
+        if (m0 + 3 < M) {
+          const uint8_t* q0 = W.qweight + static_cast<size_t>(m0) * rb;
+          const uint8_t* q1 = W.qweight + static_cast<size_t>(m0 + 1) * rb;
+          const uint8_t* q2 = W.qweight + static_cast<size_t>(m0 + 2) * rb;
+          const uint8_t* q3 = W.qweight + static_cast<size_t>(m0 + 3) * rb;
+          if (m0 + 4 < M) {
+            _mm_prefetch(reinterpret_cast<const char*>(W.qweight + static_cast<size_t>(m0 + 4) * rb),
+                         _MM_HINT_T0);
           }
-          y[m0] = std::isfinite(acc0) ? acc0 : 0.f;
-          y[m0 + 1] = std::isfinite(acc1) ? acc1 : 0.f;
-          y[m0 + 2] = std::isfinite(acc2) ? acc2 : 0.f;
-          y[m0 + 3] = std::isfinite(acc3) ? acc3 : 0.f;
-        }
-      } else {
-        for (int m = m0; m < M; ++m) {
-          const uint8_t* qrow = W.qweight + static_cast<size_t>(m) * rb;
-          for (int t = 0; t < n; ++t) {
+          for (int t = t0; t < t1; ++t) {
             const float* x = X + static_cast<size_t>(t) * K;
-            float acc = 0.f;
+            float* y = Y + static_cast<size_t>(t) * M;
+            float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
             for (int g = 0; g < ng; ++g) {
               const int k0 = g * gs;
               const int k1 = std::min(K, k0 + gs);
-              acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m, g);
+              float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+              dot_awq_noscale_4row(x, q0, q1, q2, q3, k0, k1, awq_zp, p0, p1, p2, p3);
+              acc0 += p0 * scale_at(m0, g);
+              acc1 += p1 * scale_at(m0 + 1, g);
+              acc2 += p2 * scale_at(m0 + 2, g);
+              acc3 += p3 * scale_at(m0 + 3, g);
             }
-            Y[static_cast<size_t>(t) * M + m] = std::isfinite(acc) ? acc : 0.f;
+            y[m0] = std::isfinite(acc0) ? acc0 : 0.f;
+            y[m0 + 1] = std::isfinite(acc1) ? acc1 : 0.f;
+            y[m0 + 2] = std::isfinite(acc2) ? acc2 : 0.f;
+            y[m0 + 3] = std::isfinite(acc3) ? acc3 : 0.f;
+          }
+        } else {
+          for (int m = m0; m < M; ++m) {
+            const uint8_t* qrow = W.qweight + static_cast<size_t>(m) * rb;
+            for (int t = t0; t < t1; ++t) {
+              const float* x = X + static_cast<size_t>(t) * K;
+              float acc = 0.f;
+              for (int g = 0; g < ng; ++g) {
+                const int k0 = g * gs;
+                const int k1 = std::min(K, k0 + gs);
+                acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m, g);
+              }
+              Y[static_cast<size_t>(t) * M + m] = std::isfinite(acc) ? acc : 0.f;
+            }
           }
         }
       }
     }
   } else {
+    for (int t0 = 0; t0 < n; t0 += Tb) {
+      const int t1 = std::min(n, t0 + Tb);
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (M >= 64)
 #endif
-    for (int m0 = 0; m0 < M; m0 += 2) {
-      if (m0 + 1 < M) {
-        const uint8_t* q0 = W.qweight + static_cast<size_t>(m0) * rb;
-        const uint8_t* q1 = W.qweight + static_cast<size_t>(m0 + 1) * rb;
-        for (int t = 0; t < n; ++t) {
-          const float* x = X + static_cast<size_t>(t) * K;
-          float* y = Y + static_cast<size_t>(t) * M;
-          float acc0 = 0.f, acc1 = 0.f;
-          for (int g = 0; g < ng; ++g) {
-            const int k0 = g * gs;
-            const int k1 = std::min(K, k0 + gs);
-            float p0 = 0.f, p1 = 0.f;
-            dot_awq_noscale_2row(x, q0, q1, k0, k1, awq_zp, p0, p1);
-            acc0 += p0 * scale_at(m0, g);
-            acc1 += p1 * scale_at(m0 + 1, g);
+      for (int m0 = 0; m0 < M; m0 += 2) {
+        if (m0 + 1 < M) {
+          const uint8_t* q0 = W.qweight + static_cast<size_t>(m0) * rb;
+          const uint8_t* q1 = W.qweight + static_cast<size_t>(m0 + 1) * rb;
+          for (int t = t0; t < t1; ++t) {
+            const float* x = X + static_cast<size_t>(t) * K;
+            float* y = Y + static_cast<size_t>(t) * M;
+            float acc0 = 0.f, acc1 = 0.f;
+            for (int g = 0; g < ng; ++g) {
+              const int k0 = g * gs;
+              const int k1 = std::min(K, k0 + gs);
+              float p0 = 0.f, p1 = 0.f;
+              dot_awq_noscale_2row(x, q0, q1, k0, k1, awq_zp, p0, p1);
+              acc0 += p0 * scale_at(m0, g);
+              acc1 += p1 * scale_at(m0 + 1, g);
+            }
+            y[m0] = std::isfinite(acc0) ? acc0 : 0.f;
+            y[m0 + 1] = std::isfinite(acc1) ? acc1 : 0.f;
           }
-          y[m0] = std::isfinite(acc0) ? acc0 : 0.f;
-          y[m0 + 1] = std::isfinite(acc1) ? acc1 : 0.f;
-        }
-      } else {
-        const uint8_t* qrow = W.qweight + static_cast<size_t>(m0) * rb;
-        for (int t = 0; t < n; ++t) {
-          const float* x = X + static_cast<size_t>(t) * K;
-          float acc = 0.f;
-          for (int g = 0; g < ng; ++g) {
-            const int k0 = g * gs;
-            const int k1 = std::min(K, k0 + gs);
-            acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m0, g);
+        } else {
+          const uint8_t* qrow = W.qweight + static_cast<size_t>(m0) * rb;
+          for (int t = t0; t < t1; ++t) {
+            const float* x = X + static_cast<size_t>(t) * K;
+            float acc = 0.f;
+            for (int g = 0; g < ng; ++g) {
+              const int k0 = g * gs;
+              const int k1 = std::min(K, k0 + gs);
+              acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m0, g);
+            }
+            Y[static_cast<size_t>(t) * M + m0] = std::isfinite(acc) ? acc : 0.f;
           }
-          Y[static_cast<size_t>(t) * M + m0] = std::isfinite(acc) ? acc : 0.f;
         }
       }
     }
