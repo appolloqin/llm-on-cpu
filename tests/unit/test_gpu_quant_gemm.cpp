@@ -9,6 +9,7 @@
 #include "glm/hal/glm_awq_int4_ops.h"
 #include "glm/hal/glm_nvfp4_ops.h"
 #include "test_main.h"
+#include "weights/qlwc_format.h"
 
 using namespace llmoc;
 
@@ -154,6 +155,7 @@ TINY_TEST(GpuQuant, AwqGemvJitMatchesCpu) {
   W.zeros = nullptr;
   W.M = M; W.K = K; W.group_size = gs;
   W.scheme = qlwc::Scheme::kAwqSym;
+  W.awq_zp = qlwc::kLocalAwqSymZero;
   hal::gemm_int4(x.data(), W, y_cpu.data());
 
   void* dq = hal::cuda::device_alloc(packed.size());
@@ -167,7 +169,8 @@ TINY_TEST(GpuQuant, AwqGemvJitMatchesCpu) {
   EXPECT_TRUE(hal::cuda::jit_gemv_int4(reinterpret_cast<const uint8_t*>(dq),
                                        reinterpret_cast<const uint16_t*>(ds), nullptr,
                                        reinterpret_cast<const float*>(dx),
-                                       reinterpret_cast<float*>(dy), M, K, ng, gs, true));
+                                       reinterpret_cast<float*>(dy), M, K, ng, gs, true,
+                                       qlwc::kLocalAwqSymZero));
   EXPECT_TRUE(hal::cuda::d2h(y_gpu.data(), dy, M * 4));
   for (int m = 0; m < M; ++m) {
     EXPECT_TRUE(std::fabs(y_gpu[m] - y_cpu[m]) < 1e-3f * (1.f + std::fabs(y_cpu[m])));
@@ -227,7 +230,8 @@ TINY_TEST(GpuQuant, GptqGemvJitMatchesCpu) {
                                        reinterpret_cast<const uint16_t*>(ds),
                                        reinterpret_cast<const uint16_t*>(dz),
                                        reinterpret_cast<const float*>(dx),
-                                       reinterpret_cast<float*>(dy), M, K, ng, gs, false));
+                                       reinterpret_cast<float*>(dy), M, K, ng, gs, false,
+                                       /*awq_zp=*/0));
   EXPECT_TRUE(hal::cuda::d2h(y_gpu.data(), dy, M * 4));
   for (int m = 0; m < M; ++m) {
     EXPECT_TRUE(std::fabs(y_gpu[m] - y_cpu[m]) < 1e-3f * (1.f + std::fabs(y_cpu[m])));
