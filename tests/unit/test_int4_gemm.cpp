@@ -6,6 +6,7 @@
 #include "hal/cuda_backend.h"
 #include "hal/int4_ops.h"
 #include "test_main.h"
+#include "weights/qlwc_format.h"
 
 using namespace llmoc;
 
@@ -55,13 +56,15 @@ TINY_TEST(Int4, GemmAwqMatchesScalarRef) {
   W.K = K;
   W.group_size = gs;
   W.scheme = qlwc::Scheme::kAwqSym;
+  W.awq_zp = qlwc::kLocalAwqSymZero;
 
   for (int m = 0; m < M; ++m) {
     float acc = 0.f;
     const float sc = llmoc::hal::f16_to_f32(scales[m]);
     for (int k = 0; k < K; ++k) {
-      const float w =
-          static_cast<float>(static_cast<int>(q[static_cast<size_t>(m) * K + k]) - 8) * sc;
+      const float w = static_cast<float>(static_cast<int>(q[static_cast<size_t>(m) * K + k]) -
+                                         qlwc::kLocalAwqSymZero) *
+                      sc;
       acc += x[k] * w;
     }
     y_ref[m] = acc;
