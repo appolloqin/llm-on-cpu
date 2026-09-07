@@ -8,6 +8,10 @@
 #include "hal/cpu_ops.h"
 #include "test_main.h"
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 using namespace llmoc;
 
 namespace {
@@ -65,6 +69,35 @@ TINY_TEST(GatedDelta, ChunkMatchesSerial) {
   EXPECT_TRUE(e_st < 1e-5f);
 }
 
+TINY_TEST(Attn, PrefillParallelMatchesSerial) {
+  // Race detector: same library kernel under 1 thread vs many (Linux GCC OpenMP).
+  const int seq = 48, nh = 4, nkv = 2, hd = 32;
+  const float scale = 1.f / std::sqrt(static_cast<float>(hd));
+  std::vector<float> q(seq * nh * hd), k(seq * nkv * hd), v(seq * nkv * hd);
+  for (size_t i = 0; i < q.size(); ++i) q[i] = 0.01f * static_cast<float>((i % 9) - 4);
+  for (size_t i = 0; i < k.size(); ++i) {
+    k[i] = 0.02f * static_cast<float>((i % 7) - 3);
+    v[i] = 0.015f * static_cast<float>((i % 5) - 2);
+  }
+  std::vector<float> serial(seq * nh * hd), parallel(seq * nh * hd);
+
+#if defined(_OPENMP)
+  const int old = omp_get_max_threads();
+  omp_set_num_threads(1);
+  hal::attn_prefill(q.data(), k.data(), v.data(), serial.data(), seq, nh, nkv, hd, scale);
+  omp_set_num_threads(std::max(8, old));
+  hal::attn_prefill(q.data(), k.data(), v.data(), parallel.data(), seq, nh, nkv, hd, scale);
+  omp_set_num_threads(old);
+#else
+  hal::attn_prefill(q.data(), k.data(), v.data(), serial.data(), seq, nh, nkv, hd, scale);
+  hal::attn_prefill(q.data(), k.data(), v.data(), parallel.data(), seq, nh, nkv, hd, scale);
+#endif
+
+  const float e = max_abs_diff(serial, parallel);
+  if (!(e < 1e-6f)) std::fprintf(stderr, "Attn.PrefillParallelMatchesSerial maxabs=%.8g\n", e);
+  EXPECT_TRUE(e < 1e-6f);
+}
+
 TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
   const int seq = 48, nh = 4, nkv = 2, hd = 32;
   const float scale = 1.f / std::sqrt(static_cast<float>(hd));
@@ -76,7 +109,7 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
   }
   std::vector<float> out(seq * nh * hd), ref(seq * nh * hd);
 
-  // Reference mirrors attn_prefill math (softmax_inplace semantics via *inv).
+  // Reference mirrors attn_prefill (double dots + softmax_inplace semantics).
   const int grp = nh / nkv;
   for (int tq = 0; tq < seq; ++tq) {
     for (int h = 0; h < nh; ++h) {
@@ -85,9 +118,11 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
       const float* qh = q.data() + (tq * nh + h) * hd;
       for (int tk = 0; tk <= tq; ++tk) {
         const float* kt = k.data() + (tk * nkv + hkv) * hd;
-        float dot = 0.f;
-        for (int d = 0; d < hd; ++d) dot += qh[d] * kt[d];
-        scores[tk] = dot * scale;
+        double dot = 0.0;
+        for (int d = 0; d < hd; ++d) {
+          dot += static_cast<double>(qh[d]) * static_cast<double>(kt[d]);
+        }
+        scores[tk] = static_cast<float>(dot) * scale;
       }
       float m = scores[0];
       for (int i = 1; i <= tq; ++i) m = std::max(m, scores[i]);
@@ -110,5 +145,7 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
   hal::attn_prefill(q.data(), k.data(), v.data(), out.data(), seq, nh, nkv, hd, scale);
   float e = 0.f;
   for (size_t i = 0; i < out.size(); ++i) e = std::max(e, std::fabs(out[i] - ref[i]));
-  EXPECT_TRUE(e < 1e-5f);
+  // llmoc_weights is built with -mavx2 -mfma on Linux; test TU is not. Allow tiny drift.
+  if (!(e < 1e-4f)) std::fprintf(stderr, "Attn.PrefillMatchesNaiveSmall maxabs=%.8g\n", e);
+  EXPECT_TRUE(e < 1e-4f);
 }

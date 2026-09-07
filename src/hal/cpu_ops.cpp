@@ -375,9 +375,12 @@ void attn_prefill_one(const float* q, const float* k, const float* v, float* out
   const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
   for (int tk = 0; tk <= tq; ++tk) {
     const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
-    float dot = 0.f;
-    for (int d = 0; d < head_dim; ++d) dot += qh[d] * kt[d];
-    scores[tk] = dot * scale;
+    // Double acc matches unit ref; reduces GCC -mavx2 -mfma float reassociation drift.
+    double dot = 0.0;
+    for (int d = 0; d < head_dim; ++d) {
+      dot += static_cast<double>(qh[d]) * static_cast<double>(kt[d]);
+    }
+    scores[tk] = static_cast<float>(dot) * scale;
   }
   softmax_inplace(scores, tq + 1);
   float* oh = out + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
@@ -393,29 +396,34 @@ void attn_prefill_one(const float* q, const float* k, const float* v, float* out
 
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale) {
-  // Parallel over (query × head). Fix OpenMP privatization — not a serial rollback:
-  // declare scores inside `omp parallel`, then `omp for` (vector inside `parallel for`
-  // was mis-privatized on GCC CI).
+  // Parallel over (query × head). Scratch indexed by omp thread id — do not rely on
+  // privatizing std::vector inside `omp parallel for` (GCC CI mis-privatized that pattern).
   const int work = seq * n_heads;
+  int nthreads = 1;
+#if defined(_OPENMP)
+  if (work >= 64) nthreads = std::max(1, omp_get_max_threads());
+#endif
+  std::vector<float> scratch(static_cast<size_t>(nthreads) * static_cast<size_t>(seq));
 
 #if defined(_OPENMP)
   if (work >= 64) {
 #pragma omp parallel
     {
-      std::vector<float> scores(static_cast<size_t>(seq));
+      const int tid = omp_get_thread_num();
+      float* scores = scratch.data() + static_cast<size_t>(tid) * static_cast<size_t>(seq);
 #pragma omp for schedule(static)
       for (int wi = 0; wi < work; ++wi) {
         attn_prefill_one(q, k, v, out, n_heads, n_kv_heads, head_dim, scale, wi / n_heads,
-                         wi % n_heads, scores.data());
+                         wi % n_heads, scores);
       }
     }
     return;
   }
 #endif
-  std::vector<float> scores(static_cast<size_t>(seq));
+  float* scores = scratch.data();
   for (int wi = 0; wi < work; ++wi) {
     attn_prefill_one(q, k, v, out, n_heads, n_kv_heads, head_dim, scale, wi / n_heads,
-                     wi % n_heads, scores.data());
+                     wi % n_heads, scores);
   }
 }
 
