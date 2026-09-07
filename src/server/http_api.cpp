@@ -181,6 +181,20 @@ header{padding:14px 18px;border-bottom:1px solid var(--border);font-weight:600;l
 /* 气泡随内容长高；只滚动 #log，不在每条消息上套滚动条 */
 .msg{max-width:min(720px,92%);padding:10px 14px;border-radius:10px;word-break:break-word}
 .msg .body{white-space:pre-wrap}
+.msg .body.md{white-space:normal}
+.msg .body.md p{margin:0 0 .55em}.msg .body.md p:last-child{margin-bottom:0}
+.msg .body.md h1,.msg .body.md h2,.msg .body.md h3{margin:.75em 0 .35em;line-height:1.25;font-weight:600}
+.msg .body.md h1{font-size:1.22em}.msg .body.md h2{font-size:1.1em}.msg .body.md h3{font-size:1.05em}
+.msg .body.md ul,.msg .body.md ol{margin:.35em 0 .55em;padding-left:1.35em}
+.msg .body.md li{margin:.12em 0}
+.msg .body.md a{color:var(--accent)}
+.msg .body.md blockquote{margin:.45em 0;padding-left:10px;border-left:3px solid var(--border);color:var(--muted)}
+.msg .body.md pre{background:#0a0e14;padding:10px 12px;border-radius:8px;overflow:auto;margin:.5em 0;border:1px solid var(--border)}
+.msg .body.md code{font:12.5px/1.45 ui-monospace,Consolas,monospace;background:#0a0e14;padding:.08em .32em;border-radius:4px}
+.msg .body.md pre code{padding:0;background:transparent;border:0}
+.msg .body.md table{border-collapse:collapse;margin:.5em 0;font-size:.95em;display:block;overflow:auto;max-width:100%}
+.msg .body.md th,.msg .body.md td{border:1px solid var(--border);padding:4px 8px}
+.msg .body.md th{background:#121821}
 .user{align-self:flex-end;background:#243044}.bot{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
 .meta{color:var(--muted);font-size:12px;margin-bottom:4px}
 .muted{color:var(--muted);font-style:italic}
@@ -256,6 +270,42 @@ function normalize(t){
   t=String(t||'').replace(/\r\n/g,'\n').replace(/[\u200b\ufeff]/g,'');
   return t.replace(/\n{3,}/g,'\n\n').trim();
 }
+function escHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+// 轻量 Markdown（无 CDN，本地离线可用）。先转义再替换，避免 XSS。
+function renderMd(src){
+  let t=String(src||'');
+  const blocks=[];
+  t=t.replace(/```([^\n`]*)\n?([\s\S]*?)```/g,(_,lang,code)=>{
+    const i=blocks.length;
+    blocks.push('<pre><code'+(lang?' class="lang-'+escHtml(lang.trim())+'"':'')+'>'+escHtml(code.replace(/\n$/,''))+'</code></pre>');
+    return '\u0000B'+i+'\u0000';
+  });
+  t=escHtml(t);
+  t=t.replace(/^&gt;\s?(.*)$/gm,'<blockquote>$1</blockquote>');
+  t=t.replace(/^(#{1,3})\s+(.+)$/gm,(_,h,c)=>'<h'+h.length+'>'+c+'</h'+h.length+'>');
+  t=t.replace(/(`+)([^`]+?)\1/g,(_,__,c)=>'<code>'+c+'</code>');
+  t=t.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  t=t.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g,'$1<em>$2</em>');
+  t=t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  // 简单无序/有序列表块
+  t=t.replace(/(?:^(?:[-*+]|\d+\.)\s+.+(?:\n|$))+/gm,(block)=>{
+    const ordered=/^\d+\./m.test(block);
+    const items=block.trim().split(/\n/).map(ln=>ln.replace(/^(?:[-*+]|\d+\.)\s+/,'')).filter(Boolean)
+      .map(li=>'<li>'+li+'</li>').join('');
+    return ordered?'<ol>'+items+'</ol>':'<ul>'+items+'</ul>';
+  });
+  // 段落：按空行切；已是块级标签的行不包 <p>
+  t=t.split(/\n{2,}/).map(chunk=>{
+    chunk=chunk.trim();
+    if(!chunk)return '';
+    if(/^(?:<h\d|<ul>|<ol>|<pre>|<blockquote>|<table)/.test(chunk))return chunk.replace(/\n/g,'');
+    return '<p>'+chunk.replace(/\n/g,'<br>')+'</p>';
+  }).join('');
+  t=t.replace(/\u0000B(\d+)\u0000/g,(_,i)=>blocks[+i]||'');
+  return t;
+}
 function fileToDataUrl(f){
   return new Promise((resolve,reject)=>{
     const r=new FileReader();
@@ -318,7 +368,7 @@ function setBody(el,text,imgs){
   }else if(atts){atts.remove();}
   if(!n && !(imgs&&imgs.length)){body.className='body muted';body.textContent='（无有效文本）';}
   else if(!n){body.className='body muted';body.textContent='';}
-  else{body.className='body';body.textContent=n;}
+  else{body.className='body md';body.innerHTML=renderMd(n);}
 }
 function add(role,text,imgs){
   const d=document.createElement('div');
