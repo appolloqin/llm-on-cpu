@@ -368,285 +368,50 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
 
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale) {
+  // Parallel over (query×head). Per-iteration score buffer (MSVC OpenMP-safe).
+  // Note: keep scalar dots here — prior dual-AVX+hsum path produced huge errors on MSVC;
+  // attn_decode_one retains AVX for the decode hot path.
   const int g = n_heads / n_kv_heads;
   const int work = seq * n_heads;
 #if defined(_OPENMP)
-#pragma omp parallel if (work >= 64)
+#pragma omp parallel for schedule(static) if (work >= 64)
 #endif
-  {
-    std::vector<float> scores(static_cast<size_t>(seq));
-#if defined(_OPENMP)
-#pragma omp for schedule(static)
-#endif
-    for (int wi = 0; wi < work; ++wi) {
-      const int tq = wi / n_heads;
-      const int h = wi % n_heads;
-      const int hkv = h / g;
-      const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
-      for (int tk = 0; tk <= tq; ++tk) {
-        const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
-#if defined(LLMOC_ENABLE_AVX2)
-        __m256 vacc = _mm256_setzero_ps();
-        int d = 0;
-        for (; d + 8 <= head_dim; d += 8) {
-          vacc = _mm256_fmadd_ps(_mm256_loadu_ps(qh + d), _mm256_loadu_ps(kt + d), vacc);
-        }
-        float dot = hsum256(vacc);
-        for (; d < head_dim; ++d) dot += qh[d] * kt[d];
-        scores[tk] = dot * scale;
-#else
-        double dot = 0.0;
-        for (int d = 0; d < head_dim; ++d) dot += static_cast<double>(qh[d]) * kt[d];
-        scores[tk] = static_cast<float>(dot) * scale;
-#endif
-      }
-      softmax_inplace(scores.data(), tq + 1);
-      float* oh = out + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
-      std::fill(oh, oh + head_dim, 0.f);
-      for (int tk = 0; tk <= tq; ++tk) {
-        const float* vt = v + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
-        const float s = scores[tk];
-#if defined(LLMOC_ENABLE_AVX2)
-        int d = 0;
-        const __m256 vs = _mm256_set1_ps(s);
-        for (; d + 8 <= head_dim; d += 8) {
-          __m256 o = _mm256_loadu_ps(oh + d);
-          o = _mm256_fmadd_ps(vs, _mm256_loadu_ps(vt + d), o);
-          _mm256_storeu_ps(oh + d, o);
-        }
-        for (; d < head_dim; ++d) oh[d] += s * vt[d];
-#else
-        for (int d = 0; d < head_dim; ++d) oh[d] += s * vt[d];
-#endif
-      }
+  for (int wi = 0; wi < work; ++wi) {
+    const int tq = wi / n_heads;
+    const int h = wi % n_heads;
+    const int hkv = h / g;
+    std::vector<float> scores(static_cast<size_t>(tq) + 1u);
+    const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
+    for (int tk = 0; tk <= tq; ++tk) {
+      const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
+      float dot = 0.f;
+      for (int d = 0; d < head_dim; ++d) dot += qh[d] * kt[d];
+      scores[tk] = dot * scale;
+    }
+    float m = scores[0];
+    for (int i = 1; i <= tq; ++i) m = std::max(m, scores[i]);
+    float sum = 0.f;
+    for (int i = 0; i <= tq; ++i) {
+      scores[i] = std::exp(scores[i] - m);
+      sum += scores[i];
+    }
+    const float inv = sum > 0.f ? 1.f / sum : 0.f;
+    for (int i = 0; i <= tq; ++i) scores[i] *= inv;
+    float* oh = out + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
+    std::fill(oh, oh + head_dim, 0.f);
+    for (int tk = 0; tk <= tq; ++tk) {
+      const float* vt = v + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
+      const float s = scores[tk];
+      for (int d = 0; d < head_dim; ++d) oh[d] += s * vt[d];
     }
   }
 }
-
-static void l2norm_row(float* x, int n) {
-  double ss = 0.0;
-  for (int i = 0; i < n; ++i) ss += static_cast<double>(x[i]) * x[i];
-  const float inv = static_cast<float>(1.0 / std::sqrt(ss + 1e-6));
-  for (int i = 0; i < n; ++i) x[i] *= inv;
-}
-
-#if defined(LLMOC_ENABLE_AVX2)
-// 清除 NaN（保留 Inf 交给后续 clamp）；长 prefill/视觉路径否则会污染 GDN 递推状态
-inline __m256 sanitize_ord_ps(__m256 v) {
-  const __m256 ord = _mm256_cmp_ps(v, v, _CMP_ORD_Q);
-  return _mm256_and_ps(v, ord);
-}
-
-// Qwen3.5 固定 dk=dv=128：AVX clamp + NaN 清洗（视觉多 token prefill 必需）
-static void gated_delta_head_128(const float* q, const float* k, const float* v, float g_log,
-                                 float beta_t, float* st, float* ot, float scale, bool qk_l2norm) {
-  alignas(32) float qt[128], kt[128], vt[128], kv_mem[128], delta[128];
-  std::memcpy(qt, q, sizeof(qt));
-  std::memcpy(kt, k, sizeof(kt));
-  std::memcpy(vt, v, sizeof(vt));
-  if (qk_l2norm) {
-    l2norm_row(qt, 128);
-    l2norm_row(kt, 128);
-  }
-  const __m256 vscale = _mm256_set1_ps(scale);
-  for (int i = 0; i < 128; i += 8)
-    _mm256_store_ps(qt + i, sanitize_ord_ps(_mm256_mul_ps(_mm256_load_ps(qt + i), vscale)));
-
-  if (!std::isfinite(g_log)) g_log = -80.f;
-  if (g_log > 0.f) g_log = 0.f;
-  if (g_log < -80.f) g_log = -80.f;
-  const float g_t = std::exp(g_log);
-  if (!std::isfinite(beta_t)) beta_t = 0.f;
-  beta_t = std::min(1.f, std::max(0.f, beta_t));
-
-  const __m256 vg = _mm256_set1_ps(g_t);
-  for (int i = 0; i < 128 * 128; i += 8) {
-    __m256 s = sanitize_ord_ps(_mm256_loadu_ps(st + i));
-    _mm256_storeu_ps(st + i, _mm256_mul_ps(s, vg));
-  }
-
-  std::memset(kv_mem, 0, sizeof(kv_mem));
-  for (int i = 0; i < 128; ++i) {
-    const float ki = kt[i];
-    if (!std::isfinite(ki)) continue;
-    const __m256 vk = _mm256_set1_ps(ki);
-    float* row = st + i * 128;
-    for (int j = 0; j < 128; j += 8) {
-      __m256 acc = _mm256_load_ps(kv_mem + j);
-      acc = _mm256_fmadd_ps(vk, _mm256_loadu_ps(row + j), acc);
-      _mm256_store_ps(kv_mem + j, sanitize_ord_ps(acc));
-    }
-  }
-
-  const __m256 vb = _mm256_set1_ps(beta_t);
-  for (int j = 0; j < 128; j += 8) {
-    __m256 d = _mm256_mul_ps(
-        _mm256_sub_ps(sanitize_ord_ps(_mm256_load_ps(vt + j)), _mm256_load_ps(kv_mem + j)), vb);
-    _mm256_store_ps(delta + j, sanitize_ord_ps(d));
-  }
-
-  const __m256 vlo = _mm256_set1_ps(-1e4f);
-  const __m256 vhi = _mm256_set1_ps(1e4f);
-  for (int i = 0; i < 128; ++i) {
-    const float ki = kt[i];
-    if (!std::isfinite(ki)) continue;
-    const __m256 vk = _mm256_set1_ps(ki);
-    float* row = st + i * 128;
-    for (int j = 0; j < 128; j += 8) {
-      __m256 s = _mm256_fmadd_ps(vk, _mm256_load_ps(delta + j), _mm256_loadu_ps(row + j));
-      s = sanitize_ord_ps(s);
-      s = _mm256_min_ps(vhi, _mm256_max_ps(vlo, s));
-      _mm256_storeu_ps(row + j, s);
-    }
-  }
-
-  std::memset(ot, 0, 128 * sizeof(float));
-  for (int i = 0; i < 128; ++i) {
-    const float qi = qt[i];
-    if (!std::isfinite(qi)) continue;
-    const __m256 vq = _mm256_set1_ps(qi);
-    const float* row = st + i * 128;
-    for (int j = 0; j < 128; j += 8) {
-      __m256 o = _mm256_loadu_ps(ot + j);
-      o = _mm256_fmadd_ps(vq, _mm256_loadu_ps(row + j), o);
-      _mm256_storeu_ps(ot + j, sanitize_ord_ps(o));
-    }
-  }
-}
-#endif
 
 void gated_delta_recurrent(const float* q, const float* k, const float* v, const float* g,
                            const float* beta, float* state, float* out, int seq, int n_heads,
                            int dk, int dv, bool qk_l2norm) {
-  // Layouts (token-major):
-  // q/k: [seq, n_heads, dk]; v: [seq, n_heads, dv]; g/beta: [seq, n_heads]
-  // state: [n_heads, dk, dv]
-  const float scale = 1.f / std::sqrt(static_cast<float>(dk));
-  constexpr int kMaxD = 256;
-  if (dk > kMaxD || dv > kMaxD) throw std::runtime_error("gated_delta_recurrent: dk/dv too large");
-
-#if defined(LLMOC_ENABLE_AVX2)
-  if (dk == 128 && dv == 128) {
-    for (int t = 0; t < seq; ++t) {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if (n_heads >= 8 && !omp_in_parallel())
-#endif
-      for (int h = 0; h < n_heads; ++h) {
-        const size_t qk = (static_cast<size_t>(t) * n_heads + h) * 128;
-        gated_delta_head_128(q + qk, k + qk, v + (static_cast<size_t>(t) * n_heads + h) * 128,
-                             g[t * n_heads + h], beta[t * n_heads + h],
-                             state + static_cast<size_t>(h) * 128 * 128,
-                             out + (static_cast<size_t>(t) * n_heads + h) * 128, scale, qk_l2norm);
-      }
-    }
-    return;
-  }
-#endif
-
-  for (int t = 0; t < seq; ++t) {
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if (n_heads >= 8 && !omp_in_parallel())
-#endif
-    for (int h = 0; h < n_heads; ++h) {
-      float qt[kMaxD], kt[kMaxD], vt[kMaxD], kv_mem[kMaxD], delta[kMaxD];
-      std::memcpy(qt, q + (static_cast<size_t>(t) * n_heads + h) * dk, sizeof(float) * dk);
-      std::memcpy(kt, k + (static_cast<size_t>(t) * n_heads + h) * dk, sizeof(float) * dk);
-      std::memcpy(vt, v + (static_cast<size_t>(t) * n_heads + h) * dv, sizeof(float) * dv);
-      if (qk_l2norm) {
-        l2norm_row(qt, dk);
-        l2norm_row(kt, dk);
-      }
-      for (int i = 0; i < dk; ++i) qt[i] *= scale;
-
-      float g_log = g[t * n_heads + h];
-      if (!std::isfinite(g_log)) g_log = -80.f;
-      if (g_log > 0.f) g_log = 0.f;
-      if (g_log < -80.f) g_log = -80.f;
-      const float g_t = std::exp(g_log);
-      float beta_t = beta[t * n_heads + h];
-      if (!std::isfinite(beta_t)) beta_t = 0.f;
-      beta_t = std::min(1.f, std::max(0.f, beta_t));
-      float* st = state + (static_cast<size_t>(h) * dk * dv);
-
-#if defined(LLMOC_ENABLE_AVX2)
-      {
-        const __m256 vg = _mm256_set1_ps(g_t);
-        const int n = dk * dv;
-        int i = 0;
-        for (; i + 8 <= n; i += 8)
-          _mm256_storeu_ps(st + i, _mm256_mul_ps(_mm256_loadu_ps(st + i), vg));
-        for (; i < n; ++i) st[i] *= g_t;
-      }
-#else
-      for (int i = 0; i < dk * dv; ++i) st[i] *= g_t;
-#endif
-
-      std::memset(kv_mem, 0, sizeof(float) * dv);
-      for (int i = 0; i < dk; ++i) {
-        const float ki = kt[i];
-#if defined(LLMOC_ENABLE_AVX2)
-        const __m256 vk = _mm256_set1_ps(ki);
-        int j = 0;
-        for (; j + 8 <= dv; j += 8) {
-          __m256 acc = _mm256_loadu_ps(kv_mem + j);
-          acc = _mm256_fmadd_ps(vk, _mm256_loadu_ps(st + i * dv + j), acc);
-          _mm256_storeu_ps(kv_mem + j, acc);
-        }
-        for (; j < dv; ++j) kv_mem[j] += st[i * dv + j] * ki;
-#else
-        for (int j = 0; j < dv; ++j) kv_mem[j] += st[i * dv + j] * ki;
-#endif
-      }
-
-      for (int j = 0; j < dv; ++j) delta[j] = (vt[j] - kv_mem[j]) * beta_t;
-
-      for (int i = 0; i < dk; ++i) {
-        const float ki = kt[i];
-#if defined(LLMOC_ENABLE_AVX2)
-        const __m256 vk = _mm256_set1_ps(ki);
-        const __m256 vlo = _mm256_set1_ps(-1e4f);
-        const __m256 vhi = _mm256_set1_ps(1e4f);
-        int j = 0;
-        for (; j + 8 <= dv; j += 8) {
-          __m256 s = _mm256_fmadd_ps(vk, _mm256_loadu_ps(delta + j), _mm256_loadu_ps(st + i * dv + j));
-          s = _mm256_min_ps(vhi, _mm256_max_ps(vlo, s));
-          _mm256_storeu_ps(st + i * dv + j, s);
-        }
-        for (; j < dv; ++j) {
-          float s = st[i * dv + j] + ki * delta[j];
-          if (s > 1e4f) s = 1e4f;
-          if (s < -1e4f) s = -1e4f;
-          st[i * dv + j] = s;
-        }
-#else
-        for (int j = 0; j < dv; ++j) {
-          float s = st[i * dv + j] + ki * delta[j];
-          if (s > 1e4f) s = 1e4f;
-          if (s < -1e4f) s = -1e4f;
-          st[i * dv + j] = s;
-        }
-#endif
-      }
-
-      float* ot = out + (static_cast<size_t>(t) * n_heads + h) * dv;
-      std::fill(ot, ot + dv, 0.f);
-      for (int i = 0; i < dk; ++i) {
-        const float qi = qt[i];
-#if defined(LLMOC_ENABLE_AVX2)
-        const __m256 vq = _mm256_set1_ps(qi);
-        int j = 0;
-        for (; j + 8 <= dv; j += 8) {
-          __m256 o = _mm256_loadu_ps(ot + j);
-          o = _mm256_fmadd_ps(vq, _mm256_loadu_ps(st + i * dv + j), o);
-          _mm256_storeu_ps(ot + j, o);
-        }
-        for (; j < dv; ++j) ot[j] += st[i * dv + j] * qi;
-#else
-        for (int j = 0; j < dv; ++j) ot[j] += st[i * dv + j] * qi;
-#endif
-      }
-    }
-  }
+  // Prefill/decode: heads-outer path (gated_delta_chunked). Avoids forking OpenMP once per token.
+  gated_delta_chunked(q, k, v, g, beta, state, out, seq, n_heads, dk, dv, qk_l2norm);
 }
 
 }  // namespace llmoc::hal

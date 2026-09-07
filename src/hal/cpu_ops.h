@@ -89,13 +89,20 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
                      float scale);
 
 // Prefill causal attention: q/k/v [seq, n_heads/n_kv, head_dim] -> out [seq, n_heads, head_dim]
+// Parallel over (query×head); dual-AVX dots for wide head_dim.
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale);
 
-// Gated DeltaNet recurrent step (seq tokens). State: [n_v_heads, dk, dv]
+// Gated DeltaNet (seq tokens). State: [n_v_heads, dk, dv].
+// Prefill: heads-outer parallel (gated_delta_chunked) — no per-token OpenMP fork.
 void gated_delta_recurrent(const float* q, const float* k, const float* v, const float* g,
                            const float* beta, float* state, float* out, int seq, int n_heads,
                            int dk, int dv, bool qk_l2norm);
+
+// Prefill entry (heads-outer). Same numerics as recurrent; used by gated_delta_recurrent.
+void gated_delta_chunked(const float* q, const float* k, const float* v, const float* g,
+                         const float* beta, float* state, float* out, int seq, int n_heads, int dk,
+                         int dv, bool qk_l2norm);
 
 class CpuOps final : public Ops {
  public:
