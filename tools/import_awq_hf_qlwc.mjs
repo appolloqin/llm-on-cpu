@@ -189,11 +189,11 @@ function quantAwqSym(W, M, K, groupSize) {
         const a = Math.abs(W[base + k]);
         if (a > amax) amax = a;
       }
-      let scale = amax / 8.0;
+      let scale = amax / 7.0;
       if (scale < 1e-8) scale = 1e-8;
       scales[m * ng + g] = scale;
       for (let k = 0; k < groupSize; ++k) {
-        let qq = Math.round(W[base + k] / scale) + 8;
+        let qq = Math.round(W[base + k] / scale) + 7;
         if (qq < 0) qq = 0;
         if (qq > 15) qq = 15;
         q[base + k] = qq;

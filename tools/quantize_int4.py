@@ -158,9 +158,9 @@ def quant_awq_sym(W: np.ndarray, group_size: int):
         sl = slice(g * group_size, (g + 1) * group_size)
         block = W[:, sl]
         amax = np.max(np.abs(block), axis=1)
-        scale = np.maximum(amax / 8.0, 1e-8)
+        scale = np.maximum(amax / 7.0, 1e-8)
         scales[:, g] = scale
-        qq = np.round(block / scale[:, None]) + 8
+        qq = np.round(block / scale[:, None]) + 7
         q[:, sl] = np.clip(qq, 0, 15).astype(np.uint8)
     # dequant: (q-7)*scale ≈ W
     return pack_int4(q), f32_to_f16_bits(scales.reshape(-1)), None

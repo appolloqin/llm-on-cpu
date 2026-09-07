@@ -107,6 +107,7 @@ void QlwcStore::load_tensor(const TensorMeta& t) {
     v.K = static_cast<int>(t.shape[1]);
     v.group_size = static_cast<int>(t.group_size);
     v.scheme = hdr_.scheme;
+    v.awq_zp = awq_zero_point(hdr_.scheme);
     const int ng = (v.K + v.group_size - 1) / v.group_size;
     auto& sf = blobs_[t.name + "#sf"];
     sf.resize(static_cast<size_t>(v.M) * ng * sizeof(float));

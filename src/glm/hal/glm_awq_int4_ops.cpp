@@ -49,7 +49,7 @@ void gemm_awq_int4(const float* x, const AwqView& W, float* y) {
       }
       const uint8_t b = row[k / 2];
       const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-      acc += x[k] * (static_cast<float>(qi - 8) * scale);
+      acc += x[k] * (static_cast<float>(qi - 7) * scale);
     }
     y[m] = std::isfinite(acc) ? acc : 0.f;
   }

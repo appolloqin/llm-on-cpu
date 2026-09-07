@@ -43,7 +43,7 @@ const align = u32(cat, o);
 o += 4;
 const n = u64(cat, o);
 o += 8;
-const schemeName = scheme === 1 ? "gptq_asym" : scheme === 2 ? "awq_sym_zp8" : `unknown(${scheme})`;
+const schemeName = scheme === 1 ? "gptq_asym" : scheme === 2 ? "awq_sym_zp7" : `unknown(${scheme})`;
 let nInt4 = 0;
 let nWithZeros = 0;
 let nNoZeros = 0;

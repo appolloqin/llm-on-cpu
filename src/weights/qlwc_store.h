@@ -22,6 +22,8 @@ struct Int4View {
   int M = 0, K = 0;
   int group_size = 128;
   Scheme scheme = Scheme::kAwqSym;
+  // kAwqSym only; GPTQ ignores. Default kLocalAwqSymZero.
+  int awq_zp = kLocalAwqSymZero;
 };
 
 struct PassView {

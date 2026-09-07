@@ -1,6 +1,7 @@
 # Qwen3.6-35B-A3B (MoE) INT4 / QLWC — hybrid GDN+GQA + sparse FFN
+# Served by Qwen36MoeInt4Model (isolated from dense Qwen3.5 awq_sym zp=7).
 # MoE: GPU fused top-k experts by default (pin attn/shared; expert LRU). LLMOC_MOE_GPU_EXPERTS=0 → host.
-# AutoAWQ (zero_point:true): import must write scheme=gptq. If log shows awq_sym_zp8, re-import.
+# AutoAWQ (zero_point:true): import must write scheme=gptq. If log shows awq_sym_zp7, re-import.
 #
 # node tools/import_awq_hf_qlwc.mjs --src models/Qwen3.6-35B-A3B-AWQ-4bit-hf --out models/Qwen3.6-35B-A3B-AWQ-4bit.int4.qlwc
 # .\build\bin\Release\llmoc_server_int4.exe --config configs\engine_int4_qwen3_6a3b.yaml

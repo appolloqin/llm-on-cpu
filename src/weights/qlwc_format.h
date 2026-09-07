@@ -19,6 +19,13 @@ inline constexpr char kMagic[5] = "QLW1";
 inline constexpr uint32_t kVersion = 1;
 
 enum class Scheme : uint32_t { kGptqAsym = 1, kAwqSym = 2 };
+
+// Local QLWC awq_sym: w=(q - zp)*scale. Project convention (NOT AutoAWQ mid-point 8).
+// AutoAWQ zero_point models must use kGptqAsym + zeros — never retune zp globally for one HF dump.
+inline constexpr int kLocalAwqSymZero = 7;
+inline int awq_zero_point(Scheme s) {
+  return s == Scheme::kAwqSym ? kLocalAwqSymZero : 0;
+}
 enum class TensorKind : uint32_t { kPassthrough = 0, kInt4 = 1 };
 enum class PassDtype : uint32_t { kBF16 = 1, kF16 = 2 };
 

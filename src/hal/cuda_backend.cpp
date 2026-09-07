@@ -127,6 +127,7 @@ struct Int4Resident {
   void* d_zeros = nullptr;
   int M = 0, K = 0, ng = 0, gs = 0;
   bool is_awq = true;
+  int awq_zp = 7;  // from Int4View.awq_zp; GPTQ ignores
   bool pinned = false;  // warm attn/shared: MoE expert LRU must not evict
   size_t bytes = 0;
   uint64_t last_use = 0;
@@ -605,6 +606,7 @@ const Int4Resident* ensure_int4_resident(const qlwc::Int4View& W) {
   e.ng = ng;
   e.gs = gs;
   e.is_awq = is_awq;
+  e.awq_zp = W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero;
   e.bytes = total;
   e.last_use = ++g_lru_tick;
   g_int4_cache[W.qweight] = e;
@@ -1037,7 +1039,7 @@ namespace {
 
 // kernel 源: 与 CPU hal::gemm_int4 语义一致。
 // 打包格式: qweight 行主序 M×rb(rb=(K+1)/2), 偶数 k 取低 4 位, 奇数 k 取高 4 位。
-// awq: w=(q-8)*scale (AutoAWQ); gptq: w=q*scale+zero。每 block 算一行, 256 线程, warp shuffle 归约。
+// awq: w=(q-awq_zp)*scale (Int4View.awq_zp); gptq: w=q*scale+zero。
 const char* kGemvInt4Src = R"CUDA(
 __device__ __forceinline__ float f16_to_f32_dev(unsigned short h) {
   unsigned int sign = (h & 0x8000u) << 16;
@@ -1068,7 +1070,7 @@ extern "C" __global__ void gemv_int4(
     const unsigned short* __restrict__ zeros,
     const float* __restrict__ x,
     float* __restrict__ y,
-    int M, int K, int ng, int gs, int is_awq, int use_sx) {
+    int M, int K, int ng, int gs, int is_awq, int awq_zp, int use_sx) {
   const int row0 = blockIdx.x * ROWS_PER_BLOCK;
   const int tid = threadIdx.x;
   const int rb = (K + 1) >> 1;
@@ -1108,14 +1110,14 @@ extern "C" __global__ void gemv_int4(
       const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
       const float x0 = xr[k + 0], x1 = xr[k + 1], x2 = xr[k + 2], x3 = xr[k + 3];
       const float x4 = xr[k + 4], x5 = xr[k + 5], x6 = xr[k + 6], x7 = xr[k + 7];
-      const float w0 = ((float)((v.x & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w1 = ((float)((v.x >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w2 = ((float)((v.y & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w3 = ((float)((v.y >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w4 = ((float)((v.z & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w5 = ((float)((v.z >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w6 = ((float)((v.w & 0xF) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
-      const float w7 = ((float)((v.w >> 4) - (is_awq ? 8 : 0))) * s + (is_awq ? 0.f : z);
+      const float w0 = ((float)((v.x & 0xF) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w1 = ((float)((v.x >> 4) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w2 = ((float)((v.y & 0xF) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w3 = ((float)((v.y >> 4) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w4 = ((float)((v.z & 0xF) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w5 = ((float)((v.z >> 4) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w6 = ((float)((v.w & 0xF) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
+      const float w7 = ((float)((v.w >> 4) - (is_awq ? awq_zp : 0))) * s + (is_awq ? 0.f : z);
       acc += x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3 + x4 * w4 + x5 * w5 + x6 * w6 + x7 * w7;
     } else {
       for (int kk = k; kk < k + 8 && kk < K; ++kk) {
@@ -1124,7 +1126,7 @@ extern "C" __global__ void gemv_int4(
         const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
         const unsigned char b = qrow[kk >> 1];
         const int qi = (kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-        const float w = ((float)qi - (is_awq ? 8 : 0)) * ss + (is_awq ? 0.f : zz);
+        const float w = ((float)qi - (is_awq ? awq_zp : 0)) * ss + (is_awq ? 0.f : zz);
         acc += xr[kk] * w;
       }
     }
@@ -1143,7 +1145,7 @@ extern "C" __global__ void gemm_int4(
     const unsigned short* __restrict__ zeros,
     const float* __restrict__ X,
     float* __restrict__ Y,
-    int M, int K, int n, int ng, int gs, int is_awq) {
+    int M, int K, int n, int ng, int gs, int is_awq, int awq_zp) {
   const int row0 = blockIdx.x * ROWS_PER_BLOCK;
   const int tid = threadIdx.x;
   const int rb = (K + 1) >> 1;
@@ -1169,7 +1171,7 @@ extern "C" __global__ void gemm_int4(
   const int m = row0 + warp_id;
   if (m >= M) return;
   const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
-  const int off0 = is_awq ? 8 : 0;
+  const int off0 = is_awq ? awq_zp : 0;
   constexpr int BT = 8;
   for (int b0 = 0; b0 < n; b0 += BT) {
     const int bn = (b0 + BT <= n) ? BT : (n - b0);
@@ -1267,7 +1269,7 @@ extern "C" __global__ void gemv_multi4_int4(
     const unsigned short* __restrict__ z2, float* __restrict__ y2, int m2,
     const unsigned char* __restrict__ q3, const unsigned short* __restrict__ s3,
     const unsigned short* __restrict__ z3, float* __restrict__ y3, int m3,
-    int nt, int K, int ng, int gs, int is_awq,
+    int nt, int K, int ng, int gs, int is_awq, int awq_zp,
     const float* __restrict__ x) {
   const int row = blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x >> 5);
   const int lane = threadIdx.x & 31;
@@ -1304,7 +1306,7 @@ extern "C" __global__ void gemv_multi4_int4(
     if (kp + 3 < rb) {
       const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
       const float x0=x[k],x1=x[k+1],x2=x[k+2],x3=x[k+3],x4=x[k+4],x5=x[k+5],x6=x[k+6],x7=x[k+7];
-      const int off = is_awq ? 8 : 0;
+      const int off = is_awq ? awq_zp : 0;
       acc += x0*(((float)((v.x&0xF)-off))*s+z) + x1*(((float)((v.x>>4)-off))*s+z)
            + x2*(((float)((v.y&0xF)-off))*s+z) + x3*(((float)((v.y>>4)-off))*s+z)
            + x4*(((float)((v.z&0xF)-off))*s+z) + x5*(((float)((v.z>>4)-off))*s+z)
@@ -1316,7 +1318,7 @@ extern "C" __global__ void gemv_multi4_int4(
         const float zzv = is_awq ? 0.f : f16_to_f32_dev(my_z[gr]);
         const unsigned char b = qrow[kk >> 1];
         const int qi = (kk & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-        const int off = is_awq ? 8 : 0;
+        const int off = is_awq ? awq_zp : 0;
         acc += x[kk] * (((float)(qi - off)) * ss + zzv);
       }
     }
@@ -1637,13 +1639,15 @@ void* get_jit_kernel(const char* src, const char* name) {
 }  // namespace
 
 bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
-                   const float* d_x, float* d_y, int M, int K, int ng, int gs, bool is_awq) {
+                   const float* d_x, float* d_y, int M, int K, int ng, int gs, bool is_awq,
+                   int awq_zp) {
   if (!d_qweight || !d_scales || !d_x || !d_y || M <= 0 || K <= 0 || ng <= 0 || gs <= 0)
     return false;
   if (!is_awq && !d_zeros) return false;
   void* fn = get_jit_kernel(kGemvInt4Src, "gemv_int4");
   if (!fn) return false;
   int is_awq_i = is_awq ? 1 : 0;
+  int awq_zp_i = awq_zp;
   constexpr int RPB = 8;
   constexpr int BLOCK_DIM = RPB * 32;
   const int scale_words = RPB * ng * (is_awq ? 1 : 2);
@@ -1653,7 +1657,7 @@ bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
   int use_sx = (scale_bytes + sizeof(float) * static_cast<size_t>(K) <= kMaxSmem) ? 1 : 0;
   const unsigned shmem =
       static_cast<unsigned>(scale_bytes + (use_sx ? sizeof(float) * static_cast<size_t>(K) : 0));
-  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_x, &d_y, &M, &K, &ng, &gs, &is_awq_i,
+  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_x, &d_y, &M, &K, &ng, &gs, &is_awq_i, &awq_zp_i,
                     &use_sx};
   const int blocks = (M + RPB - 1) / RPB;
   return jit_launch(fn, static_cast<unsigned>(blocks), 1, 1, static_cast<unsigned>(BLOCK_DIM), 1, 1,
@@ -1661,16 +1665,18 @@ bool jit_gemv_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
 }
 
 bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uint16_t* d_zeros,
-                   const float* d_X, float* d_Y, int M, int K, int n, int ng, int gs, bool is_awq) {
+                   const float* d_X, float* d_Y, int M, int K, int n, int ng, int gs, bool is_awq,
+                   int awq_zp) {
   if (!d_qweight || !d_scales || !d_X || !d_Y || M <= 0 || K <= 0 || n <= 0 || ng <= 0 || gs <= 0)
     return false;
   if (!is_awq && !d_zeros) return false;
   if (n == 1)
-    return jit_gemv_int4(d_qweight, d_scales, d_zeros, d_X, d_Y, M, K, ng, gs, is_awq);
+    return jit_gemv_int4(d_qweight, d_scales, d_zeros, d_X, d_Y, M, K, ng, gs, is_awq, awq_zp);
   void* fn = get_jit_kernel(kGemvInt4Src, "gemm_int4");
   if (!fn) return false;
   int is_awq_i = is_awq ? 1 : 0;
-  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_X, &d_Y, &M, &K, &n, &ng, &gs, &is_awq_i};
+  int awq_zp_i = awq_zp;
+  void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_X, &d_Y, &M, &K, &n, &ng, &gs, &is_awq_i, &awq_zp_i};
   constexpr int ROWS_PER_BLOCK = 8;
   constexpr int BLOCK_DIM = ROWS_PER_BLOCK * 32;
   const int blocks_x = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
@@ -1916,7 +1922,7 @@ bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
                                 static_cast<const uint16_t*>(res->d_zeros),
                                 reinterpret_cast<const float*>(g_dx),
                                 reinterpret_cast<float*>(g_dy),
-                                res->M, res->K, res->ng, res->gs, res->is_awq);
+                                res->M, res->K, res->ng, res->gs, res->is_awq, res->awq_zp);
   auto tk1 = std::chrono::steady_clock::now();
   if (!ok) return false;
   std::lock_guard<std::mutex> lock(g_mu);
@@ -1955,7 +1961,7 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
                                   static_cast<const uint16_t*>(res->d_zeros),
                                   reinterpret_cast<const float*>(g_dx),
                                   reinterpret_cast<float*>(g_dy), res->M, res->K, res->ng,
-                                  res->gs, res->is_awq);
+                                  res->gs, res->is_awq, res->awq_zp);
     if (!ok) return false;
     std::lock_guard<std::mutex> lock(g_mu);
     return g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(W.M),
@@ -2000,7 +2006,7 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
                          static_cast<const uint16_t*>(res->d_scales),
                          static_cast<const uint16_t*>(res->d_zeros),
                          reinterpret_cast<const float*>(g_dx), reinterpret_cast<float*>(g_dy), M,
-                         K, c, res->ng, res->gs, res->is_awq))
+                         K, c, res->ng, res->gs, res->is_awq, res->awq_zp))
         return false;
       std::lock_guard<std::mutex> lock(g_mu);
       if (g_api.cudaMemcpy(Yp, g_dy, sizeof(float) * static_cast<size_t>(c) * M,
@@ -2070,13 +2076,14 @@ bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float*
   for (int i = n; i < 4; ++i) { q[i] = q[0]; s[i] = s[0]; z[i] = z[0]; ydev[i] = ydev[0]; m[i] = 0; }
   int K = res[0]->K, ng = res[0]->ng, gs = res[0]->gs;
   int is_awq_i = res[0]->is_awq ? 1 : 0;
+  int awq_zp_i = res[0]->awq_zp;
   const float* dx = reinterpret_cast<const float*>(g_dx);
   void* params[] = {
     &q[0], &s[0], &z[0], &ydev[0], &m[0],
     &q[1], &s[1], &z[1], &ydev[1], &m[1],
     &q[2], &s[2], &z[2], &ydev[2], &m[2],
     &q[3], &s[3], &z[3], &ydev[3], &m[3],
-    &n, &K, &ng, &gs, &is_awq_i, &dx
+    &n, &K, &ng, &gs, &is_awq_i, &awq_zp_i, &dx
   };
   constexpr int RPB = 8;
   const int blocks = (total_m + RPB - 1) / RPB;
@@ -2331,12 +2338,12 @@ bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::In
   if (!jit_gemv_int4(static_cast<const uint8_t*>(rg->d_qweight),
                      static_cast<const uint16_t*>(rg->d_scales),
                      static_cast<const uint16_t*>(rg->d_zeros), g_mlp_norm, g_mlp_g, rg->M, rg->K,
-                     rg->ng, rg->gs, rg->is_awq))
+                     rg->ng, rg->gs, rg->is_awq, rg->awq_zp))
     return false;
   if (!jit_gemv_int4(static_cast<const uint8_t*>(ru->d_qweight),
                      static_cast<const uint16_t*>(ru->d_scales),
                      static_cast<const uint16_t*>(ru->d_zeros), g_mlp_norm, g_mlp_u, ru->M, ru->K,
-                     ru->ng, ru->gs, ru->is_awq))
+                     ru->ng, ru->gs, ru->is_awq, ru->awq_zp))
     return false;
 
   const unsigned silu_grid = (static_cast<unsigned>(I) + blk - 1) / blk;
@@ -2346,7 +2353,7 @@ bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::In
   if (!jit_gemv_int4(static_cast<const uint8_t*>(rd->d_qweight),
                      static_cast<const uint16_t*>(rd->d_scales),
                      static_cast<const uint16_t*>(rd->d_zeros), g_mlp_mid, g_mlp_down, rd->M, rd->K,
-                     rd->ng, rd->gs, rd->is_awq))
+                     rd->ng, rd->gs, rd->is_awq, rd->awq_zp))
     return false;
 
   const unsigned add_grid = (static_cast<unsigned>(H) + blk - 1) / blk;
@@ -2422,10 +2429,11 @@ bool try_rmsnorm_gemm_multi_resident(const float* x, const uint16_t* ln1,
   }
   int K = res[0]->K, ng = res[0]->ng, gs = res[0]->gs;
   int is_awq_i = res[0]->is_awq ? 1 : 0;
+  int awq_zp_i = res[0]->awq_zp;
   const float* dx = g_mlp_norm;
   void* params[] = {&q[0], &s[0], &z[0], &ydev[0], &m[0], &q[1], &s[1], &z[1], &ydev[1], &m[1],
                     &q[2], &s[2], &z[2], &ydev[2], &m[2], &q[3], &s[3], &z[3], &ydev[3], &m[3],
-                    &n,    &K,    &ng,   &gs,      &is_awq_i, &dx};
+                    &n,    &K,    &ng,   &gs,      &is_awq_i, &awq_zp_i, &dx};
   constexpr int RPB = 8;
   const int blocks = (total_m + RPB - 1) / RPB;
   const unsigned shmem = sizeof(unsigned short) * RPB * ng * 2;
@@ -2488,7 +2496,7 @@ bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::
   if (!jit_gemv_int4(static_cast<const uint8_t*>(ro->d_qweight),
                      static_cast<const uint16_t*>(ro->d_scales),
                      static_cast<const uint16_t*>(ro->d_zeros), g_mlp_core, g_mlp_down, ro->M, ro->K,
-                     ro->ng, ro->gs, ro->is_awq))
+                     ro->ng, ro->gs, ro->is_awq, ro->awq_zp))
     return false;
 
   const unsigned blk = 256;
@@ -2512,12 +2520,12 @@ bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::
   if (!jit_gemv_int4(static_cast<const uint8_t*>(rg->d_qweight),
                      static_cast<const uint16_t*>(rg->d_scales),
                      static_cast<const uint16_t*>(rg->d_zeros), g_mlp_down, g_mlp_g, rg->M, rg->K,
-                     rg->ng, rg->gs, rg->is_awq))
+                     rg->ng, rg->gs, rg->is_awq, rg->awq_zp))
     return false;
   if (!jit_gemv_int4(static_cast<const uint8_t*>(ru->d_qweight),
                      static_cast<const uint16_t*>(ru->d_scales),
                      static_cast<const uint16_t*>(ru->d_zeros), g_mlp_down, g_mlp_u, ru->M, ru->K,
-                     ru->ng, ru->gs, ru->is_awq))
+                     ru->ng, ru->gs, ru->is_awq, ru->awq_zp))
     return false;
 
   const unsigned silu_grid = (static_cast<unsigned>(I) + blk - 1) / blk;
@@ -2527,7 +2535,7 @@ bool try_out_mlp_resident(const float* residual, const float* core, const qlwc::
   if (!jit_gemv_int4(static_cast<const uint8_t*>(rd->d_qweight),
                      static_cast<const uint16_t*>(rd->d_scales),
                      static_cast<const uint16_t*>(rd->d_zeros), g_mlp_mid, g_mlp_down, rd->M, rd->K,
-                     rd->ng, rd->gs, rd->is_awq))
+                     rd->ng, rd->gs, rd->is_awq, rd->awq_zp))
     return false;
 
   void* prm_add1[] = {&g_mlp_x, &g_mlp_down, &g_mlp_norm, &H};
@@ -2597,10 +2605,11 @@ bool try_rmsnorm_gemm_multi_from_act(const uint16_t* ln1, const qlwc::Int4View* 
   }
   int K = res[0]->K, ng = res[0]->ng, gs = res[0]->gs;
   int is_awq_i = res[0]->is_awq ? 1 : 0;
+  int awq_zp_i = res[0]->awq_zp;
   const float* dx = g_mlp_norm;
   void* params[] = {&q[0], &s[0], &z[0], &ydev[0], &m[0], &q[1], &s[1], &z[1], &ydev[1], &m[1],
                     &q[2], &s[2], &z[2], &ydev[2], &m[2], &q[3], &s[3], &z[3], &ydev[3], &m[3],
-                    &n,    &K,    &ng,   &gs,      &is_awq_i, &dx};
+                    &n,    &K,    &ng,   &gs,      &is_awq_i, &awq_zp_i, &dx};
   constexpr int RPB = 8;
   const int blocks = (total_m + RPB - 1) / RPB;
   const unsigned shmem = sizeof(unsigned short) * RPB * ng * 2;
@@ -2800,11 +2809,12 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
     }
     int K = resv[0]->K, ng = resv[0]->ng, gs = resv[0]->gs;
     int is_awq_i = resv[0]->is_awq ? 1 : 0;
+  int awq_zp_i = resv[0]->awq_zp;
     const float* dx = g_mlp_norm;
     int nn = nproj;
     void* params[] = {&q[0], &s[0], &z[0], &yd[0], &m[0], &q[1], &s[1], &z[1], &yd[1], &m[1],
                       &q[2], &s[2], &z[2], &yd[2], &m[2], &q[3], &s[3], &z[3], &yd[3], &m[3],
-                      &nn,   &K,    &ng,   &gs,      &is_awq_i, &dx};
+                      &nn,   &K,    &ng,   &gs,      &is_awq_i, &awq_zp_i, &dx};
     constexpr int RPB = 8;
     const int blocks = (total_m + RPB - 1) / RPB;
     const unsigned shmem = sizeof(unsigned short) * RPB * ng * 2;
@@ -2839,7 +2849,7 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
       if (!jit_gemv_int4(static_cast<const uint8_t*>(rb->d_qweight),
                          static_cast<const uint16_t*>(rb->d_scales),
                          static_cast<const uint16_t*>(rb->d_zeros), g_mlp_norm, d_b, rb->M, rb->K,
-                         rb->ng, rb->gs, rb->is_awq)) {
+                         rb->ng, rb->gs, rb->is_awq, rb->awq_zp)) {
         g_act_lin_last_err = "b_int4";
         return false;
       }
@@ -2851,7 +2861,7 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
       if (!jit_gemv_int4(static_cast<const uint8_t*>(ra->d_qweight),
                          static_cast<const uint16_t*>(ra->d_scales),
                          static_cast<const uint16_t*>(ra->d_zeros), g_mlp_norm, d_a, ra->M, ra->K,
-                         ra->ng, ra->gs, ra->is_awq)) {
+                         ra->ng, ra->gs, ra->is_awq, ra->awq_zp)) {
         g_act_lin_last_err = "a_int4";
         return false;
       }
@@ -2976,7 +2986,7 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
     if (!jit_gemv_int4(static_cast<const uint8_t*>(ro->d_qweight),
                        static_cast<const uint16_t*>(ro->d_scales),
                        static_cast<const uint16_t*>(ro->d_zeros), g_mlp_core, g_mlp_down, ro->M,
-                       ro->K, ro->ng, ro->gs, ro->is_awq))
+                       ro->K, ro->ng, ro->gs, ro->is_awq, ro->awq_zp))
       return false;
   } else if (d_wout_fp32) {
     std::lock_guard<std::mutex> lock(g_mu);
@@ -3012,12 +3022,12 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
   if (!jit_gemv_int4(static_cast<const uint8_t*>(rg->d_qweight),
                      static_cast<const uint16_t*>(rg->d_scales),
                      static_cast<const uint16_t*>(rg->d_zeros), g_mlp_down, g_mlp_g, rg->M, rg->K,
-                     rg->ng, rg->gs, rg->is_awq))
+                     rg->ng, rg->gs, rg->is_awq, rg->awq_zp))
     return false;
   if (!jit_gemv_int4(static_cast<const uint8_t*>(ru->d_qweight),
                      static_cast<const uint16_t*>(ru->d_scales),
                      static_cast<const uint16_t*>(ru->d_zeros), g_mlp_down, g_mlp_u, ru->M, ru->K,
-                     ru->ng, ru->gs, ru->is_awq))
+                     ru->ng, ru->gs, ru->is_awq, ru->awq_zp))
     return false;
 
   const unsigned silu_grid = (static_cast<unsigned>(I) + blk - 1) / blk;
@@ -3027,7 +3037,7 @@ bool try_ffn_on_act(const float* host_core, int core_dim, const qlwc::Int4View* 
   if (!jit_gemv_int4(static_cast<const uint8_t*>(rd->d_qweight),
                      static_cast<const uint16_t*>(rd->d_scales),
                      static_cast<const uint16_t*>(rd->d_zeros), g_mlp_mid, g_mlp_down, rd->M, rd->K,
-                     rd->ng, rd->gs, rd->is_awq))
+                     rd->ng, rd->gs, rd->is_awq, rd->awq_zp))
     return false;
 
   // Write back into persistent residual: g_act_h = g_mlp_x + down
@@ -3109,7 +3119,7 @@ bool try_lm_head_int4_from_act(const uint16_t* final_norm, const qlwc::Int4View&
   if (!jit_gemv_int4(static_cast<const uint8_t*>(res->d_qweight),
                      static_cast<const uint16_t*>(res->d_scales),
                      static_cast<const uint16_t*>(res->d_zeros), g_mlp_norm,
-                     reinterpret_cast<float*>(g_dy), res->M, res->K, res->ng, res->gs, res->is_awq))
+                     reinterpret_cast<float*>(g_dy), res->M, res->K, res->ng, res->gs, res->is_awq, res->awq_zp))
     return false;
   std::lock_guard<std::mutex> lock(g_mu);
   if (g_api.cudaMemcpy(logits_host, g_dy, sizeof(float) * static_cast<size_t>(lm.M),
@@ -3211,19 +3221,19 @@ bool try_moe_ffn_int4(const float* x, int H, int I, const MoeExpertInt4* experts
     if (!jit_gemv_int4(static_cast<const uint8_t*>(g->d_qweight),
                        static_cast<const uint16_t*>(g->d_scales),
                        static_cast<const uint16_t*>(g->d_zeros), g_mlp_x, g_mlp_g, g->M, g->K, g->ng,
-                       g->gs, g->is_awq))
+                       g->gs, g->is_awq, g->awq_zp))
       return false;
     if (!jit_gemv_int4(static_cast<const uint8_t*>(u->d_qweight),
                        static_cast<const uint16_t*>(u->d_scales),
                        static_cast<const uint16_t*>(u->d_zeros), g_mlp_x, g_mlp_u, u->M, u->K, u->ng,
-                       u->gs, u->is_awq))
+                       u->gs, u->is_awq, u->awq_zp))
       return false;
     void* prm_silu[] = {&g_mlp_g, &g_mlp_u, &g_mlp_mid, &I};
     if (!jit_launch(fn_silu, grid_i, 1, 1, blk, 1, 1, 0, prm_silu)) return false;
     if (!jit_gemv_int4(static_cast<const uint8_t*>(d->d_qweight),
                        static_cast<const uint16_t*>(d->d_scales),
                        static_cast<const uint16_t*>(d->d_zeros), g_mlp_mid, g_mlp_core, d->M, d->K,
-                       d->ng, d->gs, d->is_awq))
+                       d->ng, d->gs, d->is_awq, d->awq_zp))
       return false;
     float aw = w;
     void* prm_axpy[] = {&g_mlp_core, &g_mlp_down, &aw, &H};

@@ -14,6 +14,12 @@
 #include "hal/cuda_backend.h"
 #include "model/generate.h"
 #include "model/qwen3_5_int4_model.h"
+#include "model/qwen3_6_moe_int4_model.h"
+#include "model/qwen3_8_int4_model.h"
+#include "model/qwen3_8_moe_int4_model.h"
+#include <fstream>
+#include <memory>
+#include <nlohmann/json.hpp>
 #include "model/tokenizer_hf.h"
 #include "sched/mode_controller.h"
 #include "sched/scheduler.h"
@@ -27,6 +33,61 @@ uint64_t file_size_u64(const std::string& p) {
   std::error_code ec;
   const auto sz = std::filesystem::file_size(p, ec);
   return ec ? 0 : static_cast<uint64_t>(sz);
+}
+
+bool hf_config_looks_moe(const std::string& config_json_path) {
+  std::ifstream in(config_json_path);
+  if (!in) return false;
+  nlohmann::json root;
+  try {
+    in >> root;
+  } catch (...) {
+    return false;
+  }
+  const auto& tc = root.contains("text_config") ? root["text_config"] : root;
+  const int n = tc.value("num_experts", tc.value("n_routed_experts", 0));
+  return n > 0;
+}
+
+std::string lower_ascii(std::string s) {
+  for (char& c : s) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return s;
+}
+
+bool path_looks_qwen36(const std::string& s) {
+  const std::string l = lower_ascii(s);
+  return l.find("qwen3.6") != std::string::npos || l.find("qwen36") != std::string::npos ||
+         l.find("3.6-35") != std::string::npos || l.find("a3b") != std::string::npos;
+}
+
+bool path_looks_qwen38(const std::string& s) {
+  const std::string l = lower_ascii(s);
+  return l.find("qwen3.8") != std::string::npos || l.find("qwen38") != std::string::npos ||
+         l.find("3.8-27") != std::string::npos;
+}
+
+// Family 3.8 (dense or MoE). Path wins; dense geometry fallback must not steal 3.6 MoE.
+bool hf_config_looks_qwen38(const std::string& config_json_path, const std::string& model_path_hint,
+                            bool is_moe) {
+  if (path_looks_qwen38(config_json_path) || path_looks_qwen38(model_path_hint)) return true;
+  if (path_looks_qwen36(config_json_path) || path_looks_qwen36(model_path_hint)) return false;
+  if (is_moe) return false;  // unnamed MoE → 3.6 MoE entry
+
+  std::ifstream in(config_json_path);
+  if (!in) return false;
+  nlohmann::json root;
+  try {
+    in >> root;
+  } catch (...) {
+    return false;
+  }
+  const auto& tc = root.contains("text_config") ? root["text_config"] : root;
+  const int H = tc.value("hidden_size", 0);
+  const int L = tc.value("num_hidden_layers", 0);
+  // 3.8-27B dense: hidden=5120 layers=64; keep clear of 3.5-4B (2560/32).
+  return H >= 4096 || L >= 48;
 }
 
 }  // namespace
@@ -159,8 +220,31 @@ int main(int argc, char** argv) {
     llmoc::model::HfTokenizer tok;
     tok.load(tok_dir + "/tokenizer.json");
 
-    llmoc::model::Qwen35Int4Model model;
-    model.load(store_ptr, tok_dir + "/config.json");
+    const std::string cfg_json = tok_dir + "/config.json";
+    bool want_moe = hf_config_looks_moe(cfg_json);
+    if (!want_moe && store_ptr) {
+      // Some AWQ dumps omit num_experts in config.json
+      want_moe = store_ptr->has("language_model.layers.0.mlp.experts.0.gate_proj.weight") ||
+                 store_ptr->has("language_model.layers.0.mlp.gate.weight") ||
+                 store_ptr->has("layers.0.mlp.experts.0.gate_proj.weight");
+    }
+    const bool want_38 = hf_config_looks_qwen38(cfg_json, cfg.model_path, want_moe);
+    std::unique_ptr<llmoc::model::Qwen35Int4Model> model_holder;
+    if (want_moe && want_38) {
+      model_holder = std::make_unique<llmoc::model::Qwen38MoeInt4Model>();
+      LOG_INFO("INT4 model class=Qwen38MoeInt4Model (3.8 MoE)");
+    } else if (want_moe) {
+      model_holder = std::make_unique<llmoc::model::Qwen36MoeInt4Model>();
+      LOG_INFO("INT4 model class=Qwen36MoeInt4Model (3.6 MoE)");
+    } else if (want_38) {
+      model_holder = std::make_unique<llmoc::model::Qwen38Int4Model>();
+      LOG_INFO("INT4 model class=Qwen38Int4Model (3.8 dense)");
+    } else {
+      model_holder = std::make_unique<llmoc::model::Qwen35Int4Model>();
+      LOG_INFO("INT4 model class=Qwen35Int4Model (3.5 dense)");
+    }
+    auto& model = *model_holder;
+    model.load(store_ptr, cfg_json);
     if (use_stream && streamer) {
       model.enable_layer_stream(streamer.get());
     }

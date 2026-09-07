@@ -50,31 +50,31 @@ inline void unpack32_nibbles(const uint8_t* qrow_at_k_div2, __m256i& i0, __m256i
   i3 = _mm256_cvtepu8_epi32(_mm_srli_si128(p1, 8));
 }
 
-// AWQ: 累加 x*(q-8)*scale（对齐 AutoAWQ/vLLM；旧自量化 QLWC 需重量化）
-inline float dot_awq_noscale(const float* x, const uint8_t* qrow, int k0, int k1) {
+// AWQ: 累加 x*(q-zp)，zp=Int4View.awq_zp（本地 QLWC 默认 7；勿为 AutoAWQ 改全局）
+inline float dot_awq_noscale(const float* x, const uint8_t* qrow, int k0, int k1, float zp) {
   __m256 vacc0 = _mm256_setzero_ps();
   __m256 vacc1 = _mm256_setzero_ps();
   __m256 vacc2 = _mm256_setzero_ps();
   __m256 vacc3 = _mm256_setzero_ps();
-  const __m256 v8 = _mm256_set1_ps(8.f);
+  const __m256 vzp = _mm256_set1_ps(zp);
   int k = k0;
   for (; k + 32 <= k1; k += 32) {
     __m256i i0, i1, i2, i3;
     unpack32_nibbles(qrow + (k / 2), i0, i1, i2, i3);
     vacc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), vacc0);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), vacc0);
     vacc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 8),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), vacc1);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), vacc1);
     vacc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 16),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), vacc2);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), vacc2);
     vacc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + k + 24),
-                            _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), vacc3);
+                            _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), vacc3);
   }
   float acc = hsum256(_mm256_add_ps(_mm256_add_ps(vacc0, vacc1), _mm256_add_ps(vacc2, vacc3)));
   for (; k < k1; ++k) {
     const uint8_t b = qrow[k / 2];
     const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-    acc += x[k] * static_cast<float>(qi - 8);
+    acc += x[k] * static_cast<float>(qi - zp);
   }
   return acc;
 }
@@ -111,12 +111,12 @@ inline float dot_gptq_avx2(const float* x, const uint8_t* qrow, int k0, int k1, 
 
 // 2 行同时：同一段 x 只 load 一次
 inline void dot_awq_noscale_2row(const float* x, const uint8_t* q0, const uint8_t* q1, int k0,
-                                 int k1, float& out0, float& out1) {
+                                 int k1, float zp, float& out0, float& out1) {
   __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
   __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps();
   __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps();
   __m256 d0 = _mm256_setzero_ps(), d1 = _mm256_setzero_ps();
-  const __m256 v8 = _mm256_set1_ps(8.f);
+  const __m256 vzp = _mm256_set1_ps(zp);
   int k = k0;
   for (; k + 32 <= k1; k += 32) {
     const __m256 x0 = _mm256_loadu_ps(x + k);
@@ -125,15 +125,15 @@ inline void dot_awq_noscale_2row(const float* x, const uint8_t* q0, const uint8_
     const __m256 x3 = _mm256_loadu_ps(x + k + 24);
     __m256i i0, i1, i2, i3;
     unpack32_nibbles(q0 + (k / 2), i0, i1, i2, i3);
-    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a0);
-    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b0);
-    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c0);
-    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d0);
+    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), a0);
+    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), b0);
+    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), c0);
+    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), d0);
     unpack32_nibbles(q1 + (k / 2), i0, i1, i2, i3);
-    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a1);
-    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b1);
-    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c1);
-    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d1);
+    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), a1);
+    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), b1);
+    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), c1);
+    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), d1);
   }
   out0 = hsum256(_mm256_add_ps(_mm256_add_ps(a0, b0), _mm256_add_ps(c0, d0)));
   out1 = hsum256(_mm256_add_ps(_mm256_add_ps(a1, b1), _mm256_add_ps(c1, d1)));
@@ -141,15 +141,15 @@ inline void dot_awq_noscale_2row(const float* x, const uint8_t* q0, const uint8_
     const uint8_t qb0 = q0[k / 2], qb1 = q1[k / 2];
     const int q0i = (k & 1) ? ((qb0 >> 4) & 0xF) : (qb0 & 0xF);
     const int q1i = (k & 1) ? ((qb1 >> 4) & 0xF) : (qb1 & 0xF);
-    out0 += x[k] * static_cast<float>(q0i - 8);
-    out1 += x[k] * static_cast<float>(q1i - 8);
+    out0 += x[k] * static_cast<float>(q0i - zp);
+    out1 += x[k] * static_cast<float>(q1i - zp);
   }
 }
 
 // 4 行：大 M（MLP / lm_head）复用 x load，提高 L1 命中
 inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_t* q1,
-                                 const uint8_t* q2, const uint8_t* q3, int k0, int k1, float& out0,
-                                 float& out1, float& out2, float& out3) {
+                                 const uint8_t* q2, const uint8_t* q3, int k0, int k1, float zp,
+                                 float& out0, float& out1, float& out2, float& out3) {
   __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps(),
          a3 = _mm256_setzero_ps();
   __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps(), b2 = _mm256_setzero_ps(),
@@ -158,7 +158,7 @@ inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_
          c3 = _mm256_setzero_ps();
   __m256 d0 = _mm256_setzero_ps(), d1 = _mm256_setzero_ps(), d2 = _mm256_setzero_ps(),
          d3 = _mm256_setzero_ps();
-  const __m256 v8 = _mm256_set1_ps(8.f);
+  const __m256 vzp = _mm256_set1_ps(zp);
   int k = k0;
   for (; k + 32 <= k1; k += 32) {
     const __m256 x0 = _mm256_loadu_ps(x + k);
@@ -167,25 +167,25 @@ inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_
     const __m256 x3 = _mm256_loadu_ps(x + k + 24);
     __m256i i0, i1, i2, i3;
     unpack32_nibbles(q0 + (k / 2), i0, i1, i2, i3);
-    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a0);
-    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b0);
-    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c0);
-    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d0);
+    a0 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), a0);
+    b0 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), b0);
+    c0 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), c0);
+    d0 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), d0);
     unpack32_nibbles(q1 + (k / 2), i0, i1, i2, i3);
-    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a1);
-    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b1);
-    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c1);
-    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d1);
+    a1 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), a1);
+    b1 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), b1);
+    c1 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), c1);
+    d1 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), d1);
     unpack32_nibbles(q2 + (k / 2), i0, i1, i2, i3);
-    a2 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a2);
-    b2 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b2);
-    c2 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c2);
-    d2 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d2);
+    a2 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), a2);
+    b2 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), b2);
+    c2 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), c2);
+    d2 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), d2);
     unpack32_nibbles(q3 + (k / 2), i0, i1, i2, i3);
-    a3 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), v8), a3);
-    b3 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), v8), b3);
-    c3 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), v8), c3);
-    d3 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), v8), d3);
+    a3 = _mm256_fmadd_ps(x0, _mm256_sub_ps(_mm256_cvtepi32_ps(i0), vzp), a3);
+    b3 = _mm256_fmadd_ps(x1, _mm256_sub_ps(_mm256_cvtepi32_ps(i1), vzp), b3);
+    c3 = _mm256_fmadd_ps(x2, _mm256_sub_ps(_mm256_cvtepi32_ps(i2), vzp), c3);
+    d3 = _mm256_fmadd_ps(x3, _mm256_sub_ps(_mm256_cvtepi32_ps(i3), vzp), d3);
   }
   out0 = hsum256(_mm256_add_ps(_mm256_add_ps(a0, b0), _mm256_add_ps(c0, d0)));
   out1 = hsum256(_mm256_add_ps(_mm256_add_ps(a1, b1), _mm256_add_ps(c1, d1)));
@@ -194,10 +194,10 @@ inline void dot_awq_noscale_4row(const float* x, const uint8_t* q0, const uint8_
   for (; k < k1; ++k) {
     const uint8_t qb0 = q0[k / 2], qb1 = q1[k / 2], qb2 = q2[k / 2], qb3 = q3[k / 2];
     const int s = (k & 1) ? 4 : 0;
-    out0 += x[k] * static_cast<float>(((qb0 >> s) & 0xF) - 8);
-    out1 += x[k] * static_cast<float>(((qb1 >> s) & 0xF) - 8);
-    out2 += x[k] * static_cast<float>(((qb2 >> s) & 0xF) - 8);
-    out3 += x[k] * static_cast<float>(((qb3 >> s) & 0xF) - 8);
+    out0 += x[k] * static_cast<float>(((qb0 >> s) & 0xF) - zp);
+    out1 += x[k] * static_cast<float>(((qb1 >> s) & 0xF) - zp);
+    out2 += x[k] * static_cast<float>(((qb2 >> s) & 0xF) - zp);
+    out3 += x[k] * static_cast<float>(((qb3 >> s) & 0xF) - zp);
   }
 }
 
@@ -205,6 +205,7 @@ void gemm_int4_awq_avx2(const float* x, const qlwc::Int4View& W, float* y) {
   const int M = W.M, K = W.K, gs = W.group_size;
   const int ng = (K + gs - 1) / gs;
   const int rb = row_bytes(K);
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
 
   // 优先用 QlwcStore 预转的 f32 scales；否则本帧转一次（大 M 极慢）
   const float* scf = W.scales_f32;
@@ -224,7 +225,7 @@ void gemm_int4_awq_avx2(const float* x, const qlwc::Int4View& W, float* y) {
     for (int g = 0; g < ng; ++g) {
       const int k0 = g * gs;
       const int k1 = std::min(K, k0 + gs);
-      acc += dot_awq_noscale(x, qrow, k0, k1) * scale_at(m0, g);
+      acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m0, g);
     }
     y[m0] = std::isfinite(acc) ? acc : 0.f;
   };
@@ -240,7 +241,7 @@ void gemm_int4_awq_avx2(const float* x, const qlwc::Int4View& W, float* y) {
       const int k0 = g * gs;
       const int k1 = std::min(K, k0 + gs);
       float p0 = 0.f, p1 = 0.f;
-      dot_awq_noscale_2row(x, q0, q1, k0, k1, p0, p1);
+      dot_awq_noscale_2row(x, q0, q1, k0, k1, awq_zp, p0, p1);
       acc0 += p0 * scale_at(m0, g);
       acc1 += p1 * scale_at(m0 + 1, g);
     }
@@ -270,7 +271,7 @@ void gemm_int4_awq_avx2(const float* x, const qlwc::Int4View& W, float* y) {
           const int k0 = g * gs;
           const int k1 = std::min(K, k0 + gs);
           float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
-          dot_awq_noscale_4row(x, q0, q1, q2, q3, k0, k1, p0, p1, p2, p3);
+          dot_awq_noscale_4row(x, q0, q1, q2, q3, k0, k1, awq_zp, p0, p1, p2, p3);
           acc0 += p0 * scale_at(m0, g);
           acc1 += p1 * scale_at(m0 + 1, g);
           acc2 += p2 * scale_at(m0 + 2, g);
@@ -320,7 +321,7 @@ void gemm_int4_gptq_avx2(const float* x, const qlwc::Int4View& W, float* y) {
 #endif  // AVX2
 
 float gemm_row_scalar(const float* x, const uint8_t* qbase, int M, int K, int m, int gs, int ng,
-                      const uint16_t* scales, const uint16_t* zeros, bool awq) {
+                      const uint16_t* scales, const uint16_t* zeros, bool awq, float awq_zp) {
   (void)M;
   const int rb = row_bytes(K);
   const uint8_t* qrow = qbase + static_cast<size_t>(m) * rb;
@@ -333,7 +334,7 @@ float gemm_row_scalar(const float* x, const uint8_t* qbase, int M, int K, int m,
     for (int k = k0; k < k1; ++k) {
       const uint8_t b = qrow[k / 2];
       const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-      float w = awq ? static_cast<float>(qi - 8) * scale : static_cast<float>(qi) * scale + zero;
+      float w = awq ? static_cast<float>(qi - awq_zp) * scale : static_cast<float>(qi) * scale + zero;
       acc += static_cast<double>(x[k]) * w;
     }
   }
@@ -343,6 +344,7 @@ float gemm_row_scalar(const float* x, const uint8_t* qbase, int M, int K, int m,
 Int4ArgmaxResult gemm_int4_argmax_impl(const float* x, const qlwc::Int4View& W) {
   Int4ArgmaxResult best{};
   const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
   const int M = W.M, K = W.K, gs = W.group_size;
   const int ng = (K + gs - 1) / gs;
   const int rb = row_bytes(K);
@@ -364,13 +366,13 @@ Int4ArgmaxResult gemm_int4_argmax_impl(const float* x, const qlwc::Int4View& W) 
       for (int g = 0; g < ng; ++g) {
         const int k0 = g * gs;
         const int k1 = std::min(K, k0 + gs);
-        acc += dot_awq_noscale(x, qrow, k0, k1) * scf[static_cast<size_t>(m) * ng + g];
+        acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scf[static_cast<size_t>(m) * ng + g];
       }
 #else
-      acc = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, true);
+      acc = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, true, awq_zp);
 #endif
     } else {
-      acc = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, false);
+      acc = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, false, awq_zp);
     }
     return std::isfinite(acc) ? acc : -1e30f;
   };
@@ -419,6 +421,7 @@ Int4ArgmaxResult gemm_int4_argmax_impl(const float* x, const qlwc::Int4View& W) 
 
 void gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
   const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
 
 #if defined(LLMOC_ENABLE_AVX2)
   if (awq) {
@@ -433,7 +436,7 @@ void gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
 #pragma omp parallel for schedule(static) if (M >= 128)
 #endif
   for (int m = 0; m < M; ++m) {
-    y[m] = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, awq);
+    y[m] = gemm_row_scalar(x, W.qweight, M, K, m, gs, ng, W.scales, W.zeros, awq, awq_zp);
     if (!std::isfinite(y[m])) y[m] = 0.f;
   }
 #endif
@@ -445,6 +448,7 @@ Int4ArgmaxResult gemm_int4_argmax(const float* x, const qlwc::Int4View& W) {
 
 #if defined(LLMOC_ENABLE_AVX2)
 void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, float* Y) {
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
   const int M = W.M, K = W.K, gs = W.group_size;
   const int ng = (K + gs - 1) / gs;
   const int rb = row_bytes(K);
@@ -482,7 +486,7 @@ void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, fl
             const int k0 = g * gs;
             const int k1 = std::min(K, k0 + gs);
             float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
-            dot_awq_noscale_4row(x, q0, q1, q2, q3, k0, k1, p0, p1, p2, p3);
+            dot_awq_noscale_4row(x, q0, q1, q2, q3, k0, k1, awq_zp, p0, p1, p2, p3);
             acc0 += p0 * scale_at(m0, g);
             acc1 += p1 * scale_at(m0 + 1, g);
             acc2 += p2 * scale_at(m0 + 2, g);
@@ -502,7 +506,7 @@ void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, fl
             for (int g = 0; g < ng; ++g) {
               const int k0 = g * gs;
               const int k1 = std::min(K, k0 + gs);
-              acc += dot_awq_noscale(x, qrow, k0, k1) * scale_at(m, g);
+              acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m, g);
             }
             Y[static_cast<size_t>(t) * M + m] = std::isfinite(acc) ? acc : 0.f;
           }
@@ -525,7 +529,7 @@ void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, fl
             const int k0 = g * gs;
             const int k1 = std::min(K, k0 + gs);
             float p0 = 0.f, p1 = 0.f;
-            dot_awq_noscale_2row(x, q0, q1, k0, k1, p0, p1);
+            dot_awq_noscale_2row(x, q0, q1, k0, k1, awq_zp, p0, p1);
             acc0 += p0 * scale_at(m0, g);
             acc1 += p1 * scale_at(m0 + 1, g);
           }
@@ -540,7 +544,7 @@ void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, fl
           for (int g = 0; g < ng; ++g) {
             const int k0 = g * gs;
             const int k1 = std::min(K, k0 + gs);
-            acc += dot_awq_noscale(x, qrow, k0, k1) * scale_at(m0, g);
+            acc += dot_awq_noscale(x, qrow, k0, k1, awq_zp) * scale_at(m0, g);
           }
           Y[static_cast<size_t>(t) * M + m0] = std::isfinite(acc) ? acc : 0.f;
         }
@@ -557,6 +561,7 @@ void gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
     return;
   }
   const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
 #if defined(LLMOC_ENABLE_AVX2)
   if (awq) {
     gemm_int4_awq_batch_avx2(X, n, W, Y);
@@ -573,6 +578,7 @@ void dequant_int4_row(const qlwc::Int4View& W, int row, float* out) {
   const int K = W.K, gs = W.group_size;
   const int ng = (K + gs - 1) / gs;
   const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
   const int rb = row_bytes(K);
   const uint8_t* qrow = W.qweight + static_cast<size_t>(row) * rb;
   for (int g = 0; g < ng; ++g) {
@@ -584,7 +590,7 @@ void dequant_int4_row(const qlwc::Int4View& W, int row, float* out) {
       const uint8_t b = qrow[k / 2];
       const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
       if (awq)
-        out[k] = static_cast<float>(qi - 8) * scale;
+        out[k] = static_cast<float>(qi - awq_zp) * scale;
       else
         out[k] = static_cast<float>(qi) * scale + zero;
     }

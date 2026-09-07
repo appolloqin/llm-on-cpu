@@ -71,7 +71,7 @@ void dequant_awq_matrix(const AwqView& W, float* out) {
       }
       const uint8_t b = row[k / 2];
       const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
-      dst[k] = static_cast<float>(qi - 8) * scale;
+      dst[k] = static_cast<float>(qi - 7) * scale;
     }
   }
 }

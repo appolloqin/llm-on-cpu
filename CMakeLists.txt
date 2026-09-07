@@ -176,6 +176,9 @@ target_link_libraries(llmoc_server PRIVATE llmoc_server_lib)
 add_executable(llmoc_server_int4
   src/server/main_int4.cpp
   src/model/qwen3_5_int4_model.cpp
+  src/model/qwen3_6_moe_int4_model.cpp
+  src/model/qwen3_8_int4_model.cpp
+  src/model/qwen3_8_moe_int4_model.cpp
 )
 target_link_libraries(llmoc_server_int4 PRIVATE llmoc_server_lib)
 
@@ -206,7 +209,11 @@ add_test(NAME unit COMMAND llmoc_unit_tests
 add_executable(m3_spec_table tools/m3_spec_table/main.cpp)
 target_link_libraries(m3_spec_table PRIVATE llmoc_model)
 
-add_executable(bench_decode_tps tools/bench_decode_tps/main.cpp src/model/qwen3_5_int4_model.cpp)
+add_executable(bench_decode_tps tools/bench_decode_tps/main.cpp
+  src/model/qwen3_5_int4_model.cpp
+  src/model/qwen3_6_moe_int4_model.cpp
+  src/model/qwen3_8_int4_model.cpp
+  src/model/qwen3_8_moe_int4_model.cpp)
 target_link_libraries(bench_decode_tps PRIVATE llmoc_model llmoc_weights nlohmann_json::nlohmann_json)
 
 add_executable(m2_pipeline_bench tools/m2_pipeline_bench/main.cpp)
@@ -230,6 +237,9 @@ target_link_libraries(lmhead_jit_bench PRIVATE llmoc_weights)
 add_executable(nan_probe
   tools/nan_probe/main.cpp
   src/model/qwen3_5_int4_model.cpp
+  src/model/qwen3_6_moe_int4_model.cpp
+  src/model/qwen3_8_int4_model.cpp
+  src/model/qwen3_8_moe_int4_model.cpp
 )
 target_link_libraries(nan_probe PRIVATE llmoc_model llmoc_weights nlohmann_json::nlohmann_json)
 

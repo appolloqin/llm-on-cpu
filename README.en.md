@@ -6,11 +6,6 @@
 
 Pure-CPU large language model inference engine — run sparse MoE LLMs in **BF16 without quantization** on a 64GB-RAM host.  
 **Current delivery target: Qwen3.8-27B** (full BF16 ~54–61GB fits entirely in 64GB DRAM, zero page faults;  
-expected ~55 tok/s raw, 80+ tok/s with MTP; see [docs/MODEL_QWEN3.8-27B.md](docs/MODEL_QWEN3.8-27B.md)).  
-One engine, three execution modes: **pure CPU by default**, optional consumer-GPU hybrid (8–24GB), or pure GPU.  
-DeepSeek-V4-Flash remains a longer-horizon large-model scenario (NVMe streaming; see architecture docs).
-
-> Four-phase plan: [DESIGN_P0_P3](docs/DESIGN_P0_P3.md) · [IMPLEMENTATION_P0_P3](docs/IMPLEMENTATION_P0_P3.md) (**no coding until confirmed**).
 
 ## UI preview
 

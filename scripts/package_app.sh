@@ -77,6 +77,8 @@ cp configs/engine.yaml configs/engine_int4.yaml \
    configs/engine_ds_nvfp4.yaml configs/engine_kimi_hybrid.yaml \
    "${STAGE}/configs/"
 [[ -f configs/engine_int4_mtp.yaml ]] && cp configs/engine_int4_mtp.yaml "${STAGE}/configs/"
+[[ -f configs/engine_int4_qwen3_6a3b.yaml ]] && cp configs/engine_int4_qwen3_6a3b.yaml "${STAGE}/configs/"
+[[ -f configs/engine_int4_hybrid.yaml ]] && cp configs/engine_int4_hybrid.yaml "${STAGE}/configs/"
 cp README.md "${STAGE}/"
 [[ -f README.en.md ]] && cp README.en.md "${STAGE}/"
 [[ -f docs/USAGE.md ]] && cp docs/USAGE.md "${STAGE}/docs/"
@@ -140,8 +142,10 @@ download_* = auto pipeline (skip steps already done):
   download_int4.cmd
   start_int4.cmd
   start_int4.cmd configs\\engine_int4_mtp.yaml
+  start_int4.cmd configs\\engine_int4_qwen3_6a3b.yaml
   Modes: configs/engine_int4.yaml — pure_cpu|hybrid_gpu|pure_gpu|auto|layer_stream
          GPU: tiers.gpu_vram_gb ; layer_stream: see yaml block / docs/DESIGN_LAYER_STREAM.md
+         MoE Qwen3.6-35B-A3B: configs/engine_int4_qwen3_6a3b.yaml
 
 -- BF16 (unquantized) --
   download_bf16.cmd && start_bf16.cmd
@@ -188,8 +192,10 @@ download_* = auto pipeline (skip steps already done):
   ./download_int4.sh
   ./start_int4.sh
   ./start_int4.sh configs/engine_int4_mtp.yaml
+  ./start_int4.sh configs/engine_int4_qwen3_6a3b.yaml
   Modes: configs/engine_int4.yaml — pure_cpu|hybrid_gpu|pure_gpu|auto|layer_stream
          GPU: tiers.gpu_vram_gb ; layer_stream: see yaml block / docs/DESIGN_LAYER_STREAM.md
+         MoE Qwen3.6-35B-A3B: configs/engine_int4_qwen3_6a3b.yaml
 
 -- BF16 (unquantized) --
   ./download_bf16.sh && ./start_bf16.sh

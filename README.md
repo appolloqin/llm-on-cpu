@@ -6,11 +6,7 @@
 
 纯 CPU 大模型推理引擎 —— 在 64G 内存主机上，以 **BF16 不量化** 跑稀疏 MoE 大模型。  
 **当前交付目标模型：Qwen3.8-27B**（BF16 全量 ~54-61G 恰好全常驻 64G DRAM，零缺页，  
-预期原始 ~55 t/s、叠加 MTP 80+ t/s；详见 [docs/MODEL_QWEN3.8-27B.md](docs/MODEL_QWEN3.8-27B.md)）。  
-同一引擎支持三种执行模式，**默认纯 CPU**，可选消费级显卡(8~24G)混合、或纯 GPU。  
-DeepSeek-V4-Flash 保留为远期大模型场景（依赖 NVMe 流式，见架构文档）。
 
-> 四阶段方案：[设计 DESIGN_P0_P3](docs/DESIGN_P0_P3.md) · [实现 IMPLEMENTATION_P0_P3](docs/IMPLEMENTATION_P0_P3.md)（**确认前不编码**）。
 
 ## 界面预览
 

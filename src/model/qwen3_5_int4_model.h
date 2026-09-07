@@ -1,6 +1,8 @@
 #pragma once
 // llm-on-cpu :: model/qwen3_5_int4_model.h
-// Qwen3.5 INT4 推理路径（读 QLWC，不改动原 Qwen35Model）。
+// Qwen3.5 dense INT4（读 QLWC）。
+// MoE 3.6 → qwen3_6_moe；MoE 3.8 → qwen3_8_moe；dense 3.8 → qwen3_8_int4。
+// 勿为其它型号改 awq_sym zp。
 
 #include <string>
 #include <vector>
@@ -32,7 +34,7 @@ struct Qwen35Int4Config {
   int linear_dv = 128;
   int conv_k = 4;
   bool tie_embeddings = true;
-  // Qwen3.5/3.6 MoE (e.g. 35B-A3B): hybrid attn + sparse FFN
+  // MoE geometry — only Qwen36MoeInt4Model may run with is_moe=true
   bool is_moe = false;
   int n_experts = 0;
   int topk = 0;
@@ -45,9 +47,10 @@ struct Qwen35Int4Config {
   int32_t vision_end_id = 248054;
 };
 
-class Qwen35Int4Model final : public ICausalLM {
+class Qwen35Int4Model : public ICausalLM {
  public:
-  void load(qlwc::QlwcStore* store, const std::string& hf_config_json_path);
+  ~Qwen35Int4Model() override = default;
+  virtual void load(qlwc::QlwcStore* store, const std::string& hf_config_json_path);
   // 层流式：store 须 lazy open；loader 负责 pin/prefetch/release
   void enable_layer_stream(wt::ILayerStreamLoader* loader);
   bool layer_stream_enabled() const { return streamer_ != nullptr; }
@@ -85,7 +88,7 @@ class Qwen35Int4Model final : public ICausalLM {
   int32_t vision_start_id() const { return cfg_.vision_start_id; }
   int32_t vision_end_id() const { return cfg_.vision_end_id; }
 
- private:
+ protected:
   struct OptW {
     bool is_int4 = false;
     qlwc::Int4View i4{};
@@ -130,6 +133,7 @@ class Qwen35Int4Model final : public ICausalLM {
   CausalLmMeta meta_;
   std::string prefix_ = "language_model.";
   hal::WDtype pass_wd_ = hal::WDtype::kBF16;
+  bool allow_moe_ = false;  // Qwen36MoeInt4Model sets true before load()
   vision::QwenVisionEncoder vision_;
   vision::ImagePrepConfig image_prep_;
   std::vector<float> vision_embeds_;
@@ -171,7 +175,8 @@ class Qwen35Int4Model final : public ICausalLM {
   bool layer_forward_linear_act(int layer, SessionCache& cache);
   // Path A S3: full-attn decode with residual on device (QKV/attn host; out+MLP on act).
   bool layer_forward_full_act(int layer, SessionCache& cache, int pos_start);
-  void moe_ffn_token(int layer, const float* normed, float* down_acc);
+  // Dense stub throws; MoE override lives in qwen3_6_moe_int4_model.cpp
+  virtual void moe_ffn_token(int layer, const float* normed, float* down_acc);
   void forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache, bool is_prefill,
                          float* h_out, double* ms_lin = nullptr, double* ms_full = nullptr);
   void prepare_mrope_positions(const std::vector<int32_t>& tokens, bool is_prefill);
