@@ -32,11 +32,11 @@ inline size_t int4_scales_f32_bytes(int M, int K, int group_size) {
   return static_cast<size_t>(M) * static_cast<size_t>(int4_ngroups(K, group_size)) * sizeof(float);
 }
 
-// One projection [M,K]: packed q + fp16 scales + optional zeros + host f32 scales scratch.
+// One projection [M,K]: packed q + fp16 scales + optional zeros.
+// Host f32 scales are NOT stored — gemm_int4 converts on demand for CPU overflow.
 inline size_t int4_proj_storage_bytes(int M, int K, int group_size, bool has_zeros) {
   return int4_q_bytes(M, K) + int4_scales_f16_bytes(M, K, group_size) +
-         int4_zeros_f16_bytes(M, K, group_size, has_zeros) +
-         int4_scales_f32_bytes(M, K, group_size);
+         int4_zeros_f16_bytes(M, K, group_size, has_zeros);
 }
 
 // gate[IxH] + up[IxH] + down[HxI]

@@ -7,7 +7,6 @@
 
 #include "common/log.h"
 #include "common/platform.h"
-#include "hal/cpu_ops.h"
 #include "hal/cuda_backend.h"
 #include "moe/qlwc_expert_bytes.h"
 
@@ -21,18 +20,6 @@
 #endif
 
 namespace llmoc::moe {
-namespace {
-
-void fill_scales_f32(qlwc::Int4View& v) {
-  if (!v.scales || v.M <= 0 || v.K <= 0) return;
-  const int ng = int4_ngroups(v.K, v.group_size);
-  const size_t nsc = static_cast<size_t>(v.M) * static_cast<size_t>(ng);
-  auto* sf = const_cast<float*>(v.scales_f32);
-  if (!sf) return;
-  for (size_t i = 0; i < nsc; ++i) sf[i] = hal::f16_to_f32(v.scales[i]);
-}
-
-}  // namespace
 
 QlwcExpertHostBanks::~QlwcExpertHostBanks() { free_all(); }
 
@@ -156,7 +143,7 @@ void QlwcExpertHostBanks::build_views_for_layer(int only_L) {
     } else {
       b.view.zeros = nullptr;
     }
-    b.view.scales_f32 = reinterpret_cast<const float*>(p);
+    b.view.scales_f32 = nullptr;  // CPU gemm converts fp16 on demand
     b.view.M = M;
     b.view.K = K;
     b.view.group_size = gs;
@@ -181,6 +168,8 @@ void QlwcExpertHostBanks::fill_from_qlwc(qlwc::QlwcStore& store) {
   const int E = cfg_.num_experts;
   const auto& hdr = store.header();
 
+  // Copy one projection into the bank, then drop the QLWC blob immediately.
+  // Without drop, fill keeps a second full copy of every expert in store → OOM (~2× DRAM).
   auto copy_proj = [&](ExpertProjBank& dst, const std::string& name) {
     store.ensure(name);
     const auto src = store.get_int4(name);
@@ -199,33 +188,76 @@ void QlwcExpertHostBanks::fill_from_qlwc(qlwc::QlwcStore& store) {
         std::memset(const_cast<uint16_t*>(dst.view.zeros), 0, zn);
       }
     }
-    fill_scales_f32(dst.view);
+    store.drop(name);
   };
 
   int n_moe = 0;
+  const size_t layer_bytes_est =
+      expert_storage_bytes(cfg_.hidden, cfg_.intermediate, cfg_.group_size, cfg_.has_zeros) *
+      static_cast<size_t>(E);
   for (int li = 0; li < L; ++li) {
     const std::string probe = cfg_.name_prefix + "layers." + std::to_string(li) +
                               ".mlp.experts.0.gate_proj.weight";
     if (!store.has(probe)) continue;
 
-    alloc_layer_arena(li);
-    auto& lb = layers_[static_cast<size_t>(li)];
-    for (int e = 0; e < E; ++e) {
-      const std::string base = cfg_.name_prefix + "layers." + std::to_string(li) +
-                               ".mlp.experts." + std::to_string(e) + ".";
-      copy_proj(lb.gate[static_cast<size_t>(e)], base + "gate_proj.weight");
-      copy_proj(lb.up[static_cast<size_t>(e)], base + "up_proj.weight");
-      copy_proj(lb.down[static_cast<size_t>(e)], base + "down_proj.weight");
+    if (cfg_.dram_budget_bytes > 0 &&
+        total_arena_bytes_ + layer_bytes_est > cfg_.dram_budget_bytes) {
+      LOG_WARN("moe host_banks: dram_hot budget reached before layer %d "
+               "(arena=%.2fGiB budget=%.2fGiB) — remaining MoE layers use disk ensure",
+               li, total_arena_bytes_ / double(1ull << 30),
+               cfg_.dram_budget_bytes / double(1ull << 30));
+      break;
     }
+
+    try {
+      alloc_layer_arena(li);
+    } catch (const std::bad_alloc&) {
+      LOG_WARN("moe host_banks: OOM allocating layer %d (arena=%.2fGiB so far, store=%.2fGiB) — "
+               "stop fill; remaining MoE layers fall back to disk ensure",
+               li, total_arena_bytes_ / double(1ull << 30),
+               store.loaded_bytes() / double(1ull << 30));
+      break;
+    }
+
+    auto& lb = layers_[static_cast<size_t>(li)];
+    try {
+      for (int e = 0; e < E; ++e) {
+        const std::string base = cfg_.name_prefix + "layers." + std::to_string(li) +
+                                 ".mlp.experts." + std::to_string(e) + ".";
+        copy_proj(lb.gate[static_cast<size_t>(e)], base + "gate_proj.weight");
+        copy_proj(lb.up[static_cast<size_t>(e)], base + "up_proj.weight");
+        copy_proj(lb.down[static_cast<size_t>(e)], base + "down_proj.weight");
+      }
+    } catch (const std::bad_alloc&) {
+      LOG_WARN("moe host_banks: OOM while filling layer %d expert blob — stop fill "
+               "(arena=%.2fGiB store=%.2fGiB)",
+               li, total_arena_bytes_ / double(1ull << 30),
+               store.loaded_bytes() / double(1ull << 30));
+      // Drop partial layer arena so residency maps stay consistent.
+      if (lb.arena) {
+        free_arena(lb.arena, lb.arena_bytes);
+        if (total_arena_bytes_ >= lb.arena_bytes) total_arena_bytes_ -= lb.arena_bytes;
+        lb.arena = nullptr;
+        lb.arena_bytes = 0;
+        lb.gate.clear();
+        lb.up.clear();
+        lb.down.clear();
+      }
+      break;
+    }
+
     ++n_moe;
     if (n_moe % 4 == 0 || li + 1 == L) {
-      LOG_INFO("moe host_banks fill: moe_layers=%d last=%d/%d (scheme=%u gs=%u)", n_moe, li + 1, L,
-               static_cast<unsigned>(hdr.scheme), hdr.group_size);
+      LOG_INFO("moe host_banks fill: moe_layers=%d last=%d/%d arena=%.2fGiB store=%.2fGiB "
+               "(scheme=%u gs=%u)",
+               n_moe, li + 1, L, total_arena_bytes_ / double(1ull << 30),
+               store.loaded_bytes() / double(1ull << 30), static_cast<unsigned>(hdr.scheme),
+               hdr.group_size);
     }
   }
   ready_ = n_moe > 0;
-  LOG_INFO("moe host_banks fill done: moe_layers=%d arena=%.2fGiB", n_moe,
-           total_arena_bytes_ / double(1ull << 30));
+  LOG_INFO("moe host_banks fill done: moe_layers=%d arena=%.2fGiB store_left=%.2fGiB", n_moe,
+           total_arena_bytes_ / double(1ull << 30), store.loaded_bytes() / double(1ull << 30));
 }
 
 bool QlwcExpertHostBanks::settle_layer(int L, HostResidency want) {

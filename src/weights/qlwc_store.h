@@ -52,6 +52,8 @@ class QlwcStore {
 
   // lazy：装入张量（已装则命中）；非 lazy 为 no-op
   void ensure(const std::string& name);
+  // 释放单个已装张量（host bank 拷贝后立刻 drop，避免与 bank 双份 DRAM）
+  void drop(const std::string& name);
   // 释放不在 keep 集合内、且非 always_resident 的已装张量
   void release_except(const std::unordered_set<std::string>& keep);
   void mark_always_resident(const std::string& name);

@@ -77,6 +77,8 @@ void QlwcStore::ensure(const std::string& name) {
   load_tensor(*t);
 }
 
+void QlwcStore::drop(const std::string& name) { drop_tensor(name); }
+
 void QlwcStore::load_tensor(const TensorMeta& t) {
   if (is_loaded(t.name)) return;
   if (t.kind == TensorKind::kPassthrough) {

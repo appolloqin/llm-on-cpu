@@ -83,13 +83,26 @@ void Qwen36MoeInt4Model::init_moe_offload(const MoeOffloadRuntimeConfig& cfg) {
   hcfg.name_prefix = prefix_;
   hcfg.host_pin = cfg.host_pin;
   if (cfg.dram_hot_gb > 0) {
-    hcfg.dram_budget_bytes = static_cast<size_t>(cfg.dram_hot_gb * (1ull << 30));
+    const size_t hot = static_cast<size_t>(cfg.dram_hot_gb * (1ull << 30));
+    const size_t already = store_->loaded_bytes();
+    const size_t margin = 2ull << 30;  // OS + working set headroom
+    if (hot > already + margin) {
+      hcfg.dram_budget_bytes = hot - already - margin;
+    } else {
+      hcfg.dram_budget_bytes = hot / 2;
+    }
+    LOG_INFO("moe host_banks dram budget=%.2fGiB (dram_hot=%.2f store_now=%.2f margin=2.0)",
+             hcfg.dram_budget_bytes / double(1ull << 30), cfg.dram_hot_gb,
+             already / double(1ull << 30));
   }
+
+  const size_t per_exp_host =
+      moe::expert_storage_bytes(hcfg.hidden, hcfg.intermediate, hcfg.group_size, hcfg.has_zeros);
+  LOG_INFO("moe host_banks: filling experts from QLWC (layers=%d E=%d ~%.2fMiB/expert)…",
+           hcfg.num_layers, hcfg.num_experts, per_exp_host / double(1 << 20));
 
   moe_banks_ = std::make_unique<moe::QlwcExpertHostBanks>();
   moe_banks_->configure(hcfg);
-  LOG_INFO("moe host_banks: filling experts from QLWC (layers=%d E=%d)…", hcfg.num_layers,
-           hcfg.num_experts);
   moe_banks_->allocate();
   moe_banks_->fill_from_qlwc(*store_);
   moe_banks_->pin();
