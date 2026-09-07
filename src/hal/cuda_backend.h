@@ -23,6 +23,14 @@ void disable();
 
 size_t vram_used();
 size_t vram_budget();
+// Resize the weight-cache budget (MoE-first: shrink before attn pin, restore after).
+void set_vram_budget(size_t bytes);
+// Query device free/total bytes (0 if CUDA unavailable). Best-effort via cudaMemGetInfo.
+bool device_mem_info(size_t* free_bytes, size_t* total_bytes);
+
+// Pin-after-fill host banks for async H2D (cudaHostRegisterPortable). No-op / false if unavailable.
+bool host_register(void* ptr, size_t bytes);
+bool host_unregister(void* ptr);
 
 // Auto resident-GPU path: if free VRAM >= workspace_bytes (or LLMOC_RESIDENT_GPU=1),
 // reserve headroom and enable GPU GDN / tighter decode residency. LLMOC_RESIDENT_GPU=0 forces off.

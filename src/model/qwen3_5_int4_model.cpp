@@ -1343,12 +1343,14 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
   if (prog_prefill) {
     LOG_INFO("prefill begin: tok=%d layers=%d (progress every 8 layers)", n, cfg_.layers);
   }
+  if (is_prefill) on_prefill_begin();
   for (int L = 0; L < cfg_.layers; ++L) {
     if (streamer_) {
       if (L + 1 < cfg_.layers) streamer_->prefetch_layer(L + 1);
       streamer_->pin_layer(L);
       fill_layer_pack(L);
     }
+    if (is_prefill) on_prefill_layer(L, n);
     const bool is_full = (cfg_.layer_types[L] == "full_attention");
     auto run = [&]() {
       if (stream_act && !is_full) {
@@ -1387,6 +1389,7 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
     } else {
       run();
     }
+    if (is_prefill) on_prefill_layer_done(L);
     if (streamer_ && L + 1 >= stream_window_) streamer_->release_layer(L + 1 - stream_window_);
     if (prog_prefill && ((L + 1) % 8 == 0 || L + 1 == cfg_.layers)) {
       const double ms =
@@ -1572,12 +1575,14 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
 
   double ms_full = 0, ms_lin = 0;
   prepare_mrope_positions(tokens, is_prefill);
+  if (is_prefill) on_prefill_begin();
   for (int L = 0; L < cfg_.layers; ++L) {
     if (streamer_) {
       if (L + 1 < cfg_.layers) streamer_->prefetch_layer(L + 1);
       streamer_->pin_layer(L);
       fill_layer_pack(L);
     }
+    if (is_prefill) on_prefill_layer(L, n);
     if (kProf) {
       const auto a = Clock::now();
       layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
@@ -1588,6 +1593,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
     } else {
       layer_forward(L, x.data(), cache, pos_start, n, is_prefill);
     }
+    if (is_prefill) on_prefill_layer_done(L);
     if (streamer_ && L + 1 >= stream_window_) streamer_->release_layer(L + 1 - stream_window_);
   }
 

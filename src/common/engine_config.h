@@ -45,6 +45,13 @@ struct EngineConfig {
   int margin_mb = 512;
   bool has_moe_hint = true;
 
+  // Qwen36 INT4 MoE offload (FreeToken-isomorphic)
+  std::string moe_backend = "hybrid";  // offload | hybrid | cpu
+  int moe_cache_slots = 0;             // 0 = auto
+  bool moe_host_pin = true;
+  bool moe_prefill_overlap = true;
+  float moe_hybrid_fetch_frac = 0.5f;
+
   contracts::DeviceMeshSpec mesh_spec() const;
 
   static EngineConfig load(const std::string& path);

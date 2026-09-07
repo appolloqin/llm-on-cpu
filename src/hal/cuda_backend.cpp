@@ -42,6 +42,10 @@ using cudaMemcpy_t = int (*)(void*, const void*, size_t, int);
 using cudaGetDeviceCount_t = int (*)(int*);
 using cudaSetDevice_t = int (*)(int);
 using cudaGetDeviceProperties_t = int (*)(void*, int);
+using cudaMemGetInfo_t = int (*)(size_t*, size_t*);
+using cudaHostRegister_t = int (*)(void*, size_t, unsigned);
+using cudaHostUnregister_t = int (*)(void*);
+constexpr unsigned kCudaHostRegisterPortable = 1u;
 using cublasCreate_t = int (*)(void**);
 using cublasDestroy_t = int (*)(void*);
 using cublasSgemm_t = int (*)(void*, int, int, int, int, int, const float*, const float*, int,
@@ -78,6 +82,9 @@ struct Api {
   cudaGetDeviceCount_t cudaGetDeviceCount = nullptr;
   cudaSetDevice_t cudaSetDevice = nullptr;
   cudaGetDeviceProperties_t cudaGetDeviceProperties = nullptr;
+  cudaMemGetInfo_t cudaMemGetInfo = nullptr;
+  cudaHostRegister_t cudaHostRegister = nullptr;
+  cudaHostUnregister_t cudaHostUnregister = nullptr;
   cublasCreate_t cublasCreate = nullptr;
   cublasDestroy_t cublasDestroy = nullptr;
   cublasSgemm_t cublasSgemm = nullptr;
@@ -343,6 +350,11 @@ bool load_apis(std::string& err) {
   }
   g_api.cudaGetDeviceProperties =
       reinterpret_cast<cudaGetDeviceProperties_t>(sym(g_api.cudart, "cudaGetDeviceProperties"));
+  g_api.cudaMemGetInfo = reinterpret_cast<cudaMemGetInfo_t>(sym(g_api.cudart, "cudaMemGetInfo"));
+  g_api.cudaHostRegister =
+      reinterpret_cast<cudaHostRegister_t>(sym(g_api.cudart, "cudaHostRegister"));
+  g_api.cudaHostUnregister =
+      reinterpret_cast<cudaHostUnregister_t>(sym(g_api.cudart, "cudaHostUnregister"));
 
   // ---- 可选: driver API (nvcuda.dll) + NVRTC, 用于运行时 JIT kernel (no nvcc) ----
   // 加载失败不致命: jit_available()=false, 走 cublas/CPU 回退。
@@ -682,6 +694,41 @@ bool enabled() { return g_enabled; }
 const char* status() { return g_status.c_str(); }
 size_t vram_used() { return g_used; }
 size_t vram_budget() { return g_budget; }
+
+void set_vram_budget(size_t bytes) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_budget = bytes;
+}
+
+bool device_mem_info(size_t* free_bytes, size_t* total_bytes) {
+  if (free_bytes) *free_bytes = 0;
+  if (total_bytes) *total_bytes = 0;
+  std::string err;
+  if (!load_apis(err)) return false;
+  if (!g_api.cudaMemGetInfo) return false;
+  if (g_api.cudaSetDevice) (void)g_api.cudaSetDevice(0);
+  size_t free_b = 0, total_b = 0;
+  if (g_api.cudaMemGetInfo(&free_b, &total_b) != kCudaSuccess) return false;
+  if (free_bytes) *free_bytes = free_b;
+  if (total_bytes) *total_bytes = total_b;
+  return true;
+}
+
+bool host_register(void* ptr, size_t bytes) {
+  if (!ptr || bytes == 0) return false;
+  std::string err;
+  if (!load_apis(err)) return false;
+  if (!g_api.cudaHostRegister) return false;
+  // Need a device context; enable() or setDevice may not have run yet.
+  if (g_api.cudaSetDevice) (void)g_api.cudaSetDevice(0);
+  return g_api.cudaHostRegister(ptr, bytes, kCudaHostRegisterPortable) == kCudaSuccess;
+}
+
+bool host_unregister(void* ptr) {
+  if (!ptr) return false;
+  if (!g_api.cudaHostUnregister) return false;
+  return g_api.cudaHostUnregister(ptr) == kCudaSuccess;
+}
 
 bool resident_gpu_enabled() { return g_resident && g_enabled; }
 

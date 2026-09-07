@@ -15,6 +15,13 @@ model:
 # MoE weights are large; prefer hybrid_gpu or layer_stream if DRAM is tight.
 mode: hybrid_gpu
 
+moe:
+  backend: hybrid          # offload | hybrid | cpu
+  cache_slots: 0           # 0 = auto from VRAM after MoE-first reserve
+  host_pin: true
+  prefill_overlap: true
+  hybrid_fetch_frac: 0.5
+
 layer_stream:
   window_layers: 2
   device: cpu

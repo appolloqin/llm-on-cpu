@@ -120,8 +120,15 @@ EngineConfig EngineConfig::load(const std::string& path) {
     else if (full == "decode.max_seq" || full == "decode.context_length") {
       cfg.max_seq = std::stoi(val);
       if (cfg.max_seq < 256) cfg.max_seq = 256;
-    } else if (full == "server.port") cfg.server_port = std::stoi(val);
+    }     else if (full == "server.port") cfg.server_port = std::stoi(val);
     else if (full == "server.api_key_env") cfg.api_key_env = val;
+    else if (full == "moe.backend") cfg.moe_backend = val;
+    else if (full == "moe.cache_slots") cfg.moe_cache_slots = std::stoi(val);
+    else if (full == "moe.host_pin")
+      cfg.moe_host_pin = (val == "true" || val == "1" || val == "yes");
+    else if (full == "moe.prefill_overlap")
+      cfg.moe_prefill_overlap = (val == "true" || val == "1" || val == "yes");
+    else if (full == "moe.hybrid_fetch_frac") cfg.moe_hybrid_fetch_frac = std::stof(val);
   }
   return cfg;
 }

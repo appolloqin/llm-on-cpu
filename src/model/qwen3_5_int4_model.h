@@ -177,6 +177,10 @@ class Qwen35Int4Model : public ICausalLM {
   bool layer_forward_full_act(int layer, SessionCache& cache, int pos_start);
   // Dense stub throws; MoE override lives in qwen3_6_moe_int4_model.cpp
   virtual void moe_ffn_token(int layer, const float* normed, float* down_acc);
+  // Prefill MoE overlap hooks (no-op in dense; Qwen36 overrides).
+  virtual void on_prefill_begin() {}
+  virtual void on_prefill_layer(int /*layer*/, int /*n_tok*/) {}
+  virtual void on_prefill_layer_done(int /*layer*/) {}
   void forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache, bool is_prefill,
                          float* h_out, double* ms_lin = nullptr, double* ms_full = nullptr);
   void prepare_mrope_positions(const std::vector<int32_t>& tokens, bool is_prefill);

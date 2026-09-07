@@ -159,7 +159,18 @@ int main(int argc, char** argv) {
                  backend->caps().experts_on_gpu ? 1 : 0, backend->caps().attn_on_gpu ? 1 : 0);
 
         double vram_gb = cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0;
-        if (!llmoc::hal::cuda::enable(static_cast<size_t>(vram_gb * (1ull << 30)))) {
+        size_t want = static_cast<size_t>(vram_gb * (1ull << 30));
+        // Cap by device free VRAM so yaml 20GiB on an 8GiB card does not over-promise.
+        size_t free_b = 0, total_b = 0;
+        if (llmoc::hal::cuda::device_mem_info(&free_b, &total_b) && free_b > 0) {
+          const size_t cap = free_b > (512ull << 20) ? free_b - (512ull << 20) : free_b;
+          if (want > cap) {
+            LOG_INFO("vram budget clamp: config=%.2fGiB → device_free=%.2fGiB (total=%.2fGiB)",
+                     vram_gb, cap / double(1ull << 30), total_b / double(1ull << 30));
+            want = cap;
+          }
+        }
+        if (!llmoc::hal::cuda::enable(want)) {
           throw std::runtime_error(std::string("CUDA enable failed: ") +
                                    llmoc::hal::cuda::status());
         }
@@ -248,9 +259,38 @@ int main(int argc, char** argv) {
     if (use_stream && streamer) {
       model.enable_layer_stream(streamer.get());
     }
+
+    // FreeToken-isomorphic MoE offload: host pin + VRAM slots (before attn warm).
+    auto* moe36 = dynamic_cast<llmoc::model::Qwen36MoeInt4Model*>(&model);
+    size_t moe_reserve = 0;
+    if (moe36 && !use_stream) {
+      llmoc::model::MoeOffloadRuntimeConfig mcfg;
+      mcfg.backend = cfg.moe_backend;
+      mcfg.cache_slots = cfg.moe_cache_slots;
+      mcfg.host_pin = cfg.moe_host_pin;
+      mcfg.prefill_overlap = cfg.moe_prefill_overlap;
+      mcfg.hybrid_fetch_frac = cfg.moe_hybrid_fetch_frac;
+      mcfg.dram_hot_gb = cfg.dram_hot_gb;
+      // Temporarily shrink budget so slot count auto uses MoE-first share.
+      const size_t bud0 = llmoc::hal::cuda::enabled() ? llmoc::hal::cuda::vram_budget() : 0;
+      moe36->init_moe_offload(mcfg);
+      moe_reserve = moe36->moe_slot_reserve_bytes();
+      if (llmoc::hal::cuda::enabled() && moe_reserve > 0 && bud0 > moe_reserve) {
+        llmoc::hal::cuda::set_vram_budget(bud0 - moe_reserve);
+        LOG_INFO("moe-first VRAM: reserve=%.2fGiB attn_budget=%.2fGiB (of %.2fGiB)",
+                 moe_reserve / double(1ull << 30),
+                 llmoc::hal::cuda::vram_budget() / double(1ull << 30), bud0 / double(1ull << 30));
+      }
+    }
+
     if (llmoc::hal::cuda::enabled() && !use_stream) {
       LOG_INFO("warm_gpu_int4: pinning attn/shared/router (experts stay LRU)…");
       model.warm_gpu_int4_weights();
+      // Restore full budget so expert slot H2D can use the MoE reserve.
+      if (moe_reserve > 0) {
+        const size_t cur = llmoc::hal::cuda::vram_budget();
+        llmoc::hal::cuda::set_vram_budget(cur + moe_reserve);
+      }
       const size_t need = model.resident_workspace_bytes();
       const double need_g = need / double(1ull << 30);
       const double used_g = llmoc::hal::cuda::vram_used() / double(1ull << 30);
@@ -266,9 +306,16 @@ int main(int argc, char** argv) {
       }
     }
 
-    // 预热（MoE+GPU：首次会按需从盘装专家并 H2D，可能数分钟）
+    // 预热（MoE+offload：专家已在 host banks；首次仅 H2D top-k）
     {
-      LOG_INFO("int4 warmup starting (MoE first run loads top-k experts from disk→VRAM)…");
+      LOG_INFO("int4 warmup starting…");
+      if (moe36) {
+        if (moe36->moe_offload_ready()) {
+          LOG_INFO("moe offload ready: slots=%d host_pin path active", moe36->moe_cache_slots());
+        } else {
+          LOG_INFO("moe: legacy ensure path (host banks not ready)");
+        }
+      }
       llmoc::model::SessionCache wc;
       model.init_cache(wc, 256);
       std::vector<float> logits;

@@ -46,6 +46,8 @@ add_library(llmoc_weights STATIC
   src/weights/weight_manager.cpp
   src/weights/prefetch_pipeline.cpp
   src/weights/layer_stream.cpp
+  src/moe/host_banks.cpp
+  src/moe/offload_cache.cpp
   src/common/platform.cpp
   src/common/engine_config.cpp
   src/common/log.cpp
@@ -201,6 +203,8 @@ add_executable(llmoc_unit_tests
   tests/unit/test_moe_forward.cpp
   tests/unit/test_int4_gemm.cpp
   tests/unit/test_gated_delta_chunk.cpp
+  tests/unit/test_moe_offload_cache.cpp
+  tests/unit/test_moe_prefill_overlap.cpp
   tests/unit/test_kv_snapshot.cpp
   tests/unit/test_model_spec.cpp
   tests/unit/test_m5_mode.cpp
