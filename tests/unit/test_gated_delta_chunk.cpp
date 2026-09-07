@@ -145,7 +145,8 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
   hal::attn_prefill(q.data(), k.data(), v.data(), out.data(), seq, nh, nkv, hd, scale);
   float e = 0.f;
   for (size_t i = 0; i < out.size(); ++i) e = std::max(e, std::fabs(out[i] - ref[i]));
-  // llmoc_weights is built with -mavx2 -mfma on Linux; test TU is not. Allow tiny drift.
-  if (!(e < 1e-4f)) std::fprintf(stderr, "Attn.PrefillMatchesNaiveSmall maxabs=%.8g\n", e);
-  EXPECT_TRUE(e < 1e-4f);
+  // Naive ref vs library. Linux GCC previously blew up (~1e10) when AVX GEMM left YMM dirty
+  // before libm exp inside softmax; vzeroupper in softmax_inplace fixes that.
+  if (!(e < 1e-5f)) std::fprintf(stderr, "Attn.PrefillMatchesNaiveSmall maxabs=%.8g\n", e);
+  EXPECT_TRUE(e < 1e-5f);
 }

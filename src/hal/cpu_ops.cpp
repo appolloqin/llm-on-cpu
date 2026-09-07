@@ -228,22 +228,20 @@ void rmsnorm_gated(const float* x, const float* gate, const uint16_t* w, float* 
 void silu_and_mul(const float* gate, const float* up, float* out, int n) {
 #if defined(LLMOC_ENABLE_AVX2)
   int i = 0;
-  const __m256 one = _mm256_set1_ps(1.f);
   for (; i + 8 <= n; i += 8) {
-    __m256 g = _mm256_loadu_ps(gate + i);
-    __m256 u = _mm256_loadu_ps(up + i);
-    // silu(g) = g / (1 + exp(-g))
-    alignas(32) float gt[8], ot[8];
-    _mm256_store_ps(gt, g);
+    alignas(32) float gt[8], ut[8], ot[8];
+    _mm256_store_ps(gt, _mm256_loadu_ps(gate + i));
+    _mm256_store_ps(ut, _mm256_loadu_ps(up + i));
+    // Spill before zeroupper — clearing YMM must not clobber live gate/up vectors.
+    _mm256_zeroupper();
     for (int j = 0; j < 8; ++j) ot[j] = gt[j] / (1.f + std::exp(-gt[j]));
-    __m256 s = _mm256_load_ps(ot);
-    _mm256_storeu_ps(out + i, _mm256_mul_ps(s, u));
+    _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_load_ps(ot), _mm256_load_ps(ut)));
   }
+  _mm256_zeroupper();
   for (; i < n; ++i) {
     const float g = gate[i];
     out[i] = (g / (1.f + std::exp(-g))) * up[i];
   }
-  (void)one;
 #else
   for (int i = 0; i < n; ++i) {
     const float g = gate[i];
@@ -253,6 +251,11 @@ void silu_and_mul(const float* gate, const float* up, float* out, int n) {
 }
 
 void softmax_inplace(float* x, int n) {
+  // GCC+AVX2: prior YMM-dirty kernels (INT4 GEMM etc.) + libm SSE `exp` without vzeroupper
+  // produce huge wrong softmax on Linux CI (maxabs ~1e10). Mac (no AVX) / MSVC OK.
+#if defined(LLMOC_ENABLE_AVX2)
+  _mm256_zeroupper();
+#endif
   float m = x[0];
   for (int i = 1; i < n; ++i) m = std::max(m, x[i]);
   double s = 0.0;
