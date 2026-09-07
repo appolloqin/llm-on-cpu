@@ -100,14 +100,18 @@ class Qwen35Int4Model final : public ICausalLM {
     bool is_moe = false;
     const uint16_t* ln1 = nullptr;
     const uint16_t* ln2 = nullptr;
+    // Per-tensor dtype: AWQ ignore-list may mix BF16/F16; never assume global pass_wd_.
+    hal::WDtype ln_dt = hal::WDtype::kBF16;
     // full attention (INT4 or BF16 pass — AWQ often leaves attn in ignore)
     OptW wq, wk, wv, wo;
     const uint16_t* qn = nullptr;
     const uint16_t* kn = nullptr;
+    hal::WDtype qk_norm_dt = hal::WDtype::kBF16;
     // linear / GDN（qkv/z/a/b/out 均可 INT4 或 BF16 透传）
     OptW wqkv, wz;
     OptW wb, wa, wout;
     const uint16_t* nrm = nullptr;
+    hal::WDtype nrm_dt = hal::WDtype::kBF16;
     std::vector<float> A_log_f;
     std::vector<float> dt_bias_f;
     std::vector<float> conv_w_f;  // [conv_dim * conv_k]
@@ -140,13 +144,20 @@ class Qwen35Int4Model final : public ICausalLM {
   qlwc::Int4View emb_int4_{};
   bool emb_is_int4_ = false;
   const uint16_t* emb_pass_ = nullptr;
+  hal::WDtype emb_dt_ = hal::WDtype::kBF16;
   qlwc::Int4View lm_int4_{};
   bool lm_is_int4_ = false;
   const uint16_t* lm_pass_ = nullptr;
+  hal::WDtype lm_dt_ = hal::WDtype::kBF16;
   const uint16_t* final_norm_ = nullptr;
+  hal::WDtype final_norm_dt_ = hal::WDtype::kBF16;
 
+  static hal::WDtype pass_to_wd(qlwc::PassDtype d) {
+    return d == qlwc::PassDtype::kF16 ?hal::WDtype::kF16 :hal::WDtype::kBF16;
+  }
   bool is_int4(const std::string& name) const;
   const uint16_t* pass(const std::string& name);
+  qlwc::PassView pass_view(const std::string& name);
   OptW load_opt_w(const std::string& name, int M, int K);
   void gemm_w(const float* x, const std::string& wname, float* y, int M, int K);
   void gemm_view(const float* x, const qlwc::Int4View& W, float* y);

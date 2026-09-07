@@ -314,8 +314,13 @@ void Qwen35Int4Model::build_global_packs() {
       prefix_.empty() ? "embedding.weight" : prefix_ + "embed_tokens.weight";
   if (store_->lazy()) store_->ensure(emb_name);
   emb_is_int4_ = is_int4(emb_name);
-  if (emb_is_int4_) emb_int4_ = store_->get_int4(emb_name);
-  else emb_pass_ = pass(emb_name);
+  if (emb_is_int4_) {
+    emb_int4_ = store_->get_int4(emb_name);
+  } else {
+    const auto pv = pass_view(emb_name);
+    emb_pass_ = pv.data;
+    emb_dt_ = pass_to_wd(pv.dtype);
+  }
 
   lm_is_int4_ = false;
   lm_pass_ = nullptr;
@@ -329,17 +334,31 @@ void Qwen35Int4Model::build_global_packs() {
           "tie_word_embeddings=false but lm_head.weight missing in QLWC");
     if (store_->lazy()) store_->ensure(lm_name);
     lm_is_int4_ = is_int4(lm_name);
-    if (lm_is_int4_) lm_int4_ = store_->get_int4(lm_name);
-    else lm_pass_ = pass(lm_name);
+    if (lm_is_int4_) {
+      lm_int4_ = store_->get_int4(lm_name);
+    } else {
+      const auto pv = pass_view(lm_name);
+      lm_pass_ = pv.data;
+      lm_dt_ = pass_to_wd(pv.dtype);
+    }
   } else {
     lm_is_int4_ = emb_is_int4_;
     lm_int4_ = emb_int4_;
     lm_pass_ = emb_pass_;
+    lm_dt_ = emb_dt_;
   }
 
   const std::string fn = prefix_ + "norm.weight";
-  if (store_->lazy()) store_->ensure(fn);
-  final_norm_ = pass(fn);
+  {
+    const auto pv = pass_view(fn);
+    final_norm_ = pv.data;
+    final_norm_dt_ = pass_to_wd(pv.dtype);
+  }
+  LOG_INFO("Qwen35Int4 pass dtypes: emb=%s lm=%s final_norm=%s catalog_first=%s",
+           emb_is_int4_ ? "int4" : (emb_dt_ == hal::WDtype::kF16 ? "f16" : "bf16"),
+           lm_is_int4_ ? "int4" : (lm_dt_ == hal::WDtype::kF16 ? "f16" : "bf16"),
+           final_norm_dt_ == hal::WDtype::kF16 ? "f16" : "bf16",
+           pass_wd_ == hal::WDtype::kF16 ? "f16" : "bf16");
 }
 
 void Qwen35Int4Model::fill_layer_pack(int L) {
@@ -350,16 +369,24 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
   const std::string base = prefix_ + "layers." + std::to_string(L) + ".";
   lp = {};
   lp.is_full = (cfg_.layer_types[L] == "full_attention");
-  lp.ln1 = pass(base + "input_layernorm.weight");
-  lp.ln2 = pass(base + "post_attention_layernorm.weight");
+  {
+    const auto p1 = pass_view(base + "input_layernorm.weight");
+    const auto p2 = pass_view(base + "post_attention_layernorm.weight");
+    lp.ln1 = p1.data;
+    lp.ln2 = p2.data;
+    lp.ln_dt = pass_to_wd(p1.dtype);
+  }
   if (lp.is_full) {
     const int nh = cfg_.n_heads, nkv = cfg_.n_kv, hd = cfg_.head_dim;
     lp.wq = load_opt_w(base + "self_attn.q_proj.weight", nh * hd * 2, cfg_.hidden);
     lp.wk = load_opt_w(base + "self_attn.k_proj.weight", nkv * hd, cfg_.hidden);
     lp.wv = load_opt_w(base + "self_attn.v_proj.weight", nkv * hd, cfg_.hidden);
     lp.wo = load_opt_w(base + "self_attn.o_proj.weight", cfg_.hidden, nh * hd);
-    lp.qn = pass(base + "self_attn.q_norm.weight");
-    lp.kn = pass(base + "self_attn.k_norm.weight");
+    const auto pq = pass_view(base + "self_attn.q_norm.weight");
+    const auto pk = pass_view(base + "self_attn.k_norm.weight");
+    lp.qn = pq.data;
+    lp.kn = pk.data;
+    lp.qk_norm_dt = pass_to_wd(pq.dtype);
   } else {
     const int value_dim = nv * dv;
     const int conv_dim_w = nk * dk * 2 + nv * dv;
@@ -369,7 +396,9 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
     lp.wb = load_opt_w(base + "linear_attn.in_proj_b.weight", nv, cfg_.hidden);
     lp.wa = load_opt_w(base + "linear_attn.in_proj_a.weight", nv, cfg_.hidden);
     lp.wout = load_opt_w(base + "linear_attn.out_proj.weight", cfg_.hidden, value_dim);
-    lp.nrm = pass(base + "linear_attn.norm.weight");
+    const auto pn = pass_view(base + "linear_attn.norm.weight");
+    lp.nrm = pn.data;
+    lp.nrm_dt = pass_to_wd(pn.dtype);
     {
       const std::string a_name = base + "linear_attn.A_log";
       const std::string d_name = base + "linear_attn.dt_bias";
@@ -388,8 +417,8 @@ void Qwen35Int4Model::fill_layer_pack(int L) {
       lp.A_log_f.resize(nv);
       lp.dt_bias_f.resize(nv);
       for (int h = 0; h < nv; ++h) {
-        lp.A_log_f[h] =hal::load_w(pa.data + h, dta);
-        lp.dt_bias_f[h] =hal::load_w(pd.data + h, dtd);
+        lp.A_log_f[h] = hal::load_w(pa.data + h, dta);
+        lp.dt_bias_f[h] = hal::load_w(pd.data + h, dtd);
       }
       lp.conv_w_f.resize(static_cast<size_t>(conv_dim) * cfg_.conv_k);
       for (int c = 0; c < conv_dim; ++c)
@@ -467,8 +496,12 @@ bool Qwen35Int4Model::is_int4(const std::string& name) const {
 }
 
 const uint16_t* Qwen35Int4Model::pass(const std::string& name) {
+  return pass_view(name).data;
+}
+
+qlwc::PassView Qwen35Int4Model::pass_view(const std::string& name) {
   if (store_->lazy()) store_->ensure(name);
-  return store_->get_pass(name).data;
+  return store_->get_pass(name);
 }
 
 Qwen35Int4Model::OptW Qwen35Int4Model::load_opt_w(const std::string& name, int M, int K) {
@@ -498,7 +531,8 @@ void Qwen35Int4Model::gemm_w(const float* x, const std::string& wname, float* y,
   } else {
     (void)M;
     (void)K;
-    hal::gemm_bias_free(x, pass(wname), y, M, K, pass_wd_);
+    const auto pv = pass_view(wname);
+    hal::gemm_bias_free(x, pv.data, y, M, K, pass_to_wd(pv.dtype));
   }
 }
 
@@ -565,7 +599,7 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
         return;
       }
       if (!W.pass || W.M <= 0 || W.K <= 0) return;
-      if (hal::cuda::prefetch_w16(W.pass, W.M, W.K, W.dt ==hal::WDtype::kF16))
+      if (hal::cuda::prefetch_w16(W.pass, W.M, W.K, W.dt == hal::WDtype::kF16))
         ++n_ok;
       else
         ++n_fail;
@@ -603,7 +637,7 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
   } else if (lm_pass_) {
     const size_t mbytes = static_cast<size_t>(cfg_.vocab) * cfg_.hidden * 2;
     if (hal::cuda::prefetch_w16(lm_pass_, cfg_.vocab, cfg_.hidden,
-                                pass_wd_ == hal::WDtype::kF16)) {
+                                lm_dt_ == hal::WDtype::kF16)) {
       LOG_INFO("Qwen35Int4: lm_head W16-pack prefetch OK (%.2fGiB)", mbytes / double(1ull << 30));
     } else {
       LOG_INFO("Qwen35Int4: lm_head W16-pack prefetch FAILED (%.2fGiB needed; used=%.2fGiB budget=%.2fGiB)",
@@ -650,7 +684,7 @@ void Qwen35Int4Model::embed(int32_t token, float* out) {
     return;
   }
   const uint16_t* row = emb_pass_ + static_cast<size_t>(token) * cfg_.hidden;
-  for (int i = 0; i < cfg_.hidden; ++i) out[i] = hal::load_w(row + i, pass_wd_);
+  for (int i = 0; i < cfg_.hidden; ++i) out[i] = hal::load_w(row + i, emb_dt_);
 }
 
 void Qwen35Int4Model::set_vision_embeds(std::vector<float> embeds, int n_tok) {
@@ -982,7 +1016,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   std::memcpy(sc.residual.data(), x, sizeof(float) * nH);
 
   for (int t = 0; t < n_tok; ++t)
-     hal::rmsnorm(x + t * H, lp.ln1, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
+     hal::rmsnorm(x + t * H, lp.ln1, sc.normed.data() + t * H, H, cfg_.rms_eps, lp.ln_dt, true);
 
   auto& Lkv = cache.layer(layer);
 
@@ -1024,14 +1058,14 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
         const float* src = sc.qg.data() + (t * nh + h) * hd * 2;
         std::memcpy(qh, src, sizeof(float) * hd);
         std::memcpy(gh, src + hd, sizeof(float) * hd);
-        hal::rmsnorm(qh, lp.qn, qh, hd, cfg_.rms_eps, pass_wd_, true);
+        hal::rmsnorm(qh, lp.qn, qh, hd, cfg_.rms_eps, lp.qk_norm_dt, true);
         hal::apply_mrope_freqs(qh, hd, rotary_dim, pt, ph, pw, cfg_.rope_theta, mrope_section_,
                                mrope_interleaved_);
       }
       for (int h = 0; h < nkv; ++h) {
         float* kh = sc.kk.data() + (t * nkv + h) * hd;
         float* vh = sc.vv.data() + (t * nkv + h) * hd;
-        hal::rmsnorm(kh, lp.kn, kh, hd, cfg_.rms_eps, pass_wd_, true);
+        hal::rmsnorm(kh, lp.kn, kh, hd, cfg_.rms_eps, lp.qk_norm_dt, true);
         hal::apply_mrope_freqs(kh, hd, rotary_dim, pt, ph, pw, cfg_.rope_theta, mrope_section_,
                                mrope_interleaved_);
         float* kdst = Lkv.k.data() + (static_cast<size_t>(h) * cache.max_seq() + Lkv.seq + t) * hd;
@@ -1184,13 +1218,13 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       for (int h = 0; h < nv; ++h) {
         float* ch = sc.core.data() + (t * nv + h) * dv;
         float* zh = sc.z.data() + (t * nv + h) * dv;
-          hal::rmsnorm_gated(ch, zh, lp.nrm, ch, dv, cfg_.rms_eps, pass_wd_);
+          hal::rmsnorm_gated(ch, zh, lp.nrm, ch, dv, cfg_.rms_eps, lp.nrm_dt);
       }
     }
     // Fuse wout + MLP on device (linear decode): skip host residual/mlp tail.
     if (n_tok == 1 && !lp.is_moe && resident_gpu_ && lp.wout.is_int4 && lp.ln2 && hal::cuda::try_out_mlp_resident(sc.residual.data(), sc.core.data(), lp.wout.i4, lp.ln2,
                                         lp.wgate, lp.wup, lp.wdown, x, H, I, cfg_.rms_eps,
-                                        pass_wd_ == hal::WDtype::kF16)) {
+                                        lp.ln_dt == hal::WDtype::kF16)) {
       return;
     }
     if (n_tok > 1)
@@ -1206,7 +1240,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     Int4Scratch::fit(sc.normed, static_cast<size_t>(n_tok) * H);
     Int4Scratch::fit(sc.down, static_cast<size_t>(n_tok) * H);
     for (int t = 0; t < n_tok; ++t) {
-     hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
+     hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, lp.ln_dt, true);
       moe_ffn_token(layer, sc.normed.data() + t * H, sc.down.data() + t * H);
       for (int i = 0; i < H; ++i) x[t * H + i] = sc.residual[t * H + i] + sc.down[t * H + i];
     }
@@ -1217,11 +1251,11 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   Int4Scratch::fit(sc.mid, static_cast<size_t>(n_tok) * I);
   Int4Scratch::fit(sc.down, static_cast<size_t>(n_tok) * H);
   if (n_tok == 1 && resident_gpu_ && lp.ln2 && hal::cuda::try_mlp_decode_resident(x, lp.ln2, lp.wgate, lp.wup, lp.wdown, x, H, I,
-                                         cfg_.rms_eps, pass_wd_ == hal::WDtype::kF16)) {
+                                         cfg_.rms_eps, lp.ln_dt == hal::WDtype::kF16)) {
     // x already = residual + down
   } else if (n_tok > 1) {
     for (int t = 0; t < n_tok; ++t)
-      hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
+      hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, lp.ln_dt, true);
     gemm_view_batch(sc.normed.data(), n_tok, lp.wgate, sc.gproj.data());
     gemm_view_batch(sc.normed.data(), n_tok, lp.wup, sc.uproj.data());
     for (int t = 0; t < n_tok; ++t)
@@ -1231,7 +1265,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
       for (int i = 0; i < H; ++i) x[t * H + i] = sc.residual[t * H + i] + sc.down[t * H + i];
   } else {
     for (int t = 0; t < n_tok; ++t)
-      hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, pass_wd_, true);
+      hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, lp.ln_dt, true);
     const qlwc::Int4View* ws2[2] = {&lp.wgate, &lp.wup};
     float* ys2[2] = {sc.gproj.data(), sc.uproj.data()};
     if (!hal::cuda::try_gemm_int4_multi(sc.normed.data(), ws2, ys2, 2)) {
@@ -1258,7 +1292,7 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   auto& sc = scratch();
   auto& Lkv = cache.layer(layer);
 
-  const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+  const bool ln_f16 = lp.ln_dt == hal::WDtype::kF16;
   if (lp.wqkv.is_int4 && lp.wz.is_int4) {
     const qlwc::Int4View* wb_i4 = lp.wb.is_int4 ? &lp.wb.i4 : nullptr;
     const uint16_t* wb_pass = lp.wb.is_int4 ? nullptr : lp.wb.pass;
@@ -1267,10 +1301,10 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
     const qlwc::Int4View* wout_i4 = lp.wout.is_int4 ? &lp.wout.i4 : nullptr;
     const uint16_t* wout_pass = lp.wout.is_int4 ? nullptr : lp.wout.pass;
     if (hal::cuda::try_linear_decode_on_act(
-            lp.ln1, lp.wqkv.i4, lp.wz.i4, wb_i4, wb_pass, lp.wb.dt ==hal::WDtype::kF16, wa_i4,
-            wa_pass, lp.wa.dt ==hal::WDtype::kF16, lp.conv_w_f.data(), Lkv.linear.conv.data(),
+            lp.ln1, lp.wqkv.i4, lp.wz.i4, wb_i4, wb_pass, lp.wb.dt == hal::WDtype::kF16, wa_i4,
+            wa_pass, lp.wa.dt == hal::WDtype::kF16, lp.conv_w_f.data(), Lkv.linear.conv.data(),
             cfg_.conv_k, lp.A_log_f.data(), lp.dt_bias_f.data(), Lkv.linear.recurrent.data(), lp.nrm,
-            wout_i4, wout_pass, lp.wout.dt ==hal::WDtype::kF16, lp.ln2, lp.wgate, lp.wup, lp.wdown,
+            wout_i4, wout_pass, lp.wout.dt == hal::WDtype::kF16, lp.ln2, lp.wgate, lp.wup, lp.wdown,
             nk, nv, dk, dv, I, cfg_.rms_eps, ln_f16, ln_f16)) {
       Lkv.linear.has_state = true;
       return true;
@@ -1303,7 +1337,7 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
     float* ys2[2] = {sc.mixed.data(), sc.z.data()};
     if (hal::cuda::try_rmsnorm_gemm_multi_from_act(lp.ln1, ws2, ys2, 2, cfg_.rms_eps, ln_f16)) {
       if (!hal::cuda::decode_act_sync_to_host(sc.normed.data(), H)) return false;
-      hal::rmsnorm(sc.normed.data(), lp.ln1, sc.normed.data(), H, cfg_.rms_eps, pass_wd_, true);
+      hal::rmsnorm(sc.normed.data(), lp.ln1, sc.normed.data(), H, cfg_.rms_eps, lp.ln_dt, true);
       gemm_opt(sc.normed.data(), lp.wb, sc.b.data());
       gemm_opt(sc.normed.data(), lp.wa, sc.a.data());
       in_ok = true;
@@ -1370,7 +1404,7 @@ bool Qwen35Int4Model::layer_forward_linear_act(int layer, SessionCache& cache) {
   for (int h = 0; h < nv; ++h) {
     float* ch = sc.core.data() + h * dv;
     float* zh = sc.z.data() + h * dv;
-    hal::rmsnorm_gated(ch, zh, lp.nrm, ch, dv, cfg_.rms_eps, pass_wd_);
+    hal::rmsnorm_gated(ch, zh, lp.nrm, ch, dv, cfg_.rms_eps, lp.nrm_dt);
   }
 
   const qlwc::Int4View* wout_i4 = lp.wout.is_int4 ? &lp.wout.i4 : nullptr;
@@ -1392,7 +1426,7 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
   const int nh = cfg_.n_heads, nkv = cfg_.n_kv, hd = cfg_.head_dim;
   const int rotary_dim = static_cast<int>(hd * cfg_.partial_rotary) / 2 * 2;
   const float scale = 1.f / std::sqrt(static_cast<float>(hd));
-  const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+  const bool ln_f16 = lp.ln_dt == hal::WDtype::kF16;
   auto& sc = scratch();
   auto& Lkv = cache.layer(layer);
 
@@ -1421,14 +1455,14 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
     const float* src = sc.qg.data() + h * hd * 2;
     std::memcpy(qh, src, sizeof(float) * hd);
     std::memcpy(gh, src + hd, sizeof(float) * hd);
-    hal::rmsnorm(qh, lp.qn, qh, hd, cfg_.rms_eps, pass_wd_, true);
+    hal::rmsnorm(qh, lp.qn, qh, hd, cfg_.rms_eps, lp.qk_norm_dt, true);
     hal::apply_mrope_freqs(qh, hd, rotary_dim, pt, ph, pw, cfg_.rope_theta, mrope_section_,
                            mrope_interleaved_);
   }
   for (int h = 0; h < nkv; ++h) {
     float* kh = sc.kk.data() + h * hd;
     float* vh = sc.vv.data() + h * hd;
-    hal::rmsnorm(kh, lp.kn, kh, hd, cfg_.rms_eps, pass_wd_, true);
+    hal::rmsnorm(kh, lp.kn, kh, hd, cfg_.rms_eps, lp.qk_norm_dt, true);
     hal::apply_mrope_freqs(kh, hd, rotary_dim, pt, ph, pw, cfg_.rope_theta, mrope_section_,
                            mrope_interleaved_);
     float* kdst = Lkv.k.data() + (static_cast<size_t>(h) * cache.max_seq() + Lkv.seq) * hd;
@@ -1550,16 +1584,16 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
   if (stream_act && hal::cuda::decode_act_valid()) {
     // Sync residual for last_hidden_; lm_head may re-norm from device act.
     if (!hal::cuda::decode_act_sync_to_host(h_out, H)) {
-     hal::rmsnorm(x, final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+     hal::rmsnorm(x, final_norm_, h_out, H, cfg_.rms_eps, final_norm_dt_, true);
      hal::cuda::decode_act_invalidate();
     } else {
       std::vector<float> tmp(static_cast<size_t>(H));
       std::memcpy(tmp.data(), h_out, sizeof(float) * static_cast<size_t>(H));
-     hal::rmsnorm(tmp.data(), final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+     hal::rmsnorm(tmp.data(), final_norm_, h_out, H, cfg_.rms_eps, final_norm_dt_, true);
     }
   } else {
    hal::cuda::decode_act_invalidate();
-   hal::rmsnorm(x + (n - 1) * H, final_norm_, h_out, H, cfg_.rms_eps, pass_wd_, true);
+   hal::rmsnorm(x + (n - 1) * H, final_norm_, h_out, H, cfg_.rms_eps, final_norm_dt_, true);
   }
   for (int i = 0; i < H; ++i)
     if (!std::isfinite(h_out[i])) h_out[i] = 0.f;
@@ -1593,13 +1627,14 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
   logits.resize(static_cast<size_t>(V));
   bool lm_from_act = false;
   if (hal::cuda::enabled() && hal::cuda::decode_act_valid()) {
-    const bool ln_f16 = pass_wd_ == hal::WDtype::kF16;
+    const bool fn_f16 = final_norm_dt_ == hal::WDtype::kF16;
+    const bool lm_f16 = lm_dt_ == hal::WDtype::kF16;
     if (lm_is_int4_) {
       lm_from_act = hal::cuda::try_lm_head_int4_from_act(final_norm_, lm_int4_, logits.data(),
-                                                         cfg_.rms_eps, ln_f16);
+                                                         cfg_.rms_eps, fn_f16);
     } else if (lm_pass_) {
       lm_from_act = hal::cuda::try_lm_head_w16_from_act(final_norm_, lm_pass_, V, logits.data(),
-                                                        cfg_.rms_eps, ln_f16, ln_f16);
+                                                        cfg_.rms_eps, fn_f16, lm_f16);
     }
   }
   if (!lm_from_act) {
@@ -1622,10 +1657,10 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
       }
     } else {
       if (hal::cuda::enabled() && lm_pass_ && hal::cuda::try_gemm_w16(h.data(), lm_pass_, logits.data(), V, H,
-                                  pass_wd_ == hal::WDtype::kF16)) {
+                                  lm_dt_ == hal::WDtype::kF16)) {
         /* GPU resident W16 cublas SGEMM */
       } else {
-      hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, pass_wd_,
+      hal::gemm_bias_free(h.data(), lm_pass_, logits.data(), V, H, lm_dt_,
                             /*allow_gpu=*/true);
       }
     }
@@ -1667,7 +1702,7 @@ bool Qwen35Int4Model::forward_decode_greedy(const std::vector<int32_t>& tokens,
       return true;
     } else if (lm_pass_) {
       if (hal::cuda::try_gemm_w16(sc.last.data(), lm_pass_, sc.logits.data(), cfg_.vocab, H,
-                                  pass_wd_ == hal::WDtype::kF16)) {
+                                  lm_dt_ == hal::WDtype::kF16)) {
         const float* lp = sc.logits.data();
         float best_val = lp[0];
         int best = 0;
@@ -1754,7 +1789,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
     Int4Scratch::fit(sc.last, static_cast<size_t>(n) * H);
     for (int t = 0; t < n; ++t) {
       float* ht = sc.last.data() + t * H;
-      hal::rmsnorm(x.data() + t * H, final_norm_, ht, H, cfg_.rms_eps, pass_wd_, true);
+      hal::rmsnorm(x.data() + t * H, final_norm_, ht, H, cfg_.rms_eps, final_norm_dt_, true);
       for (int i = 0; i < H; ++i)
         if (!std::isfinite(ht[i])) ht[i] = 0.f;
       if (keep_prefix)
@@ -1764,7 +1799,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
     gemm_view_batch(sc.last.data(), n, lm_int4_, logits_all.data());
   } else {
     for (int t = 0; t < n; ++t) {
-      hal::rmsnorm(x.data() + t * H, final_norm_, h.data(), H, cfg_.rms_eps, pass_wd_, true);
+      hal::rmsnorm(x.data() + t * H, final_norm_, h.data(), H, cfg_.rms_eps, final_norm_dt_, true);
       for (float& v : h)
         if (!std::isfinite(v)) v = 0.f;
       if (keep_prefix)
@@ -1782,7 +1817,7 @@ void Qwen35Int4Model::forward_all_logits(const std::vector<int32_t>& tokens, Ses
 #endif
         hal::gemm_int4(h.data(), lm_int4_, dest);
       } else {
-        hal::gemm_bias_free(h.data(), lm_pass_, dest, V, H, pass_wd_,
+        hal::gemm_bias_free(h.data(), lm_pass_, dest, V, H, lm_dt_,
                             /*allow_gpu=*/true);
       }
       if (t == n - 1) last_hidden_ = h;

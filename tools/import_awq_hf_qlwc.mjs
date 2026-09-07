@@ -629,10 +629,13 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
   if (!symmetric) {
     if (!qzerosE) throw new Error("asymmetric AutoAWQ needs qzeros");
     const qzeros = readTensor(qzerosE);
-    const zeroF = tensorToF32(qzeros, "I32", qzeros.length / 4);
+    // CRITICAL: packed qzeros are arbitrary int32 bit patterns. Passing them through
+    // Float32Array (tensorToF32 I32) silently corrupts words with |x| > 2^24 → wrong zp
+    // → sticky garbage after re-import. Keep int32 bit-exact.
+    const zeroI32 = readI32Words(qzeros);
     const packedRows = Math.ceil(M / 8);
-    if (zeroF.length < ng * packedRows) {
-      throw new Error(`AutoAWQ qzeros too short ${zeroF.length} need ${ng * packedRows}`);
+    if (zeroI32.length < ng * packedRows) {
+      throw new Error(`AutoAWQ qzeros too short ${zeroI32.length} need ${ng * packedRows}`);
     }
     const zpF = new Float32Array(M * ng);
     for (let m = 0; m < M; ++m) {
@@ -640,7 +643,7 @@ function importAwqToQlwc(qweightE, scalesE, qzerosE, M, K, gs, symmetric, tmpDir
       const nib = awqNibbleIndex(m % 8);
       for (let g = 0; g < ng; ++g) {
         // qzeros [ng, ceil(M/8)]
-        const word = zeroF[g * packedRows + pm] | 0;
+        const word = zeroI32[g * packedRows + pm] | 0;
         zpF[m * ng + g] = (word >>> (nib * 4)) & 0xf;
       }
     }
@@ -801,6 +804,14 @@ function shouldQuantize(name, shape, minCols, gs) {
   return true;
 }
 
+/** Packed INT4 words must stay as int32 — Float32 cannot represent all 32-bit patterns. */
+function readI32Words(buf) {
+  const n = (buf.length / 4) | 0;
+  const out = new Int32Array(n);
+  for (let i = 0; i < n; ++i) out[i] = buf.readInt32LE(i * 4);
+  return out;
+}
+
 function tensorToF32(buf, dtype, count) {
   if (dtype === "F32") {
     const out = new Float32Array(count);
@@ -822,6 +833,7 @@ function tensorToF32(buf, dtype, count) {
     return out;
   }
   if (dtype === "I32" || dtype === "U32") {
+    // Numeric I32 only (e.g. unpacked zp 0..15). Never use for packed AWQ qzeros/qweight words.
     const out = new Float32Array(count);
     for (let i = 0; i < count; ++i) out[i] = buf.readInt32LE(i * 4);
     return out;
@@ -975,7 +987,7 @@ function dequantAwq(qweight, scales, qzeros, M, K, gs, scaleDt, symmetric) {
   const scaleF = tensorToF32(scales, scaleDt, scaleCount);
   // AutoAWQ gemm scales are [ng, M] — length alone cannot distinguish m_g vs g_m.
   const layout = scaleF.length === M * ng ? "g_m" : inferLayout(scaleF.length, M, ng);
-  const zeroF = qzeros ? tensorToF32(qzeros, "I32", qzeros.length / 4) : null;
+  const zeroI32 = qzeros ? readI32Words(qzeros) : null;
   const packedRows = Math.ceil(M / 8);
   const W = new Float32Array(M * K);
   for (let m = 0; m < M; ++m) {
@@ -988,7 +1000,7 @@ function dequantAwq(qweight, scales, qzeros, M, K, gs, scaleDt, symmetric) {
         const pm = (m / 8) | 0;
         const nib = awqNibbleIndex(m);
         const zpIdx = g * packedRows + pm;
-        const word = zeroF ? zeroF[zpIdx] | 0 : 0;
+        const word = zeroI32 ? zeroI32[zpIdx] | 0 : 0;
         const zp = (word >>> (nib * 4)) & 0xf;
         W[m * K + k] = (q - zp) * sc;
       }
