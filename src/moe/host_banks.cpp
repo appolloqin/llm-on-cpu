@@ -288,23 +288,37 @@ void QlwcExpertHostBanks::pin() {
   pinned_bytes_ = 0;
   locked_bytes_ = 0;
   size_t used = 0;
+  size_t cuda_pinned = 0;
   const size_t budget = cfg_.dram_budget_bytes;
+  size_t cuda_cap = cfg_.cuda_pin_budget_bytes;
+  if (cuda_cap == 0) cuda_cap = 2ull << 30;  // default 2GiB — protects WDDM cudaMalloc/JIT
   const bool want_pin = cfg_.host_pin;
+
+  LOG_INFO("moe host_banks settle: cuda_pin_cap=%.2fGiB host_pin=%d",
+           cuda_cap / double(1ull << 30), want_pin ? 1 : 0);
 
   for (int li = 0; li < cfg_.num_layers; ++li) {
     auto& lb = layers_[static_cast<size_t>(li)];
     if (!lb.arena) continue;
-    HostResidency want = want_pin ? HostResidency::kPinned : HostResidency::kLocked;
+
+    HostResidency want = HostResidency::kLocked;
+    if (want_pin && cuda_pinned + lb.arena_bytes <= cuda_cap) {
+      want = HostResidency::kPinned;
+    } else if (want_pin && cuda_pinned < cuda_cap) {
+      // Remaining cuda budget too small for a full layer — lock instead.
+      want = HostResidency::kLocked;
+    }
     if (budget > 0 && used + lb.arena_bytes > budget) {
       want = HostResidency::kLocked;
-      LOG_WARN("moe host_banks: layer %d exceeds dram_hot (%.2f GiB used / %.2f GiB); "
-               "CPU-only for this layer",
-               li, used / double(1ull << 30), budget / double(1ull << 30));
+      LOG_WARN("moe host_banks: layer %d exceeds dram_hot (%.2f GiB used / %.2f GiB)", li,
+               used / double(1ull << 30), budget / double(1ull << 30));
     }
     if (!settle_layer(li, want)) {
-      LOG_WARN("moe host_banks: layer %d settle failed → PAGEABLE (CPU decode)", li);
+      LOG_WARN("moe host_banks: layer %d settle failed → PAGEABLE (still GPU-OK via pageable H2D)",
+               li);
     } else {
       used += lb.arena_bytes;
+      if (lb.residency == HostResidency::kPinned) cuda_pinned += lb.arena_bytes;
     }
   }
   LOG_INFO("moe host_pin=%.2fGiB locked=%.2fGiB arena=%.2fGiB layers=%d experts=%d",
@@ -333,7 +347,9 @@ bool QlwcExpertHostBanks::has_layer(int layer) const {
 }
 
 bool QlwcExpertHostBanks::layer_gpu_ok(int layer) const {
-  return has_layer(layer) && layer_residency(layer) == HostResidency::kPinned;
+  // Any filled layer can feed GPU via ensure_int4_resident (pageable H2D is fine).
+  // PINNED only speeds async/PCIe; do NOT require it (LOCKED/PAGEABLE still GPU-OK).
+  return has_layer(layer);
 }
 
 const qlwc::Int4View& QlwcExpertHostBanks::gate(int layer, int expert) const {

@@ -16,7 +16,7 @@ model:
 mode: hybrid_gpu
 
 moe:
-  backend: hybrid          # offload | hybrid | cpu
+  backend: offload         # offload | hybrid | cpu  (offload = all top-k on GPU; faster on 8GB)
   cache_slots: 0           # 0 = auto from VRAM after MoE-first reserve
   host_pin: true
   prefill_overlap: true

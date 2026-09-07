@@ -25,8 +25,10 @@ class Qwen36MoeInt4Model : public Qwen35Int4Model {
  public:
   void load(qlwc::QlwcStore* store, const std::string& hf_config_json_path) override;
 
-  // After load (+ CUDA enable): fill/pin host banks and build VRAM slot cache.
+  // After load (+ CUDA enable): fill host banks + build slot cache (pin deferred).
   void init_moe_offload(const MoeOffloadRuntimeConfig& cfg);
+  // Call AFTER warm_gpu_int4 so cudaHostRegister does not starve attn cudaMalloc/JIT.
+  void pin_moe_host_banks();
   bool moe_offload_ready() const { return moe_cache_ && moe_cache_->ready(); }
   moe::OffloadMoeCache* moe_cache() { return moe_cache_.get(); }
   moe::QlwcExpertHostBanks* moe_banks() { return moe_banks_.get(); }

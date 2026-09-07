@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
       model.enable_layer_stream(streamer.get());
     }
 
-    // FreeToken-isomorphic MoE offload: host pin + VRAM slots (before attn warm).
+    // FreeToken-isomorphic MoE offload: fill host banks first (no cudaHostRegister yet).
     auto* moe36 = dynamic_cast<llmoc::model::Qwen36MoeInt4Model*>(&model);
     size_t moe_reserve = 0;
     if (moe36 && !use_stream) {
@@ -271,7 +271,6 @@ int main(int argc, char** argv) {
       mcfg.prefill_overlap = cfg.moe_prefill_overlap;
       mcfg.hybrid_fetch_frac = cfg.moe_hybrid_fetch_frac;
       mcfg.dram_hot_gb = cfg.dram_hot_gb;
-      // Temporarily shrink budget so slot count auto uses MoE-first share.
       const size_t bud0 = llmoc::hal::cuda::enabled() ? llmoc::hal::cuda::vram_budget() : 0;
       moe36->init_moe_offload(mcfg);
       moe_reserve = moe36->moe_slot_reserve_bytes();
@@ -304,6 +303,11 @@ int main(int argc, char** argv) {
                  used_g, bud_g, llmoc::hal::cuda::jit_available() ? 1 : 0,
                  llmoc::hal::cuda::status());
       }
+    }
+
+    // cudaHostRegister AFTER attn warm — capped so WDDM pin quota does not kill cudaMalloc/JIT.
+    if (moe36 && !use_stream) {
+      moe36->pin_moe_host_banks();
     }
 
     // 预热（MoE+offload：专家已在 host banks；首次仅 H2D top-k）

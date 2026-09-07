@@ -45,7 +45,10 @@ struct HostBanksConfig {
   int awq_zp = 0;
   std::string name_prefix = "language_model.";  // + layers.L.mlp.experts.E.…
   bool host_pin = true;
-  size_t dram_budget_bytes = 0;  // 0 = unlimited; pin fails → LOCKED per layer
+  size_t dram_budget_bytes = 0;  // 0 = unlimited for arena fill
+  // Cap cudaHostRegister (WDDM pin quota). Excess layers use VirtualLock/PAGEABLE.
+  // 0 = auto (~2GiB). Huge register blocks cudaMalloc/JIT on Windows.
+  size_t cuda_pin_budget_bytes = 0;
 };
 
 class QlwcExpertHostBanks {
@@ -68,6 +71,9 @@ class QlwcExpertHostBanks {
   // Pin-after-fill: cudaHostRegister when CUDA available, else VirtualLock/mlock.
   // Layers that exceed dram_budget or fail pin become LOCKED (CPU-only decode).
   void pin();
+
+  void set_cuda_pin_budget(size_t bytes) { cfg_.cuda_pin_budget_bytes = bytes; }
+  void set_host_pin(bool on) { cfg_.host_pin = on; }
 
   // Unit-test helper: allocate N MoE layers with empty weights and mark ready/PINNED.
   void prepare_synthetic_for_test(int n_moe_layers);

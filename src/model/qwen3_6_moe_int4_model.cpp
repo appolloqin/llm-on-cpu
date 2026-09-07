@@ -105,24 +105,21 @@ void Qwen36MoeInt4Model::init_moe_offload(const MoeOffloadRuntimeConfig& cfg) {
   moe_banks_->configure(hcfg);
   moe_banks_->allocate();
   moe_banks_->fill_from_qlwc(*store_);
-  moe_banks_->pin();
+  // Defer cudaHostRegister until pin_moe_host_banks() after attn warm.
 
   const int E = cfg_.n_experts;
   int slots = cfg.cache_slots;
   const size_t per_exp = moe::expert_device_bytes(hcfg.hidden, hcfg.intermediate, hcfg.group_size,
                                                    hcfg.has_zeros);
   if (slots <= 0 && hal::cuda::enabled()) {
-    // Auto: aim for >= 2E (prefill dbuf) plus decode headroom from remaining budget.
     const size_t bud = hal::cuda::vram_budget();
-    const size_t used =hal::cuda::vram_used();
-    const size_t free_b = bud > used ? bud - used : 0;
-    // MoE-first: take up to ~40% of budget for slots (attn pin happens after reserve).
-    const size_t moe_cap = (std::max)(free_b, bud / 2);
+    // Keep MoE slot reserve modest on 8GB cards so attn pin can succeed.
+    const size_t moe_cap = (std::max)(bud / 4, per_exp * static_cast<size_t>(2 * E));
     slots = per_exp > 0 ? static_cast<int>(moe_cap / per_exp) : (2 * E);
     if (cfg.prefill_overlap) slots = (std::max)(slots, 2 * E);
-    slots = (std::min)(slots, (std::max)(2 * E, E * 4));  // sane upper for unit tests / small VRAM
+    slots = (std::min)(slots, (std::max)(2 * E, E * 4));
   }
-  if (slots <= 0) slots = (std::max)(2 * E, E);  // CPU-only still needs bookkeeping
+  if (slots <= 0) slots = (std::max)(2 * E, E);
   if (cfg.prefill_overlap && slots < 2 * E) slots = 2 * E;
 
   moe::OffloadCacheConfig ocfg;
@@ -147,9 +144,22 @@ void Qwen36MoeInt4Model::init_moe_offload(const MoeOffloadRuntimeConfig& cfg) {
       ocfg.backend == moe::MoeBackend::kCpu
           ? "cpu"
           : (ocfg.backend == moe::MoeBackend::kHybrid ? "hybrid" : "offload");
-  LOG_INFO("moe_slots=%d reserve=%.2fGiB backend=%s prefill_overlap=%d hybrid_fetch_frac=%.2f",
+  LOG_INFO("moe_slots=%d reserve=%.2fGiB backend=%s prefill_overlap=%d hybrid_fetch_frac=%.2f "
+           "(host pin deferred until after attn warm)",
            slots, moe_slot_reserve_bytes_ / double(1ull << 30), be, ocfg.prefill_overlap ? 1 : 0,
            ocfg.hybrid_fetch_frac);
+}
+
+void Qwen36MoeInt4Model::pin_moe_host_banks() {
+  if (!moe_banks_ || !moe_banks_->ready()) return;
+  size_t cuda_cap = 2ull << 30;
+  if (const char* e = std::getenv("LLMOC_MOE_CUDA_PIN_GB")) {
+    const double g = std::atof(e);
+    if (g > 0.0) cuda_cap = static_cast<size_t>(g * (1ull << 30));
+  }
+  moe_banks_->set_cuda_pin_budget(cuda_cap);
+  moe_banks_->set_host_pin(moe_rt_.host_pin);
+  moe_banks_->pin();
 }
 
 void Qwen36MoeInt4Model::on_prefill_begin() {
