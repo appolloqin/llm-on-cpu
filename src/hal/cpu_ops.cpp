@@ -368,11 +368,16 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
 
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale) {
-  // Parallel over (query×head). Per-iteration score buffer (MSVC OpenMP-safe).
-  // Note: keep scalar dots here — prior dual-AVX+hsum path produced huge errors on MSVC;
-  // attn_decode_one retains AVX for the decode hot path.
+  // Parallel over (query×head). Score scratch is indexed by omp thread id so GCC/MSVC
+  // OpenMP never share a std::vector across workers (both had privatization bugs).
   const int g = n_heads / n_kv_heads;
   const int work = seq * n_heads;
+#if defined(_OPENMP)
+  const int nthreads = work >= 64 ? omp_get_max_threads() : 1;
+#else
+  const int nthreads = 1;
+#endif
+  std::vector<float> scratch(static_cast<size_t>(std::max(1, nthreads)) * static_cast<size_t>(seq));
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (work >= 64)
 #endif
@@ -380,7 +385,12 @@ void attn_prefill(const float* q, const float* k, const float* v, float* out, in
     const int tq = wi / n_heads;
     const int h = wi % n_heads;
     const int hkv = h / g;
-    std::vector<float> scores(static_cast<size_t>(tq) + 1u);
+#if defined(_OPENMP)
+    const int tid = work >= 64 ? omp_get_thread_num() : 0;
+#else
+    const int tid = 0;
+#endif
+    float* scores = scratch.data() + static_cast<size_t>(tid) * static_cast<size_t>(seq);
     const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
     for (int tk = 0; tk <= tq; ++tk) {
       const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
