@@ -89,7 +89,7 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
                      float scale);
 
 // Prefill causal attention: q/k/v [seq, n_heads/n_kv, head_dim] -> out [seq, n_heads, head_dim]
-// Parallel over (query×head); dual-AVX dots for wide head_dim.
+// Parallel over (query×head) with per-thread score buffers.
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale);
 

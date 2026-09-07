@@ -366,54 +366,56 @@ void attn_decode_one(const float* q, const float* k_cache, const float* v_cache,
   }
 }
 
+namespace {
+
+void attn_prefill_one(const float* q, const float* k, const float* v, float* out, int n_heads,
+                      int n_kv_heads, int head_dim, float scale, int tq, int h, float* scores) {
+  const int g = n_heads / n_kv_heads;
+  const int hkv = h / g;
+  const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
+  for (int tk = 0; tk <= tq; ++tk) {
+    const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
+    float dot = 0.f;
+    for (int d = 0; d < head_dim; ++d) dot += qh[d] * kt[d];
+    scores[tk] = dot * scale;
+  }
+  softmax_inplace(scores, tq + 1);
+  float* oh = out + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
+  std::fill(oh, oh + head_dim, 0.f);
+  for (int tk = 0; tk <= tq; ++tk) {
+    const float* vt = v + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
+    const float s = scores[tk];
+    for (int d = 0; d < head_dim; ++d) oh[d] += s * vt[d];
+  }
+}
+
+}  // namespace
+
 void attn_prefill(const float* q, const float* k, const float* v, float* out, int seq, int n_heads,
                   int n_kv_heads, int head_dim, float scale) {
-  // Parallel over (query×head). Score scratch is indexed by omp thread id so GCC/MSVC
-  // OpenMP never share a std::vector across workers (both had privatization bugs).
-  const int g = n_heads / n_kv_heads;
+  // Parallel over (query × head). Fix OpenMP privatization — not a serial rollback:
+  // declare scores inside `omp parallel`, then `omp for` (vector inside `parallel for`
+  // was mis-privatized on GCC CI).
   const int work = seq * n_heads;
+
 #if defined(_OPENMP)
-  const int nthreads = work >= 64 ? omp_get_max_threads() : 1;
-#else
-  const int nthreads = 1;
+  if (work >= 64) {
+#pragma omp parallel
+    {
+      std::vector<float> scores(static_cast<size_t>(seq));
+#pragma omp for schedule(static)
+      for (int wi = 0; wi < work; ++wi) {
+        attn_prefill_one(q, k, v, out, n_heads, n_kv_heads, head_dim, scale, wi / n_heads,
+                         wi % n_heads, scores.data());
+      }
+    }
+    return;
+  }
 #endif
-  std::vector<float> scratch(static_cast<size_t>(std::max(1, nthreads)) * static_cast<size_t>(seq));
-#if defined(_OPENMP)
-#pragma omp parallel for schedule(static) if (work >= 64)
-#endif
+  std::vector<float> scores(static_cast<size_t>(seq));
   for (int wi = 0; wi < work; ++wi) {
-    const int tq = wi / n_heads;
-    const int h = wi % n_heads;
-    const int hkv = h / g;
-#if defined(_OPENMP)
-    const int tid = work >= 64 ? omp_get_thread_num() : 0;
-#else
-    const int tid = 0;
-#endif
-    float* scores = scratch.data() + static_cast<size_t>(tid) * static_cast<size_t>(seq);
-    const float* qh = q + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
-    for (int tk = 0; tk <= tq; ++tk) {
-      const float* kt = k + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
-      float dot = 0.f;
-      for (int d = 0; d < head_dim; ++d) dot += qh[d] * kt[d];
-      scores[tk] = dot * scale;
-    }
-    float m = scores[0];
-    for (int i = 1; i <= tq; ++i) m = std::max(m, scores[i]);
-    float sum = 0.f;
-    for (int i = 0; i <= tq; ++i) {
-      scores[i] = std::exp(scores[i] - m);
-      sum += scores[i];
-    }
-    const float inv = sum > 0.f ? 1.f / sum : 0.f;
-    for (int i = 0; i <= tq; ++i) scores[i] *= inv;
-    float* oh = out + (static_cast<size_t>(tq) * n_heads + h) * head_dim;
-    std::fill(oh, oh + head_dim, 0.f);
-    for (int tk = 0; tk <= tq; ++tk) {
-      const float* vt = v + (static_cast<size_t>(tk) * n_kv_heads + hkv) * head_dim;
-      const float s = scores[tk];
-      for (int d = 0; d < head_dim; ++d) oh[d] += s * vt[d];
-    }
+    attn_prefill_one(q, k, v, out, n_heads, n_kv_heads, head_dim, scale, wi / n_heads,
+                     wi % n_heads, scores.data());
   }
 }
 

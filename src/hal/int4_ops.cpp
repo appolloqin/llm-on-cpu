@@ -421,7 +421,6 @@ Int4ArgmaxResult gemm_int4_argmax_impl(const float* x, const qlwc::Int4View& W) 
 
 void gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
   const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
-  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
 
 #if defined(LLMOC_ENABLE_AVX2)
   if (awq) {
@@ -430,6 +429,7 @@ void gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
   }
   gemm_int4_gptq_avx2(x, W, y);
 #else
+  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
   const int M = W.M, K = W.K, gs = W.group_size;
   const int ng = (K + gs - 1) / gs;
 #if defined(_OPENMP)
@@ -561,13 +561,13 @@ void gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
     return;
   }
   const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
-  const float awq_zp = static_cast<float>(W.awq_zp > 0 ? W.awq_zp : qlwc::kLocalAwqSymZero);
 #if defined(LLMOC_ENABLE_AVX2)
   if (awq) {
     gemm_int4_awq_batch_avx2(X, n, W, Y);
     return;
   }
 #endif
+  (void)awq;
   // GPTQ / 无 AVX2：逐 token（正确优先）
   for (int t = 0; t < n; ++t)
     gemm_int4(X + static_cast<size_t>(t) * W.K, W, Y + static_cast<size_t>(t) * W.M);

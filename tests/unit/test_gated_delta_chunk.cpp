@@ -76,11 +76,12 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
   }
   std::vector<float> out(seq * nh * hd), ref(seq * nh * hd);
 
+  // Reference mirrors attn_prefill math (softmax_inplace semantics via *inv).
   const int grp = nh / nkv;
   for (int tq = 0; tq < seq; ++tq) {
     for (int h = 0; h < nh; ++h) {
       const int hkv = h / grp;
-      std::vector<float> scores(tq + 1);
+      std::vector<float> scores(static_cast<size_t>(tq) + 1u);
       const float* qh = q.data() + (tq * nh + h) * hd;
       for (int tk = 0; tk <= tq; ++tk) {
         const float* kt = k.data() + (tk * nkv + hkv) * hd;
@@ -90,12 +91,13 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
       }
       float m = scores[0];
       for (int i = 1; i <= tq; ++i) m = std::max(m, scores[i]);
-      float s = 0.f;
+      double sum = 0.0;
       for (int i = 0; i <= tq; ++i) {
         scores[i] = std::exp(scores[i] - m);
-        s += scores[i];
+        sum += scores[i];
       }
-      for (int i = 0; i <= tq; ++i) scores[i] /= s;
+      const float inv = static_cast<float>(1.0 / sum);
+      for (int i = 0; i <= tq; ++i) scores[i] *= inv;
       float* oh = ref.data() + (tq * nh + h) * hd;
       std::fill(oh, oh + hd, 0.f);
       for (int tk = 0; tk <= tq; ++tk) {
@@ -108,5 +110,5 @@ TINY_TEST(Attn, PrefillMatchesNaiveSmall) {
   hal::attn_prefill(q.data(), k.data(), v.data(), out.data(), seq, nh, nkv, hd, scale);
   float e = 0.f;
   for (size_t i = 0; i < out.size(); ++i) e = std::max(e, std::fabs(out[i] - ref[i]));
-  EXPECT_TRUE(e < 1e-4f);
+  EXPECT_TRUE(e < 1e-5f);
 }
