@@ -852,9 +852,19 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     Int4Scratch::fit(sc.gate, static_cast<size_t>(n_tok) * nh * hd);
     Int4Scratch::fit(sc.attn_heads, static_cast<size_t>(n_tok) * nh * hd);
     if (n_tok > 1) {
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wq, sc.qg.data());
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wk, sc.kk.data());
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wv, sc.vv.data());
+      if (lp.wq.is_int4 && lp.wk.is_int4 && lp.wv.is_int4) {
+        const qlwc::Int4View* ws3[3] = {&lp.wq.i4, &lp.wk.i4, &lp.wv.i4};
+        float* ys3[3] = {sc.qg.data(), sc.kk.data(), sc.vv.data()};
+        if (!hal::cuda::try_gemm_int4_batch_multi(sc.normed.data(), n_tok, ws3, ys3, 3)) {
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wq, sc.qg.data());
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wk, sc.kk.data());
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wv, sc.vv.data());
+        }
+      } else {
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wq, sc.qg.data());
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wk, sc.kk.data());
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wv, sc.vv.data());
+      }
     } else if (lp.wq.is_int4 && lp.wk.is_int4 && lp.wv.is_int4) {
       const qlwc::Int4View* ws3[3] = {&lp.wq.i4, &lp.wk.i4, &lp.wv.i4};
       float* ys3[3] = {sc.qg.data(), sc.kk.data(), sc.vv.data()};
@@ -947,10 +957,21 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     Int4Scratch::fit(sc.core, static_cast<size_t>(n_tok) * value_dim);
 
     if (n_tok > 1) {
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wqkv, sc.mixed.data());
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wz, sc.z.data());
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
-      gemm_opt_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
+      if (lp.wqkv.is_int4 && lp.wz.is_int4 && lp.wb.is_int4 && lp.wa.is_int4) {
+        const qlwc::Int4View* ws4[4] = {&lp.wqkv.i4, &lp.wz.i4, &lp.wb.i4, &lp.wa.i4};
+        float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
+        if (!hal::cuda::try_gemm_int4_batch_multi(sc.normed.data(), n_tok, ws4, ys4, 4)) {
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wqkv, sc.mixed.data());
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wz, sc.z.data());
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
+          gemm_opt_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
+        }
+      } else {
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wqkv, sc.mixed.data());
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wz, sc.z.data());
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wb, sc.b.data());
+        gemm_opt_batch(sc.normed.data(), n_tok, lp.wa, sc.a.data());
+      }
     } else if (lp.wqkv.is_int4 && lp.wz.is_int4 && lp.wb.is_int4 && lp.wa.is_int4) {
       const qlwc::Int4View* ws4[4] = {&lp.wqkv.i4, &lp.wz.i4, &lp.wb.i4, &lp.wa.i4};
       float* ys4[4] = {sc.mixed.data(), sc.z.data(), sc.b.data(), sc.a.data()};
@@ -970,30 +991,48 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     auto& conv_state = Lkv.linear.conv;
     const float* cw = lp.conv_w_f.data();
     const int ck = cfg_.conv_k;
-    // Parallelize over channels (state is per-c); tokens stay serial per channel.
-    // Old: omp fork inside for(t) → ~T forks/layer and kills prefill.
+    bool conv_gpu = false;
+    if (n_tok >= 64 && ck == 4 && resident_gpu_) {
+      conv_gpu = hal::cuda::try_dwconv_silu_k4_seq(sc.mixed.data(), conv_state.data(), cw,
+                                                     sc.mixed_c.data(), n_tok, conv_dim);
+      if (!conv_gpu) {
+        static std::atomic<int> warn_left{4};
+        if (warn_left.fetch_sub(1) > 0) {
+          LOG_WARN("dwconv GPU prefill fallback->CPU n_tok=%d conv_dim=%d err=%s", n_tok, conv_dim,
+                   hal::cuda::dwconv_last_error());
+        }
+      } else {
+        static std::atomic<int> ok_left{1};
+        if (ok_left.fetch_sub(1) > 0) {
+          LOG_INFO("dwconv GPU prefill ok n_tok=%d conv_dim=%d", n_tok, conv_dim);
+        }
+      }
+    }
+    if (!conv_gpu) {
+      // Parallelize over channels (state is per-c); tokens stay serial per channel.
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) if (conv_dim >= 256 && n_tok >= 1 && !omp_in_parallel())
 #endif
-    for (int c = 0; c < conv_dim; ++c) {
-      float* st = &conv_state[static_cast<size_t>(c) * ck];
-      const float* wk = cw + static_cast<size_t>(c) * ck;
-      for (int t = 0; t < n_tok; ++t) {
-        const float xin = sc.mixed[static_cast<size_t>(t) * conv_dim + c];
-        float* xout = &sc.mixed_c[static_cast<size_t>(t) * conv_dim + c];
-        if (ck == 4) {
-          st[3] = st[2];
-          st[2] = st[1];
-          st[1] = st[0];
-          st[0] = xin;
-          const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
-          *xout = acc / (1.f + std::exp(-acc));
-        } else {
-          for (int k = ck - 1; k > 0; --k) st[k] = st[k - 1];
-          st[0] = xin;
-          float acc = 0.f;
-          for (int k = 0; k < ck; ++k) acc += st[k] * wk[ck - 1 - k];
-          *xout = acc / (1.f + std::exp(-acc));
+      for (int c = 0; c < conv_dim; ++c) {
+        float* st = &conv_state[static_cast<size_t>(c) * ck];
+        const float* wk = cw + static_cast<size_t>(c) * ck;
+        for (int t = 0; t < n_tok; ++t) {
+          const float xin = sc.mixed[static_cast<size_t>(t) * conv_dim + c];
+          float* xout = &sc.mixed_c[static_cast<size_t>(t) * conv_dim + c];
+          if (ck == 4) {
+            st[3] = st[2];
+            st[2] = st[1];
+            st[1] = st[0];
+            st[0] = xin;
+            const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
+            *xout = acc / (1.f + std::exp(-acc));
+          } else {
+            for (int k = ck - 1; k > 0; --k) st[k] = st[k - 1];
+            st[0] = xin;
+            float acc = 0.f;
+            for (int k = 0; k < ck; ++k) acc += st[k] * wk[ck - 1 - k];
+            *xout = acc / (1.f + std::exp(-acc));
+          }
         }
       }
     }
@@ -1001,6 +1040,9 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     Lkv.linear.has_state = true;
 
     const int rep = nv / nk;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (n_tok >= 64 && !omp_in_parallel())
+#endif
     for (int t = 0; t < n_tok; ++t) {
       const float* m = sc.mixed_c.data() + t * conv_dim;
       for (int h = 0; h < nk; ++h) {
@@ -1107,8 +1149,14 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
   } else if (n_tok > 1) {
     for (int t = 0; t < n_tok; ++t)
       hal::rmsnorm(x + t * H, lp.ln2, sc.normed.data() + t * H, H, cfg_.rms_eps, lp.ln_dt, true);
-    gemm_view_batch(sc.normed.data(), n_tok, lp.wgate, sc.gproj.data());
-    gemm_view_batch(sc.normed.data(), n_tok, lp.wup, sc.uproj.data());
+    {
+      const qlwc::Int4View* ws2[2] = {&lp.wgate, &lp.wup};
+      float* ys2[2] = {sc.gproj.data(), sc.uproj.data()};
+      if (!hal::cuda::try_gemm_int4_batch_multi(sc.normed.data(), n_tok, ws2, ys2, 2)) {
+        gemm_view_batch(sc.normed.data(), n_tok, lp.wgate, sc.gproj.data());
+        gemm_view_batch(sc.normed.data(), n_tok, lp.wup, sc.uproj.data());
+      }
+    }
     for (int t = 0; t < n_tok; ++t)
       hal::silu_and_mul(sc.gproj.data() + t * I, sc.uproj.data() + t * I, sc.mid.data() + t * I, I);
     gemm_view_batch(sc.mid.data(), n_tok, lp.wdown, sc.down.data());
@@ -1743,7 +1791,14 @@ void Qwen35Int4Model::apply_speculative_restore(SessionCache& cache) {
 }
 
 void Qwen35Int4Model::release_session_device_state(SessionCache& cache) {
-  apply_speculative_restore(cache);
+  if (!resident_gpu_) return;
+  for (int i = 0; i < cache.n_layers(); ++i) {
+    if (i >= static_cast<int>(cfg_.layer_types.size()) || cfg_.layer_types[i] != "linear_attention")
+      continue;
+    auto& lin = cache.layer(i).linear;
+    if (!lin.recurrent.empty()) hal::cuda::invalidate_gdn_state(lin.recurrent.data());
+    if (!lin.conv.empty()) hal::cuda::invalidate_conv_state(lin.conv.data());
+  }
 }
 
 bool Qwen35Int4Model::mtp_has_cb(void* ctx, const std::string& name) {

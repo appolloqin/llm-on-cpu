@@ -211,10 +211,12 @@ int main(int argc, char** argv) {
       model.init_cache(wc, 256);
       std::vector<float> logits;
       const auto warm_ids = tok.encode("hi");
+
       if (!warm_ids.empty()) {
         model.forward(warm_ids, wc, logits, true);
         LOG_INFO("int4 warmup: prefill done, decode x4…");
         for (int i = 0; i < 4; ++i) model.forward({warm_ids.back()}, wc, logits, false);
+        model.release_session_device_state(wc);
       }
       LOG_INFO("int4 warmup: %d prefill + 4 decode forwards", static_cast<int>(warm_ids.size()));
       if (llmoc::hal::cuda::resident_gpu_enabled()) {

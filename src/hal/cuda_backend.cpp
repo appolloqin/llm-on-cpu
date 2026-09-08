@@ -50,6 +50,15 @@ using cublasCreate_t = int (*)(void**);
 using cublasDestroy_t = int (*)(void*);
 using cublasSgemm_t = int (*)(void*, int, int, int, int, int, const float*, const float*, int,
                               const float*, int, const float*, float*, int);
+// Mixed-precision GEMM (BF16/FP16 A × FP32 x → FP32 y). Optional; falls back to tiled path.
+using cublasGemmEx_t = int (*)(void*, int, int, int, int, int, const void*, const void*, int, int,
+                               const void*, int, int, const void*, void*, int, int, int, int);
+
+constexpr int kCudaR_32F = 0;
+constexpr int kCudaR_16F = 2;
+constexpr int kCudaR_16BF = 14;
+constexpr int kCublasCompute32F = 68;
+constexpr int kCublasGemmDefault = -1;
 
 // ---- driver API (nvcuda.dll) for JIT kernel launch ----
 using cuCtxGetCurrent_t = int (*)(void**);
@@ -88,6 +97,7 @@ struct Api {
   cublasCreate_t cublasCreate = nullptr;
   cublasDestroy_t cublasDestroy = nullptr;
   cublasSgemm_t cublasSgemm = nullptr;
+  cublasGemmEx_t cublasGemmEx = nullptr;
 
   void* nvcuda = nullptr;
   cuCtxGetCurrent_t cuCtxGetCurrent = nullptr;
@@ -167,6 +177,8 @@ constexpr int kW16PackMinRows = 65536;           // lm_head-scale → pack; else
 constexpr int kW16TileRows = 2048;               // FP32 inflate tile for vocab GEMV via cublas
 float* g_w16_tile = nullptr;                     // device FP32[tile_rows * K]
 int g_w16_tile_cap = 0;                          // floats capacity
+float* g_dequant_scratch = nullptr;              // reusable INT4→FP32 for prefill cublas
+size_t g_dequant_scratch_cap = 0;
 std::string g_act_lin_last_err;
 std::unordered_map<const void*, Int4Resident> g_int4_cache;
 uint64_t g_lru_tick = 0;
@@ -206,6 +218,12 @@ bool g_act_valid = false;
 float* g_lin_ws = nullptr;
 size_t g_lin_ws_cap = 0;
 std::unordered_map<const float*, float*> g_conv_state;  // host conv ptr → device state
+std::unordered_map<const float*, float*> g_conv_w_dev;   // host conv_w → device
+float* g_dwconv_io = nullptr;  // xin|xout scratch for seq dwconv
+size_t g_dwconv_io_cap = 0;
+std::string g_dwconv_last_err;
+uint64_t g_dwconv_ok = 0;
+uint64_t g_dwconv_fail = 0;
 uint64_t g_act_lin_ok = 0;
 uint64_t g_act_lin_try = 0;
 uint64_t g_act_full_ok = 0;
@@ -343,6 +361,7 @@ bool load_apis(std::string& err) {
   g_api.cublasSgemm = reinterpret_cast<cublasSgemm_t>(sym(g_api.cublas, "cublasSgemm_v2"));
   if (!g_api.cublasSgemm)
     g_api.cublasSgemm = reinterpret_cast<cublasSgemm_t>(sym(g_api.cublas, "cublasSgemm"));
+  g_api.cublasGemmEx = reinterpret_cast<cublasGemmEx_t>(sym(g_api.cublas, "cublasGemmEx"));
   if (!g_api.cudaMalloc || !g_api.cudaMemcpy || !g_api.cudaGetDeviceCount || !g_api.cublasCreate ||
       !g_api.cublasSgemm) {
     err = "missing CUDA symbols";
@@ -878,7 +897,8 @@ bool enable(size_t vram_budget_bytes) {
   g_probed = true;
   g_probe_ok = true;
   g_enabled = true;
-  g_status = "cuda+cublas enabled";
+  g_status = g_api.cublasGemmEx ? "cuda+cublas+gemmEx enabled" : "cuda+cublas enabled";
+
   return true;
 }
 
@@ -916,6 +936,8 @@ void disable() {
   g_act_full_ok = g_act_full_try = 0;
   g_act_lin_last_err.clear();
   g_gdn_last_err.clear();
+  g_dwconv_last_err.clear();
+  g_dwconv_ok = g_dwconv_fail = 0;
   auto free_f = [&](float*& p) {
     if (p) {
       g_api.cudaFree(p);
@@ -944,6 +966,15 @@ void disable() {
     if (kv.second) g_api.cudaFree(kv.second);
   }
   g_conv_state.clear();
+  for (auto& kv : g_conv_w_dev) {
+    if (kv.second) g_api.cudaFree(kv.second);
+  }
+  g_conv_w_dev.clear();
+  if (g_dwconv_io) {
+    g_api.cudaFree(g_dwconv_io);
+    g_dwconv_io = nullptr;
+    g_dwconv_io_cap = 0;
+  }
   if (g_lin_ws) {
     g_api.cudaFree(g_lin_ws);
     g_lin_ws = nullptr;
@@ -1183,9 +1214,10 @@ extern "C" __global__ void gemv_int4(
 }
 
 // Prefill batch GEMM: Y[n,M] = X[n,K] @ W[M,K]^T with on-the-fly INT4 dequant.
-// grid.x = ceil(M / ROWS_PER_BLOCK). Each warp owns one output row and tiles over
-// batch (BT=8): dequantized weights are reused across the batch tile (far fewer
-// qweight reads than launching one gemv per token).
+// grid.x = ceil(M / ROWS_PER_BLOCK), grid.y = ceil(n / BT).
+// Each block owns ROWS_PER_BLOCK output rows × BT batch rows.
+// X is staged through shared memory in K-tiles (old kernel re-read full X per M-block
+// ≈ M/8 times — multi-GB traffic for a ~MB activation).
 extern "C" __global__ void gemm_int4(
     const unsigned char* __restrict__ qweight,
     const unsigned short* __restrict__ scales,
@@ -1193,96 +1225,118 @@ extern "C" __global__ void gemm_int4(
     const float* __restrict__ X,
     float* __restrict__ Y,
     int M, int K, int n, int ng, int gs, int is_awq, int awq_zp) {
+  constexpr int BT = 8;
+  constexpr int KT = 256;  // X tile along K; BT*KT*4 ≈ 8KiB
   const int row0 = blockIdx.x * ROWS_PER_BLOCK;
+  const int b0 = blockIdx.y * BT;
+  if (b0 >= n) return;
+  const int bn = (b0 + BT <= n) ? BT : (n - b0);
   const int tid = threadIdx.x;
   const int rb = (K + 1) >> 1;
-  extern __shared__ unsigned short smem_buf[];
-  unsigned short* s_scales = smem_buf;
-  unsigned short* s_zeros = is_awq ? nullptr : smem_buf + ROWS_PER_BLOCK * ng;
+
+  extern __shared__ unsigned char smem_raw[];
+  unsigned short* s_scales = (unsigned short*)smem_raw;
+  unsigned short* s_zeros = is_awq ? nullptr : s_scales + ROWS_PER_BLOCK * ng;
+  const int scale_words = ROWS_PER_BLOCK * ng * (is_awq ? 1 : 2);
+  float* sx = (float*)(s_scales + ((scale_words + 1) & ~1));
+
   for (int row_off = 0; row_off < ROWS_PER_BLOCK; ++row_off) {
     const int m = row0 + row_off;
     if (m >= M) break;
-    for (int g = tid; g < ng; g += blockDim.x) {
+    for (int g = tid; g < ng; g += blockDim.x)
       s_scales[row_off * ng + g] = scales[m * ng + g];
-    }
     if (!is_awq) {
-      for (int g = tid; g < ng; g += blockDim.x) {
+      for (int g = tid; g < ng; g += blockDim.x)
         s_zeros[row_off * ng + g] = zeros[m * ng + g];
-      }
     }
   }
   __syncthreads();
+
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
-  if (warp_id >= ROWS_PER_BLOCK) return;
   const int m = row0 + warp_id;
-  if (m >= M) return;
-  const unsigned char* qrow = qweight + (size_t)m * (size_t)rb;
+  const bool active = (warp_id < ROWS_PER_BLOCK) && (m < M);
+  const unsigned char* qrow = active ? (qweight + (size_t)m * (size_t)rb) : nullptr;
   const int off0 = is_awq ? awq_zp : 0;
-  constexpr int BT = 8;
-  for (int b0 = 0; b0 < n; b0 += BT) {
-    const int bn = (b0 + BT <= n) ? BT : (n - b0);
-    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
-    float acc4 = 0.f, acc5 = 0.f, acc6 = 0.f, acc7 = 0.f;
-    for (int k = lane * 8; k < K; k += 32 * 8) {
-      const int g = k / gs;
-      const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
-      const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
-      const int kp = k >> 1;
-      float w0, w1, w2, w3, w4, w5, w6, w7;
-      if (kp + 3 < rb) {
-        const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
-        w0 = ((float)((v.x & 0xF) - off0)) * s + z;
-        w1 = ((float)((v.x >> 4) - off0)) * s + z;
-        w2 = ((float)((v.y & 0xF) - off0)) * s + z;
-        w3 = ((float)((v.y >> 4) - off0)) * s + z;
-        w4 = ((float)((v.z & 0xF) - off0)) * s + z;
-        w5 = ((float)((v.z >> 4) - off0)) * s + z;
-        w6 = ((float)((v.w & 0xF) - off0)) * s + z;
-        w7 = ((float)((v.w >> 4) - off0)) * s + z;
-      } else {
-        w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 0.f;
-        for (int t = 0; t < 8; ++t) {
-          const int kk = k + t;
-          if (kk >= K) break;
-          const int gg = kk / gs;
-          const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
-          const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
-          const unsigned char packed = qrow[kk >> 1];
-          const int qi = (kk & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
-          const float w = ((float)(qi - off0)) * ss + zz;
-          if (t == 0) w0 = w; else if (t == 1) w1 = w; else if (t == 2) w2 = w;
-          else if (t == 3) w3 = w; else if (t == 4) w4 = w; else if (t == 5) w5 = w;
-          else if (t == 6) w6 = w; else w7 = w;
-        }
-      }
-      // Reuse the 8 weights across up to BT batch rows
-      for (int bi = 0; bi < bn; ++bi) {
-        const float* x = X + (size_t)(b0 + bi) * (size_t)K;
-        float partial = 0.f;
-        if (k + 7 < K) {
-          partial = x[k]*w0 + x[k+1]*w1 + x[k+2]*w2 + x[k+3]*w3
-                  + x[k+4]*w4 + x[k+5]*w5 + x[k+6]*w6 + x[k+7]*w7;
+
+  float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+  float acc4 = 0.f, acc5 = 0.f, acc6 = 0.f, acc7 = 0.f;
+
+  for (int k0 = 0; k0 < K; k0 += KT) {
+    const int kn = (k0 + KT <= K) ? KT : (K - k0);
+    // Stage X[b0:b0+bn, k0:k0+kn] into sx[bi * KT + ki]
+    for (int i = tid; i < bn * kn; i += blockDim.x) {
+      const int bi = i / kn;
+      const int ki = i - bi * kn;
+      sx[bi * KT + ki] = X[(size_t)(b0 + bi) * (size_t)K + (k0 + ki)];
+    }
+    __syncthreads();
+
+    if (active) {
+      for (int k = lane * 8; k < kn; k += 32 * 8) {
+        const int gk = k0 + k;
+        const int g = gk / gs;
+        const float s = f16_to_f32_dev(s_scales[warp_id * ng + g]);
+        const float z = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + g]);
+        const int kp = gk >> 1;
+        float w0, w1, w2, w3, w4, w5, w6, w7;
+        if (gk + 7 < K && kp + 3 < rb) {
+          const uchar4 v = *reinterpret_cast<const uchar4*>(qrow + kp);
+          w0 = ((float)((v.x & 0xF) - off0)) * s + z;
+          w1 = ((float)((v.x >> 4) - off0)) * s + z;
+          w2 = ((float)((v.y & 0xF) - off0)) * s + z;
+          w3 = ((float)((v.y >> 4) - off0)) * s + z;
+          w4 = ((float)((v.z & 0xF) - off0)) * s + z;
+          w5 = ((float)((v.z >> 4) - off0)) * s + z;
+          w6 = ((float)((v.w & 0xF) - off0)) * s + z;
+          w7 = ((float)((v.w >> 4) - off0)) * s + z;
         } else {
-          if (k + 0 < K) partial += x[k + 0] * w0;
-          if (k + 1 < K) partial += x[k + 1] * w1;
-          if (k + 2 < K) partial += x[k + 2] * w2;
-          if (k + 3 < K) partial += x[k + 3] * w3;
-          if (k + 4 < K) partial += x[k + 4] * w4;
-          if (k + 5 < K) partial += x[k + 5] * w5;
-          if (k + 6 < K) partial += x[k + 6] * w6;
-          if (k + 7 < K) partial += x[k + 7] * w7;
+          w0 = w1 = w2 = w3 = w4 = w5 = w6 = w7 = 0.f;
+          for (int t = 0; t < 8; ++t) {
+            const int kk = gk + t;
+            if (kk >= K || k + t >= kn) break;
+            const int gg = kk / gs;
+            const float ss = f16_to_f32_dev(s_scales[warp_id * ng + gg]);
+            const float zz = is_awq ? 0.f : f16_to_f32_dev(s_zeros[warp_id * ng + gg]);
+            const unsigned char packed = qrow[kk >> 1];
+            const int qi = (kk & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+            const float w = ((float)(qi - off0)) * ss + zz;
+            if (t == 0) w0 = w; else if (t == 1) w1 = w; else if (t == 2) w2 = w;
+            else if (t == 3) w3 = w; else if (t == 4) w4 = w; else if (t == 5) w5 = w;
+            else if (t == 6) w6 = w; else w7 = w;
+          }
         }
-        if (bi == 0) acc0 += partial;
-        else if (bi == 1) acc1 += partial;
-        else if (bi == 2) acc2 += partial;
-        else if (bi == 3) acc3 += partial;
-        else if (bi == 4) acc4 += partial;
-        else if (bi == 5) acc5 += partial;
-        else if (bi == 6) acc6 += partial;
-        else acc7 += partial;
+        for (int bi = 0; bi < bn; ++bi) {
+          const float* xr = sx + bi * KT;
+          float partial = 0.f;
+          if (k + 7 < kn) {
+            partial = xr[k]*w0 + xr[k+1]*w1 + xr[k+2]*w2 + xr[k+3]*w3
+                    + xr[k+4]*w4 + xr[k+5]*w5 + xr[k+6]*w6 + xr[k+7]*w7;
+          } else {
+            if (k + 0 < kn) partial += xr[k + 0] * w0;
+            if (k + 1 < kn) partial += xr[k + 1] * w1;
+            if (k + 2 < kn) partial += xr[k + 2] * w2;
+            if (k + 3 < kn) partial += xr[k + 3] * w3;
+            if (k + 4 < kn) partial += xr[k + 4] * w4;
+            if (k + 5 < kn) partial += xr[k + 5] * w5;
+            if (k + 6 < kn) partial += xr[k + 6] * w6;
+            if (k + 7 < kn) partial += xr[k + 7] * w7;
+          }
+          if (bi == 0) acc0 += partial;
+          else if (bi == 1) acc1 += partial;
+          else if (bi == 2) acc2 += partial;
+          else if (bi == 3) acc3 += partial;
+          else if (bi == 4) acc4 += partial;
+          else if (bi == 5) acc5 += partial;
+          else if (bi == 6) acc6 += partial;
+          else acc7 += partial;
+        }
       }
     }
+    __syncthreads();  // before next X tile overwrite
+  }
+
+  if (active) {
     for (int off = 16; off > 0; off >>= 1) acc0 += __shfl_down_sync(0xffffffffu, acc0, off);
     for (int off = 16; off > 0; off >>= 1) acc1 += __shfl_down_sync(0xffffffffu, acc1, off);
     for (int off = 16; off > 0; off >>= 1) acc2 += __shfl_down_sync(0xffffffffu, acc2, off);
@@ -1301,6 +1355,27 @@ extern "C" __global__ void gemm_int4(
       if (bn > 6) Y[(size_t)(b0 + 6) * (size_t)M + m] = acc6;
       if (bn > 7) Y[(size_t)(b0 + 7) * (size_t)M + m] = acc7;
     }
+  }
+}
+
+// Expand full INT4 matrix to FP32 for one-shot cuBLAS (prefill). out[M*K] row-major.
+extern "C" __global__ void dequant_int4_to_f32(
+    const unsigned char* __restrict__ qweight, const unsigned short* __restrict__ scales,
+    const unsigned short* __restrict__ zeros, float* __restrict__ out, int M, int K, int ng,
+    int gs, int is_awq, int awq_zp) {
+  const size_t n = (size_t)M * (size_t)K;
+  const int rb = (K + 1) >> 1;
+  const int off0 = is_awq ? awq_zp : 0;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)gridDim.x * blockDim.x) {
+    const int m = (int)(i / (size_t)K);
+    const int k = (int)(i % (size_t)K);
+    const int g = k / gs;
+    const float s = f16_to_f32_dev(scales[m * ng + g]);
+    const float z = is_awq ? 0.f : f16_to_f32_dev(zeros[m * ng + g]);
+    const unsigned char packed = qweight[(size_t)m * (size_t)rb + (size_t)(k >> 1)];
+    const int qi = (k & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+    out[i] = ((float)(qi - off0)) * s + z;
   }
 }
 
@@ -1455,6 +1530,47 @@ extern "C" __global__ void gated_delta_seq_kernel(
 }
 )CUDA";
 
+// Depthwise conv+SiLU — separate from kActSrc so seq kernel JIT can't fail with the huge act TU.
+const char* kDwconvSrc = R"CUDA(
+extern "C" __global__ void dwconv_silu_k4(const float* __restrict__ xin, float* __restrict__ state,
+                                         const float* __restrict__ w, float* __restrict__ xout,
+                                         int conv_dim) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= conv_dim) return;
+  float* st = state + (size_t)c * 4;
+  const float* wk = w + (size_t)c * 4;
+  st[3] = st[2];
+  st[2] = st[1];
+  st[1] = st[0];
+  st[0] = xin[c];
+  const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
+  xout[c] = acc / (1.f + expf(-acc));
+}
+
+// Prefill: one thread per channel runs the full token window.
+extern "C" __global__ void dwconv_silu_k4_seq(const float* __restrict__ xin, float* __restrict__ state,
+                                             const float* __restrict__ w, float* __restrict__ xout,
+                                             int seq, int conv_dim) {
+  const int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= conv_dim) return;
+  float* st = state + (size_t)c * 4;
+  const float* wk = w + (size_t)c * 4;
+  float s0 = st[0], s1 = st[1], s2 = st[2], s3 = st[3];
+  for (int t = 0; t < seq; ++t) {
+    s3 = s2;
+    s2 = s1;
+    s1 = s0;
+    s0 = xin[(size_t)t * conv_dim + c];
+    const float acc = s0 * wk[3] + s1 * wk[2] + s2 * wk[1] + s3 * wk[0];
+    xout[(size_t)t * conv_dim + c] = acc / (1.f + expf(-acc));
+  }
+  st[0] = s0;
+  st[1] = s1;
+  st[2] = s2;
+  st[3] = s3;
+}
+)CUDA";
+
 // Decode activation helpers (rmsnorm / silu× / add) for resident MLP path.
 const char* kActSrc = R"CUDA(
 __device__ __forceinline__ float w16_to_f32(unsigned short h, int is_f16) {
@@ -1531,22 +1647,6 @@ extern "C" __global__ void vec_axpy(const float* __restrict__ x, float* __restri
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   y[i] += a * x[i];
-}
-
-// Depthwise conv_k=4 + SiLU (matches CPU linear_attn path).
-extern "C" __global__ void dwconv_silu_k4(const float* __restrict__ xin, float* __restrict__ state,
-                                         const float* __restrict__ w, float* __restrict__ xout,
-                                         int conv_dim) {
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  if (c >= conv_dim) return;
-  float* st = state + (size_t)c * 4;
-  const float* wk = w + (size_t)c * 4;
-  st[3] = st[2];
-  st[2] = st[1];
-  st[1] = st[0];
-  st[0] = xin[c];
-  const float acc = st[0] * wk[3] + st[1] * wk[2] + st[2] * wk[1] + st[3] * wk[0];
-  xout[c] = acc / (1.f + expf(-acc));
 }
 
 // Pack GDN q/k (repeat nk→nv) and copy v from mixed_c.
@@ -1765,11 +1865,16 @@ bool jit_gemm_int4(const uint8_t* d_qweight, const uint16_t* d_scales, const uin
   int awq_zp_i = awq_zp;
   void* params[] = {&d_qweight, &d_scales, &d_zeros, &d_X, &d_Y, &M, &K, &n, &ng, &gs, &is_awq_i, &awq_zp_i};
   constexpr int ROWS_PER_BLOCK = 8;
+  constexpr int BT = 8;
+  constexpr int KT = 256;
   constexpr int BLOCK_DIM = ROWS_PER_BLOCK * 32;
   const int blocks_x = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+  const int blocks_y = (n + BT - 1) / BT;
+  const int scale_words = ROWS_PER_BLOCK * ng * (is_awq ? 1 : 2);
   const unsigned shmem =
-      sizeof(unsigned short) * ROWS_PER_BLOCK * ng * (is_awq ? 1u : 2u);
-  return jit_launch(fn, static_cast<unsigned>(blocks_x), 1, 1,
+      sizeof(unsigned short) * static_cast<unsigned>((scale_words + 1) & ~1) +
+      sizeof(float) * static_cast<unsigned>(BT * KT);
+  return jit_launch(fn, static_cast<unsigned>(blocks_x), static_cast<unsigned>(blocks_y), 1,
                     static_cast<unsigned>(BLOCK_DIM), 1, 1, shmem, params);
 }
 
@@ -1859,6 +1964,11 @@ bool ensure_w16_tile(int rows, int K) {
     g_w16_tile = nullptr;
     g_w16_tile_cap = 0;
   }
+  if (g_dequant_scratch) {
+    g_api.cudaFree(g_dequant_scratch);
+    g_dequant_scratch = nullptr;
+    g_dequant_scratch_cap = 0;
+  }
   void* p = nullptr;
   if (g_api.cudaMalloc(&p, sizeof(float) * need) != kCudaSuccess) return false;
   g_w16_tile = static_cast<float*>(p);
@@ -1866,8 +1976,8 @@ bool ensure_w16_tile(int rows, int K) {
   return true;
 }
 
-// Vocab-scale lm_head: BF16/F16 pack + per-tile FP32 inflate + cublasSgemm.
-// Naive gemv_w16 was wrong/incomplete for M≈248k (blank / sticky first token "Gos").
+// Vocab-scale lm_head: tiled FP32 inflate + cublasSgemm.
+// cublasGemmEx(BF16×FP32) was tried but measured slower here (lm_head ~26ms vs ~18ms tiled).
 bool gemv_w16_tiled_cublas(const uint16_t* d_W, const float* d_x, float* d_y, int M, int K,
                            bool is_f16) {
   if (!d_W || !d_x || !d_y || M <= 0 || K <= 0 || !g_cublas || !g_api.cublasSgemm) return false;
@@ -2024,6 +2134,58 @@ bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y) {
   return mok;
 }
 
+bool ensure_dequant_scratch(size_t floats) {
+  if (floats == 0) return false;
+  if (floats <= g_dequant_scratch_cap && g_dequant_scratch) return true;
+  if (g_dequant_scratch) {
+    g_api.cudaFree(g_dequant_scratch);
+    g_dequant_scratch = nullptr;
+    g_dequant_scratch_cap = 0;
+  }
+  void* p = nullptr;
+  if (g_api.cudaMalloc(&p, sizeof(float) * floats) != kCudaSuccess) return false;
+  g_dequant_scratch = static_cast<float*>(p);
+  g_dequant_scratch_cap = floats;
+  return true;
+}
+
+bool dequant_int4_resident_to_scratch(const Int4Resident* res) {
+  if (!res || !g_dequant_scratch) return false;
+  void* fn = get_jit_kernel(kGemvInt4Src, "dequant_int4_to_f32");
+  if (!fn) return false;
+  const size_t n = static_cast<size_t>(res->M) * static_cast<size_t>(res->K);
+  if (n > g_dequant_scratch_cap) return false;
+  int M = res->M, K = res->K, ng = res->ng, gs = res->gs;
+  int is_awq_i = res->is_awq ? 1 : 0;
+  int awq_zp_i = res->awq_zp;
+  const uint8_t* q = static_cast<const uint8_t*>(res->d_qweight);
+  const uint16_t* s = static_cast<const uint16_t*>(res->d_scales);
+  const uint16_t* z = static_cast<const uint16_t*>(res->d_zeros);
+  // zeros may be null for AWQ; pass scales as dummy (kernel ignores when is_awq).
+  if (!z) z = s;
+  void* params[] = {&q, &s, &z, &g_dequant_scratch, &M, &K, &ng, &gs, &is_awq_i, &awq_zp_i};
+  constexpr unsigned BLOCK = 256;
+  unsigned grid = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
+  if (grid > 65535u) grid = 65535u;
+  return jit_launch(fn, grid, 1, 1, BLOCK, 1, 1, 0, params);
+}
+
+// Prefill: GPU-dequant INT4 → scratch once, then cuBLAS SGEMM (usually >> on-the-fly JIT).
+bool try_gemm_int4_batch_cublas_scratch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
+  if (!g_enabled || !X || !Y || n <= 1 || !g_cublas) return false;
+  const Int4Resident* res = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    res = ensure_int4_resident(W);
+    if (!res || !jit_available()) return false;
+    const size_t need = static_cast<size_t>(res->M) * static_cast<size_t>(res->K);
+    if (!ensure_dequant_scratch(need)) return false;
+  }
+  if (!dequant_int4_resident_to_scratch(res)) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return gemm_dev_batch(g_dequant_scratch, X, n, Y, res->M, res->K);
+}
+
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
   if (!g_enabled || !X || !Y || n <= 0) return false;
   if (n == 1) {
@@ -2111,7 +2273,10 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
   };
 
   if (n >= kLongPrefillN) {
+    // Prefer on-the-fly INT4 JIT (smem-tiled). Full FP32 dequant+cublas was 5–10× slower
+    // on long prefill (re-expand M×K every call; measured ~0.2 layer/s vs ~1.7).
     if (try_int4_jit_batch()) return true;
+    if (try_gemm_int4_batch_cublas_scratch(X, n, W, Y)) return true;
     if (try_cublas_fp32_batch()) return true;
     return false;
   }
@@ -2119,6 +2284,67 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
   if (try_cublas_fp32_batch()) return true;
   if (try_int4_jit_batch()) return true;
   return false;
+}
+
+// Prefill: shared-X multi-output INT4 batch. Uploads each X chunk once, then runs N GEMMs.
+bool try_gemm_int4_batch_multi(const float* X, int n, const qlwc::Int4View* const* Ws,
+                               float* const* Ys, int nW) {
+  if (!g_enabled || !X || !Ws || !Ys || n <= 0 || nW < 2 || nW > 4) return false;
+  if (!jit_available()) return false;
+  if (n == 1) return try_gemm_int4_multi(X, Ws, Ys, nW);
+
+  const Int4Resident* res[4] = {};
+  int max_m = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (int i = 0; i < nW; ++i) {
+      if (!Ws[i] || !Ys[i]) return false;
+      res[i] = ensure_int4_resident(*Ws[i]);
+      if (!res[i]) return false;
+      if (res[i]->M > max_m) max_m = res[i]->M;
+    }
+    for (int i = 1; i < nW; ++i) {
+      if (res[i]->K != res[0]->K || res[i]->ng != res[0]->ng || res[i]->gs != res[0]->gs ||
+          res[i]->is_awq != res[0]->is_awq)
+        return false;
+    }
+  }
+  const int K = res[0]->K;
+  constexpr size_t kMaxFloats = 64ull << 20;
+  int chunk = n;
+  auto fits = [&](int c) {
+    return static_cast<size_t>(c) * static_cast<size_t>(K) <= kMaxFloats &&
+           static_cast<size_t>(c) * static_cast<size_t>(max_m) <= kMaxFloats;
+  };
+  while (chunk > 1 && !fits(chunk)) chunk = (chunk + 1) / 2;
+  if (chunk < 1) chunk = 1;
+
+  for (int b0 = 0; b0 < n; b0 += chunk) {
+    const int c = chunk < (n - b0) ? chunk : (n - b0);
+    const float* Xp = X + static_cast<size_t>(b0) * K;
+    {
+      std::lock_guard<std::mutex> lock(g_mu);
+      if (!ensure_xy(max_m, K, c)) return false;
+      if (g_api.cudaMemcpy(g_dx, Xp, sizeof(float) * static_cast<size_t>(c) * K, kCudaMemcpyH2D) !=
+          kCudaSuccess)
+        return false;
+    }
+    for (int i = 0; i < nW; ++i) {
+      const int M = res[i]->M;
+      float* Yp = Ys[i] + static_cast<size_t>(b0) * M;
+      if (!jit_gemm_int4(static_cast<const uint8_t*>(res[i]->d_qweight),
+                         static_cast<const uint16_t*>(res[i]->d_scales),
+                         static_cast<const uint16_t*>(res[i]->d_zeros),
+                         reinterpret_cast<const float*>(g_dx), reinterpret_cast<float*>(g_dy), M, K,
+                         c, res[i]->ng, res[i]->gs, res[i]->is_awq, res[i]->awq_zp))
+        return false;
+      std::lock_guard<std::mutex> lock(g_mu);
+      if (g_api.cudaMemcpy(Yp, g_dy, sizeof(float) * static_cast<size_t>(c) * M, kCudaMemcpyD2H) !=
+          kCudaSuccess)
+        return false;
+    }
+  }
+  return true;
 }
 
 // Fused multi-GEMV: up to 4 weight views sharing same x. One H2D + one kernel launch + N D2H.
@@ -2466,6 +2692,103 @@ void flush_conv_state_to_host(float* host_conv, int conv_dim, int conv_k) {
   if (g_api.cudaMemcpy(host_conv, it->second, bytes, kCudaMemcpyD2H) != kCudaSuccess) return;
   g_api.cudaFree(it->second);
   g_conv_state.erase(it);
+}
+
+void invalidate_conv_state(float* host_conv) {
+  if (!g_enabled || !host_conv) return;
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_conv_state.find(host_conv);
+  if (it == g_conv_state.end() || !it->second) return;
+  g_api.cudaFree(it->second);
+  g_conv_state.erase(it);
+}
+
+bool try_dwconv_silu_k4_seq(const float* xin, float* host_state, const float* w, float* xout,
+                            int seq, int conv_dim) {
+  auto fail = [&](const char* why) {
+    g_dwconv_last_err = why;
+    ++g_dwconv_fail;
+    return false;
+  };
+  if (!g_enabled || !jit_available()) return fail("cuda_or_jit_off");
+  if (!g_resident) return fail("not_resident");
+  if (!xin || !host_state || !w || !xout || seq <= 0 || conv_dim <= 0) return fail("bad_arg");
+
+  void* fn = get_jit_kernel(kDwconvSrc, "dwconv_silu_k4_seq");
+  if (!fn) return fail(g_status.empty() ? "jit_dwconv_seq" : g_status.c_str());
+
+  // Chunk tokens so xin|xout scratch stays bounded (~same idea as GDN seq).
+  constexpr int kChunk = 256;
+  const size_t state_bytes = sizeof(float) * static_cast<size_t>(conv_dim) * 4;
+  const size_t w_bytes = state_bytes;
+  const size_t io_bytes = sizeof(float) * static_cast<size_t>(kChunk) * conv_dim * 2;
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto sit = g_conv_state.find(host_state);
+  if (sit == g_conv_state.end()) {
+    void* ds = nullptr;
+    if (g_api.cudaMalloc(&ds, state_bytes) != kCudaSuccess) return fail("state_malloc");
+    if (g_api.cudaMemcpy(ds, host_state, state_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(ds);
+      return fail("state_h2d");
+    }
+    g_conv_state[host_state] = static_cast<float*>(ds);
+    sit = g_conv_state.find(host_state);
+  }
+  float* d_state = sit->second;
+
+  auto wit = g_conv_w_dev.find(w);
+  if (wit == g_conv_w_dev.end()) {
+    void* dw = nullptr;
+    if (g_api.cudaMalloc(&dw, w_bytes) != kCudaSuccess) return fail("w_malloc");
+    if (g_api.cudaMemcpy(dw, w, w_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(dw);
+      return fail("w_h2d");
+    }
+    g_conv_w_dev[w] = static_cast<float*>(dw);
+    wit = g_conv_w_dev.find(w);
+  }
+  float* d_w = wit->second;
+
+  if (io_bytes > g_dwconv_io_cap) {
+    if (g_dwconv_io) g_api.cudaFree(g_dwconv_io);
+    void* io = nullptr;
+    if (g_api.cudaMalloc(&io, io_bytes) != kCudaSuccess) {
+      g_dwconv_io = nullptr;
+      g_dwconv_io_cap = 0;
+      return fail("io_malloc");
+    }
+    g_dwconv_io = static_cast<float*>(io);
+    g_dwconv_io_cap = io_bytes;
+  }
+  float* d_xin = g_dwconv_io;
+  float* d_xout = g_dwconv_io + static_cast<size_t>(kChunk) * conv_dim;
+  const unsigned blk = 256;
+  const unsigned grid = (static_cast<unsigned>(conv_dim) + blk - 1) / blk;
+
+  for (int t0 = 0; t0 < seq; t0 += kChunk) {
+    const int c = kChunk < (seq - t0) ? kChunk : (seq - t0);
+    const size_t x_bytes = sizeof(float) * static_cast<size_t>(c) * conv_dim;
+    if (g_api.cudaMemcpy(d_xin, xin + static_cast<size_t>(t0) * conv_dim, x_bytes,
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return fail("xin_h2d");
+    int seq_i = c, cd_i = conv_dim;
+    void* params[] = {&d_xin, &d_state, &d_w, &d_xout, &seq_i, &cd_i};
+    if (!jit_launch(fn, grid, 1, 1, blk, 1, 1, 0, params)) return fail("launch");
+    if (g_api.cudaMemcpy(xout + static_cast<size_t>(t0) * conv_dim, d_xout, x_bytes,
+                         kCudaMemcpyD2H) != kCudaSuccess)
+      return fail("xout_d2h");
+  }
+  // Mirror state so CPU fallback / snapshot stays coherent.
+  if (g_api.cudaMemcpy(host_state, d_state, state_bytes, kCudaMemcpyD2H) != kCudaSuccess)
+    return fail("state_d2h");
+  g_dwconv_last_err.clear();
+  ++g_dwconv_ok;
+  return true;
+}
+
+const char* dwconv_last_error() {
+  return g_dwconv_last_err.empty() ? "" : g_dwconv_last_err.c_str();
 }
 
 namespace {
@@ -2869,7 +3192,7 @@ bool try_linear_decode_on_act(const uint16_t* ln1, const qlwc::Int4View& wqkv,
 
   void* fn_rms = get_jit_kernel(kActSrc, "rmsnorm_w16");
   void* fn_multi = get_jit_kernel(kGemvInt4Src, "gemv_multi4_int4");
-  void* fn_conv = get_jit_kernel(kActSrc, "dwconv_silu_k4");
+  void* fn_conv = get_jit_kernel(kDwconvSrc, "dwconv_silu_k4");
   void* fn_pack = get_jit_kernel(kActSrc, "gdn_pack_qkv");
   void* fn_prep = get_jit_kernel(kActSrc, "gdn_prep_gb");
   void* fn_gn = get_jit_kernel(kActSrc, "rmsnorm_gated_heads_v2");

@@ -97,6 +97,9 @@ bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16);
 
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y);
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
+// Prefill: shared X across up to 4 INT4 weights (one H2D per chunk, then N GEMMs).
+bool try_gemm_int4_batch_multi(const float* X, int n, const qlwc::Int4View* const* Ws,
+                               float* const* Ys, int nW);
 bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float* const* ys, int n);
 bool prefetch_int4_weight(const qlwc::Int4View& W);
 // Prefetch + pin so MoE expert LRU cannot evict attn/shared/router warm weights.
@@ -139,6 +142,11 @@ void invalidate_gdn_state(float* host_state);
 const char* gdn_last_error();
 uint64_t gdn_fail_count();
 void flush_conv_state_to_host(float* host_conv, int conv_dim, int conv_k);
+void invalidate_conv_state(float* host_conv);
+// Prefill depthwise conv+SiLU (k=4): replaces host T×C nested loop.
+bool try_dwconv_silu_k4_seq(const float* xin, float* host_state, const float* w, float* xout,
+                            int seq, int conv_dim);
+const char* dwconv_last_error();
 
 // Path A S3 stats (full-attn act residual path).
 void note_full_attn_try();
