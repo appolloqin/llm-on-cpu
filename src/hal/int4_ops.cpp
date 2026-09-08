@@ -563,23 +563,78 @@ void gemm_int4_awq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, fl
 }
 #endif
 
+#if defined(LLMOC_ENABLE_AVX2)
+// Prefill GPTQ: tile tokens so each weight row is streamed once per tile (not once per token).
+void gemm_int4_gptq_batch_avx2(const float* X, int n, const qlwc::Int4View& W, float* Y) {
+  const int M = W.M, K = W.K, gs = W.group_size;
+  const int ng = (K + gs - 1) / gs;
+  const int rb = row_bytes(K);
+
+  const float* scf = W.scales_f32;
+  std::vector<float> scales_scratch;
+  std::vector<float> zeros_scratch;
+  if (!scf) {
+    scales_scratch.resize(static_cast<size_t>(M) * ng);
+    for (int i = 0; i < M * ng; ++i)
+      scales_scratch[static_cast<size_t>(i)] = f16b_to_f32(W.scales[i]);
+    scf = scales_scratch.data();
+  }
+  const float* zf = nullptr;
+  if (W.zeros) {
+    zeros_scratch.resize(static_cast<size_t>(M) * ng);
+    for (int i = 0; i < M * ng; ++i)
+      zeros_scratch[static_cast<size_t>(i)] = f16b_to_f32(W.zeros[i]);
+    zf = zeros_scratch.data();
+  }
+  auto scale_at = [&](int m, int g) -> float { return scf[static_cast<size_t>(m) * ng + g]; };
+  auto zero_at = [&](int m, int g) -> float {
+    return zf ? zf[static_cast<size_t>(m) * ng + g] : 0.f;
+  };
+
+  const int Tb = (n >= 256) ? 64 : (n >= 64) ? 32 : n;
+  for (int t0 = 0; t0 < n; t0 += Tb) {
+    const int t1 = std::min(n, t0 + Tb);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if (M >= 64)
+#endif
+    for (int m = 0; m < M; ++m) {
+      const uint8_t* qrow = W.qweight + static_cast<size_t>(m) * rb;
+      if (m + 1 < M) {
+        _mm_prefetch(reinterpret_cast<const char*>(W.qweight + static_cast<size_t>(m + 1) * rb),
+                     _MM_HINT_T0);
+      }
+      for (int t = t0; t < t1; ++t) {
+        const float* x = X + static_cast<size_t>(t) * K;
+        float acc = 0.f;
+        for (int g = 0; g < ng; ++g) {
+          const int k0 = g * gs;
+          const int k1 = std::min(K, k0 + gs);
+          acc += dot_gptq_avx2(x, qrow, k0, k1, scale_at(m, g), zero_at(m, g));
+        }
+        Y[static_cast<size_t>(t) * M + m] = std::isfinite(acc) ? acc : 0.f;
+      }
+    }
+  }
+}
+#endif
+
 void gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
   if (n <= 0) return;
   if (n == 1) {
     gemm_int4(X, W, Y);
     return;
   }
-  const bool awq = W.scheme == qlwc::Scheme::kAwqSym;
 #if defined(LLMOC_ENABLE_AVX2)
-  if (awq) {
+  if (W.scheme == qlwc::Scheme::kAwqSym) {
     gemm_int4_awq_batch_avx2(X, n, W, Y);
     return;
   }
-#endif
-  (void)awq;
-  // GPTQ / 无 AVX2：逐 token（正确优先）
+  // GPTQ asymmetric: weight-stationary token tiles (same idea as AWQ batch).
+  gemm_int4_gptq_batch_avx2(X, n, W, Y);
+#else
   for (int t = 0; t < n; ++t)
     gemm_int4(X + static_cast<size_t>(t) * W.K, W, Y + static_cast<size_t>(t) * W.M);
+#endif
 }
 
 void dequant_int4_row(const qlwc::Int4View& W, int row, float* out) {

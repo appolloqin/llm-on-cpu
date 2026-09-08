@@ -258,10 +258,7 @@ std::vector<int32_t> build_prompt_ids(const GenerateRequest& req, HfTokenizer* t
     append_text("<|im_end|>\n");
   }
   append_text("<|im_start|>assistant\n");
-  if (req.enable_thinking)
-    append_text("<think>\n");
-  else
-    append_text("<think>\n\n</think>\n\n");
+  if (req.enable_thinking) append_text("<think>\n");
   return ids;
 }
 

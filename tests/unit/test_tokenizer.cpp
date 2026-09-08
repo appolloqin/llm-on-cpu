@@ -16,7 +16,8 @@ TINY_TEST(Tok, ChatTemplate) {
       {{"system", "you are helpful"}, {"user", "hi"}}, true, false);
   EXPECT_TRUE(off.find("<|im_start|>system") != std::string::npos);
   EXPECT_TRUE(off.find("<|im_start|>assistant\n") != std::string::npos);
-  EXPECT_TRUE(off.find("<think>\n\n</think>\n\n") != std::string::npos);
+  EXPECT_TRUE(off.find("<think>") == std::string::npos);
+  EXPECT_TRUE(off.find("</think>") == std::string::npos);
   const std::string on = llmoc::model::apply_qwen_chat_template({{"user", "hi"}}, true, true);
   EXPECT_TRUE(on.find("<think>\n") != std::string::npos);
   EXPECT_TRUE(on.find("</think>") == std::string::npos);

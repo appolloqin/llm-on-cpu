@@ -1022,15 +1022,35 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     }
 
     bool gdn_ok = false;
-    if (n_tok == 1 && resident_gpu_) {
-      gdn_ok = hal::cuda::try_gated_delta_gpu(
-          sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
-          Lkv.linear.recurrent.data(), sc.core.data(), nv, dk, dv);
+    if (resident_gpu_) {
+      // Decode (n=1) and long prefill: keep GDN state on device. Prefill used to force
+      // host gated_delta_recurrent for n>1 → ~0.1 layer/s at T~1k on pure_gpu/AWQ.
+      gdn_ok = true;
+      for (int t = 0; t < n_tok; ++t) {
+        if (!hal::cuda::try_gated_delta_gpu(
+                sc.q.data() + static_cast<size_t>(t) * nv * dk,
+                sc.k.data() + static_cast<size_t>(t) * nv * dk,
+                sc.v.data() + static_cast<size_t>(t) * nv * dv, sc.g.data() + t * nv,
+                sc.beta.data() + t * nv, Lkv.linear.recurrent.data(),
+                sc.core.data() + static_cast<size_t>(t) * nv * dv, nv, dk, dv)) {
+          gdn_ok = false;
+          break;
+        }
+      }
+      if (!gdn_ok) {
+        // Partial device steps are not mirrored on host — drop device cache and recompute.
+        hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
+        if (n_tok > 1) {
+          // Multi-token GPU path assumes this call starts from zeros (standard prefill).
+          std::fill(Lkv.linear.recurrent.begin(), Lkv.linear.recurrent.end(), 0.f);
+        }
+        hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(),
+                                   sc.beta.data(), Lkv.linear.recurrent.data(), sc.core.data(),
+                                   n_tok, nv, dk, dv, true);
+        gdn_ok = true;
+      }
     }
     if (!gdn_ok) {
-      if (resident_gpu_) {
-        hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
-      }
       hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
                                  Lkv.linear.recurrent.data(), sc.core.data(), n_tok, nv, dk, dv,
                                  true);

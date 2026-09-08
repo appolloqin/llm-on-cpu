@@ -50,7 +50,7 @@ struct ChatMessage {
 };
 
 // Qwen chat 模板裁剪实现(文本 messages)。
-// enable_thinking=false 时按 HF 惯例预写空 <think></think>，跳过思考链。
+// enable_thinking=true：以 <think>\n 开思考链；false：不注入任何 think 标签。
 std::string apply_qwen_chat_template(const std::vector<ChatMessage>& messages,
                                      bool add_generation_prompt,
                                      bool enable_thinking = false);

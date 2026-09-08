@@ -252,11 +252,8 @@ std::string apply_qwen_chat_template(const std::vector<ChatMessage>& messages,
   }
   if (add_generation_prompt) {
     oss << "<|im_start|>assistant\n";
-    // 与 models/.../chat_template.jinja 一致
-    if (enable_thinking)
-      oss << "<think>\n";
-    else
-      oss << "<think>\n\n</think>\n\n";
+    // true：打开思考链；false：不写 <think>，避免仍走空 think 流程。
+    if (enable_thinking) oss << "<think>\n";
   }
   return oss.str();
 }

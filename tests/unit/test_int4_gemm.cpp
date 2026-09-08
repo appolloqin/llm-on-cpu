@@ -112,6 +112,42 @@ TINY_TEST(Int4, GemmBatchMatchesSingle) {
   }
 }
 
+TINY_TEST(Int4, GptqGemmBatchMatchesSingle) {
+  const int M = 64, K = 128, gs = 128, n = 9;
+  std::vector<uint8_t> q(static_cast<size_t>(M) * K);
+  for (int i = 0; i < M * K; ++i) q[i] = static_cast<uint8_t>((i * 7 + 3) % 16);
+  std::vector<uint8_t> packed;
+  pack_row(q, packed, M, K);
+  const int ng = (K + gs - 1) / gs;
+  std::vector<uint16_t> scales(static_cast<size_t>(M) * ng);
+  std::vector<uint16_t> zeros(static_cast<size_t>(M) * ng);
+  for (int i = 0; i < M * ng; ++i) {
+    scales[i] = f32_to_f16bits(0.015f + 0.0001f * static_cast<float>(i % 17));
+    zeros[i] = f32_to_f16bits(-0.05f + 0.001f * static_cast<float>(i % 7));
+  }
+  std::vector<float> X(static_cast<size_t>(n) * K), Yb(static_cast<size_t>(n) * M),
+      Ys(static_cast<size_t>(n) * M);
+  for (int i = 0; i < n * K; ++i) X[i] = 0.01f * static_cast<float>((i % 13) - 6);
+
+  qlwc::Int4View W;
+  W.qweight = packed.data();
+  W.scales = scales.data();
+  W.zeros = zeros.data();
+  W.scales_f32 = nullptr;
+  W.M = M;
+  W.K = K;
+  W.group_size = gs;
+  W.scheme = qlwc::Scheme::kGptqAsym;
+
+  llmoc::hal::gemm_int4_batch(X.data(), n, W, Yb.data());
+  for (int t = 0; t < n; ++t)
+    llmoc::hal::gemm_int4(X.data() + t * K, W, Ys.data() + t * M);
+  for (int i = 0; i < n * M; ++i) {
+    const float e = std::fabs(Yb[i] - Ys[i]);
+    EXPECT_TRUE(e < 1e-4f * (1.f + std::fabs(Ys[i])));
+  }
+}
+
 TINY_TEST(Int4, GpuGemmMatchesCpuIfCuda) {
   if (!llmoc::hal::cuda::probe_available()) {
     EXPECT_TRUE(true);  // no GPU — skip

@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
     // Matches server prompt shape used by Generator (im_start/user/.../assistant).
     auto approx_prompt_n = [&](const std::string& body) {
       const std::string full = "<|im_start|>user\n" + body +
-                               "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+                               "<|im_end|>\n<|im_start|>assistant\n";
       return static_cast<int>(tok.encode(full).size());
     };
     std::string body = user_msg + "\n";
