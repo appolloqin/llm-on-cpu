@@ -29,6 +29,8 @@ struct GenerateRequest {
   bool stream = false;
   float temperature = 0.f;  // 0 = greedy
   bool enable_thinking = false;
+  // family | empty_prefill | no_tags — from engine thinking.off_style
+  std::string thinking_off_style = "family";
   // P0: auto|true|false —— true/auto 且 model->has_mtp() 才投机；否则逐步 decode
   std::string mtp = "auto";
   int spec_k = 3;

@@ -8,6 +8,11 @@ model:
   mtp: false
   # tokenizer_dir: models/Qwen3.5-4B-hf   # 默认由 path 推 *-hf/
 
+# thinking（请求省略 enable_thinking 时用这里；off_style 控制关闭时是否注入空 think）
+thinking:
+  enable: false
+  off_style: family   # family | empty_prefill | no_tags
+
 # ---------------------------------------------------------------------------
 # 执行模式 mode（加载期确定）
 #

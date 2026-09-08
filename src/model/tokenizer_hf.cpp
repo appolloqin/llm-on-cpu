@@ -1,5 +1,6 @@
 // llm-on-cpu :: model/tokenizer_hf.cpp
 #include "model/tokenizer_hf.h"
+#include "model/chat_templates.h"
 
 #include <algorithm>
 #include <climits>
@@ -246,16 +247,11 @@ std::string HfTokenizer::decode(const std::vector<int32_t>& ids, bool skip_speci
 
 std::string apply_qwen_chat_template(const std::vector<ChatMessage>& messages,
                                      bool add_generation_prompt, bool enable_thinking) {
-  std::ostringstream oss;
-  for (const auto& m : messages) {
-    oss << "<|im_start|>" << m.role << "\n" << m.content << "<|im_end|>\n";
-  }
-  if (add_generation_prompt) {
-    oss << "<|im_start|>assistant\n";
-    // true：打开思考链；false：不写 <think>，避免仍走空 think 流程。
-    if (enable_thinking) oss << "<think>\n";
-  }
-  return oss.str();
+  ChatTemplateOptions opt;
+  opt.add_generation_prompt = add_generation_prompt;
+  opt.enable_thinking = enable_thinking;
+  opt.thinking_off_style = ThinkingOffStyle::kFamily;  // Qwen3.5 family default
+  return apply_chat_template(ChatFamily::kQwen35, messages, opt);
 }
 
 std::string strip_qwen_think(const std::string& text) {

@@ -60,7 +60,7 @@ inline int run(int argc, char** argv, families::deepseek::ExpertQuant force_q, c
     }
 
     families::kimi::KimiStubModel model;
-    model.load_file(cfg.model_path, mode, force_q);
+    model.load_file(cfg.model_path, mode, force_q, "kimi_k3_stub");
     if (hal::cuda::enabled()) model.warm_gpu_weights();
 
     model::HfTokenizer tok;

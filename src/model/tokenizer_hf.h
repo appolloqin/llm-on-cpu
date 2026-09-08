@@ -49,8 +49,8 @@ struct ChatMessage {
   std::vector<ChatImage> images;  // 多模态：插在文本前（Picture N + vision tokens）
 };
 
-// Qwen chat 模板裁剪实现(文本 messages)。
-// enable_thinking=true：以 <think>\n 开思考链；false：不注入任何 think 标签。
+// Backward-compatible alias → Qwen3.5 template (empty think prefill when off).
+// Prefer apply_chat_template(chat_family_from_kind(...), ...) for new code.
 std::string apply_qwen_chat_template(const std::vector<ChatMessage>& messages,
                                      bool add_generation_prompt,
                                      bool enable_thinking = false);

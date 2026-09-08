@@ -85,6 +85,10 @@ EngineConfig EngineConfig::load(const std::string& path) {
     if (full == "model.path") cfg.model_path = val;
     else if (full == "model.dtype") cfg.model_dtype = val;
     else if (full == "model.mtp") cfg.mtp = val;
+    else if (full == "thinking.enable" || full == "model.enable_thinking")
+      cfg.thinking_enable = (val == "true" || val == "1" || val == "yes");
+    else if (full == "thinking.off_style" || full == "thinking.style")
+      cfg.thinking_off_style = val;
     else if (full == "model.tokenizer_dir") cfg.tokenizer_dir = val;
     else if (full == "mode") cfg.mode = val;
     else if (full == "layer_stream.window_layers") cfg.layer_stream_window = std::stoi(val);

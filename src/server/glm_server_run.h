@@ -33,6 +33,8 @@ inline EngineConfig to_http_cfg(const glm::GlmEngineConfig& g) {
   c.api_key_env = g.api_key_env;
   c.max_new_tokens = g.max_new_tokens;
   c.model_dtype = glm::GlmEngineConfig::quant_name(g.quant);
+  c.thinking_enable = g.thinking_enable;
+  c.thinking_off_style = g.thinking_off_style;
   return c;
 }
 

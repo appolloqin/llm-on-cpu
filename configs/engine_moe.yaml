@@ -6,6 +6,10 @@ model:
   dtype: bf16
   mtp: false
 
+thinking:
+  enable: false
+  off_style: family
+
 mode: pure_cpu
 
 tiers:

@@ -165,7 +165,8 @@ void HttpApi::listen() {
   });
 
   // 简易对话页（此前只有 API，打开 / 会 404）
-  svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+  // enable_thinking 默认来自 configs thinking.enable（请求体可覆盖）
+  svr.Get("/", [this](const httplib::Request&, httplib::Response& res) {
     static constexpr const char* kHtml = R"HTML(<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -263,7 +264,7 @@ function stripThink(t){
       answer=t.slice(c+close.length).replace(/^\s+/,'').trim();
     }
   }
-  // 聊天页 enable_thinking:false，不展示思考区，避免与正文重复
+  // 聊天页 strip 思考区展示；默认 enable_thinking 见 configs thinking.enable
   return {thinking:'',answer};
 }
 function normalize(t){
@@ -400,7 +401,7 @@ document.getElementById('f').onsubmit=async(e)=>{
   add('user',text,imgs);
   const bot=add('assistant','…');go.disabled=true;st.textContent=imgs.length?'视觉编码中…':'生成中…';
   try{
-    const payload={messages:history,max_tokens:2048,stream:true,temperature:0,enable_thinking:false};
+    const payload={messages:history,max_tokens:2048,stream:true,temperature:0,enable_thinking:__THINK_ENABLE__};
     const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)});
     if(!r.ok)throw new Error(await r.text());
@@ -437,7 +438,11 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
 </script>
 </body>
 </html>)HTML";
-    res.set_content(kHtml, "text/html; charset=utf-8");
+    std::string html(kHtml);
+    const char* think_js = cfg_.thinking_enable ? "true" : "false";
+    const auto pos = html.find("__THINK_ENABLE__");
+    if (pos != std::string::npos) html.replace(pos, 16, think_js);
+    res.set_content(html, "text/html; charset=utf-8");
   });
 
   svr.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
@@ -477,7 +482,8 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
     greq.max_new_tokens = body.value("max_tokens", cfg_.max_new_tokens);
     greq.stream = body.value("stream", false);
     greq.temperature = body.value("temperature", 0.0f);
-    greq.enable_thinking = body.value("enable_thinking", false);
+    greq.enable_thinking = body.value("enable_thinking", cfg_.thinking_enable);
+    greq.thinking_off_style = body.value("thinking_off_style", cfg_.thinking_off_style);
     greq.mtp = body.value("mtp", cfg_.mtp);
     greq.spec_k = body.value("spec_k", cfg_.spec_k);
     greq.logprobs = body.value("logprobs", false);

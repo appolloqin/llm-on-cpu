@@ -16,6 +16,7 @@
 #endif
 
 #include "common/log.h"
+#include "model/chat_templates.h"
 
 namespace llmoc::model {
 namespace {
@@ -230,8 +231,8 @@ bool messages_have_images(const std::vector<ChatMessage>& messages) {
   return false;
 }
 
-std::vector<int32_t> build_prompt_ids(const GenerateRequest& req, HfTokenizer* tok,
-                                      const std::vector<int>& image_pad_counts,
+std::vector<int32_t> build_prompt_ids(ChatFamily family, const GenerateRequest& req,
+                                      HfTokenizer* tok, const std::vector<int>& image_pad_counts,
                                       int32_t vision_start, int32_t image_pad, int32_t vision_end) {
   std::vector<int32_t> ids;
   auto append_text = [&](const std::string& s) {
@@ -257,8 +258,12 @@ std::vector<int32_t> build_prompt_ids(const GenerateRequest& req, HfTokenizer* t
     append_text(m.content);
     append_text("<|im_end|>\n");
   }
-  append_text("<|im_start|>assistant\n");
-  if (req.enable_thinking) append_text("<think>\n");
+  ChatTemplateOptions topt;
+  topt.enable_thinking = req.enable_thinking;
+  topt.thinking_off_style = parse_thinking_off_style(req.thinking_off_style);
+  std::string suffix;
+  append_assistant_generation_prefix(family, topt, suffix);
+  append_text(suffix);
   return ids;
 }
 
@@ -277,6 +282,8 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
   std::vector<int32_t> ids;
   model_->clear_vision_embeds();
 
+  const ChatFamily family = chat_family_from_kind(model_->meta().kind);
+
   if (messages_have_images(req.messages)) {
     if (!model_->has_vision())
       throw std::runtime_error("images provided but vision encoder is unavailable");
@@ -292,10 +299,14 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
     LOG_INFO("gen vision: images=%d pads=%d encode=%.1f ms", static_cast<int>(pad_counts.size()),
              total_pads, vision_ms);
     model_->set_vision_embeds(std::move(all_embeds), total_pads);
-    ids = build_prompt_ids(req, tok_, pad_counts, model_->vision_start_token_id(),
+    ids = build_prompt_ids(family, req, tok_, pad_counts, model_->vision_start_token_id(),
                            model_->image_pad_token_id(), model_->vision_end_token_id());
   } else {
-    const std::string prompt = apply_qwen_chat_template(req.messages, true, req.enable_thinking);
+    ChatTemplateOptions topt;
+    topt.add_generation_prompt = true;
+    topt.enable_thinking = req.enable_thinking;
+    topt.thinking_off_style = parse_thinking_off_style(req.thinking_off_style);
+    const std::string prompt = apply_chat_template(family, req.messages, topt);
     ids = tok_->encode(prompt);
   }
 
@@ -322,9 +333,10 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
   (void)radix_.longest_prefix(ids);
 
   const auto& meta = model_->meta();
-  LOG_INFO("gen start: prompt_tok=%d max_new=%d max_seq=%d kind=%s layers=%d hidden=%d mtp=%s",
+  LOG_INFO("gen start: prompt_tok=%d max_new=%d max_seq=%d kind=%s chat_family=%s layers=%d "
+           "hidden=%d mtp=%s",
            static_cast<int>(ids.size()), greq.max_new_tokens, max_seq_, meta.kind.c_str(),
-           meta.layers, meta.hidden, greq.mtp.c_str());
+           chat_family_name(family), meta.layers, meta.hidden, greq.mtp.c_str());
 
   std::vector<float> logits;
   const auto tp0 = Clock::now();
@@ -521,7 +533,7 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
   for (int32_t id : out.token_ids) out.text += tok_->decode({id}, true);
   if (on_token && !utf8_carry.empty()) on_token(sanitize_utf8(utf8_carry), nullptr);
   out.text = sanitize_utf8(out.text);
-  if (!req.enable_thinking) out.text = strip_qwen_think(out.text);
+  out.text = postprocess_completion(family, out.text, req.enable_thinking);
   out.completion_tokens = static_cast<int>(out.token_ids.size());
   if (!out.logprobs.empty()) {
     double sum = 0.0;

@@ -9,6 +9,14 @@ model:
   # tokenizer_dir 默认由 path 推: models/Qwen3.5-4B.int4-hf —— 请显式指定原 HF 旁路:
   tokenizer_dir: models/Qwen3.5-4B-hf
 
+# thinking:
+#   enable: false          # API/UI 默认；请求体 enable_thinking 可覆盖
+#   off_style: family      # family | empty_prefill | no_tags
+#                          # Qwen3.5 family → empty_prefill；3.6/3.8 → no_tags
+thinking:
+  enable: false
+  off_style: family
+
 # pure_cpu（默认）| hybrid_gpu / pure_gpu / auto | layer_stream
 # hybrid/pure_gpu：层投影 INT4→FP32 缓存 + cuBLAS（需 CUDA；设 gpu_vram_gb）；lm_head 仍 CPU INT4
 # layer_stream：按层窗口加载（可运行优先）；auto 且模型 > dram_hot_gb 时自动切 layer_stream

@@ -23,6 +23,8 @@ struct GlmEngineConfig {
   std::string api_key_env = "LLMOC_API_KEY";
   int max_new_tokens = 2048;
   int max_seq = 16384;
+  bool thinking_enable = false;
+  std::string thinking_off_style = "no_tags";
 
   static GlmEngineConfig load(const std::string& path);
   std::string resolve_tokenizer_dir() const;

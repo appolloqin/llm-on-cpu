@@ -13,6 +13,9 @@ struct EngineConfig {
   std::string model_path = "models/Qwen3.5-4B.lwc";
   std::string model_dtype = "bf16";
   std::string mtp = "false";
+  // thinking.* — API default + template policy when thinking is off
+  bool thinking_enable = false;              // request omits enable_thinking → this
+  std::string thinking_off_style = "family"; // family | empty_prefill | no_tags
   std::string tokenizer_dir;
   std::string mode = "pure_cpu";
   // layer_stream 子配置

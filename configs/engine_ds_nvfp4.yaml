@@ -4,6 +4,10 @@ model:
   dtype: nvfp4
   tokenizer_dir: models/Qwen3.5-4B-hf
 
+thinking:
+  enable: false
+  off_style: family
+
 mode: hybrid_gpu
 
 tiers:

@@ -4,6 +4,11 @@ model:
   dtype: int4
   mtp: true
   tokenizer_dir: models/Qwen3.5-4B-hf
+
+thinking:
+  enable: false
+  off_style: family
+
 mode: pure_cpu
 tiers:
   dram_hot_gb: 6

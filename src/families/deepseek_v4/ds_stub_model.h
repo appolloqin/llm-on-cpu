@@ -34,8 +34,10 @@ struct DsStubGeometry {
 
 class DsStubModel final : public model::ICausalLM {
  public:
-  void load_file(const std::string& path, contracts::ExecMode mode, ExpertQuant expert_q);
-  void load_synthetic(DsStubGeometry g, contracts::ExecMode mode, ExpertQuant expert_q);
+  void load_file(const std::string& path, contracts::ExecMode mode, ExpertQuant expert_q,
+                 const char* kind_tag = "deepseek_v4_stub");
+  void load_synthetic(DsStubGeometry g, contracts::ExecMode mode, ExpertQuant expert_q,
+                      const char* kind_tag = "deepseek_v4_stub");
   void warm_gpu_weights();
   ExpertQuant expert_quant() const { return expert_q_; }
 
@@ -57,7 +59,7 @@ class DsStubModel final : public model::ICausalLM {
                std::vector<float>& logits, bool is_prefill) override;
 
  private:
-  void finish_load(contracts::ExecMode mode);
+  void finish_load(contracts::ExecMode mode, const char* kind_tag);
   void gemm_bf16(const float* x, const uint16_t* W, float* y, int M, int K);
   void gemm_expert(const float* x, const ExpW& W, float* y);
 

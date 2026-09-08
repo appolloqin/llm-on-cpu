@@ -14,6 +14,10 @@ mode: pure_cpu
 
 quant: awq_int4
 
+thinking:
+  enable: false
+  off_style: no_tags
+
 tiers:
   dram_hot_gb: 24
   gpu_vram_gb: 20   # hybrid_gpu / pure_gpu 显存预算（GB）

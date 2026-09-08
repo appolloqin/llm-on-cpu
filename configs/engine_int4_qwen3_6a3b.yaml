@@ -12,6 +12,11 @@ model:
   mtp: false
   tokenizer_dir: models/Qwen3.6-35B-A3B-AWQ-4bit-hf
 
+# Qwen3.6：off 不注入 think 标签（family→no_tags）；开 think 时请求 enable_thinking:true
+thinking:
+  enable: false
+  off_style: family
+
 # MoE weights are large; prefer hybrid_gpu or layer_stream if DRAM is tight.
 mode: hybrid_gpu
 

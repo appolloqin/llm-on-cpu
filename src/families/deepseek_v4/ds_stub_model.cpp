@@ -111,7 +111,7 @@ void DsStubModel::gemm_expert(const float* x, const ExpW& W, float* y) {
   }
 }
 
-void DsStubModel::finish_load(contracts::ExecMode mode) {
+void DsStubModel::finish_load(contracts::ExecMode mode, const char* kind_tag) {
   mode_ = mode;
   meta_.hidden = g_.hidden;
   meta_.layers = g_.layers;
@@ -119,14 +119,16 @@ void DsStubModel::finish_load(contracts::ExecMode mode) {
   meta_.n_kv = 1;
   meta_.head_dim = g_.d_latent;
   meta_.is_moe = true;
-  meta_.kind = std::string("deepseek_v4_stub_") + expert_quant_name(expert_q_);
+  const char* tag = (kind_tag && kind_tag[0]) ? kind_tag : "deepseek_v4_stub";
+  meta_.kind = std::string(tag) + "_" + expert_quant_name(expert_q_);
   use_gpu_ = false;
-  LOG_INFO("DsStub: H=%d L=%d V=%d E=%d topk=%d d_c=%d expert_q=%s mode=%s", g_.hidden, g_.layers,
-           g_.vocab, g_.n_experts, g_.top_k, g_.d_latent, expert_quant_name(expert_q_),
-           contracts::mode_name(mode_));
+  LOG_INFO("DsStub: H=%d L=%d V=%d E=%d topk=%d d_c=%d expert_q=%s kind=%s mode=%s", g_.hidden,
+           g_.layers, g_.vocab, g_.n_experts, g_.top_k, g_.d_latent, expert_quant_name(expert_q_),
+           meta_.kind.c_str(), contracts::mode_name(mode_));
 }
 
-void DsStubModel::load_synthetic(DsStubGeometry g, contracts::ExecMode mode, ExpertQuant expert_q) {
+void DsStubModel::load_synthetic(DsStubGeometry g, contracts::ExecMode mode, ExpertQuant expert_q,
+                                 const char* kind_tag) {
   g_ = g;
   expert_q_ = expert_q;
   const int H = g_.hidden, V = g_.vocab, L = g_.layers, E = g_.n_experts;
@@ -169,10 +171,11 @@ void DsStubModel::load_synthetic(DsStubGeometry g, contracts::ExecMode mode, Exp
       }
     }
   }
-  finish_load(mode);
+  finish_load(mode, kind_tag);
 }
 
-void DsStubModel::load_file(const std::string& path, contracts::ExecMode mode, ExpertQuant expert_q) {
+void DsStubModel::load_file(const std::string& path, contracts::ExecMode mode, ExpertQuant expert_q,
+                            const char* kind_tag) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("ds stub open failed: " + path);
   char magic[4];
@@ -190,9 +193,9 @@ void DsStubModel::load_file(const std::string& path, contracts::ExecMode mode, E
   in.read(reinterpret_cast<char*>(&g.d_latent), 4);
   in.read(reinterpret_cast<char*>(&g.intermediate), 4);
   (void)ver;
-  load_synthetic(g, mode, expert_q);
-  LOG_INFO("DsStub: loaded header from %s (synthetic fill, expert_q=%s)", path.c_str(),
-           expert_quant_name(expert_q));
+  load_synthetic(g, mode, expert_q, kind_tag);
+  LOG_INFO("DsStub: loaded header from %s (synthetic fill, expert_q=%s kind_tag=%s)", path.c_str(),
+           expert_quant_name(expert_q), kind_tag ? kind_tag : "deepseek_v4_stub");
 }
 
 void DsStubModel::warm_gpu_weights() {

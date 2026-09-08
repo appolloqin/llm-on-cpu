@@ -8,6 +8,10 @@ model:
 mode: pure_cpu
 quant: bf16
 
+thinking:
+  enable: false
+  off_style: no_tags
+
 tiers:
   dram_hot_gb: 48
   gpu_vram_gb: 20

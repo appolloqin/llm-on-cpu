@@ -15,6 +15,10 @@ mode: hybrid_gpu
 
 quant: nvfp4
 
+thinking:
+  enable: false
+  off_style: no_tags
+
 tiers:
   dram_hot_gb: 40
   gpu_vram_gb: 20   # hybrid_gpu / pure_gpu 显存预算（GB）

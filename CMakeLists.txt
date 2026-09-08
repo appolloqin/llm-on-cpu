@@ -152,6 +152,7 @@ endif()
 add_library(llmoc_model STATIC
   src/model/spec_decode.cpp
   src/model/tokenizer_hf.cpp
+  src/model/chat_templates.cpp
   src/model/kv_cache.cpp
   src/model/mtp_head.cpp
   src/model/qwen3_5_model.cpp

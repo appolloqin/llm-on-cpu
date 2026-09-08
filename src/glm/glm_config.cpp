@@ -78,6 +78,10 @@ GlmEngineConfig GlmEngineConfig::load(const std::string& path) {
       if (cfg.max_seq < 256) cfg.max_seq = 256;
     } else if (full == "server.port") cfg.server_port = std::stoi(val);
     else if (full == "server.api_key_env") cfg.api_key_env = val;
+    else if (full == "thinking.enable")
+      cfg.thinking_enable = (val == "true" || val == "1" || val == "yes");
+    else if (full == "thinking.off_style" || full == "thinking.style")
+      cfg.thinking_off_style = val;
   }
   return cfg;
 }
