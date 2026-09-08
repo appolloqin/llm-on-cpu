@@ -1463,8 +1463,12 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
     return e && e[0] == '1';
   }();
   // One-shot decode profile when resident_gpu (no env needed).
+  // Long prefill: always log lin/full once so we know where time goes.
   static int kAutoProfLeft = resident_gpu_ ? 2 : 0;
-  const bool do_prof = kProf || (!is_prefill && kAutoProfLeft > 0);
+  static int kAutoPrefillProfLeft = resident_gpu_ ? 2 : 0;
+  const bool do_prof =
+      kProf || (!is_prefill && kAutoProfLeft > 0) ||
+      (is_prefill && static_cast<int>(tokens.size()) >= 256 && kAutoPrefillProfLeft > 0);
   using Clock = std::chrono::steady_clock;
   const auto t0 = do_prof ? Clock::now() : Clock::time_point{};
 
@@ -1527,9 +1531,16 @@ void Qwen35Int4Model::forward(const std::vector<int32_t>& tokens, SessionCache& 
     const auto t1 = Clock::now();
     const double ms_head = std::chrono::duration<double, std::milli>(t1 - t_head0).count();
     const double ms_tot = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    LOG_INFO("profile decode: lin=%.1fms full=%.1fms lm_head=%.1fms total=%.1fms (%.2f tok/s)",
-             ms_lin, ms_full, ms_head, ms_tot, ms_tot > 0 ? 1000.0 / ms_tot : 0.0);
-    if (kAutoProfLeft > 0) --kAutoProfLeft;
+    if (is_prefill) {
+      LOG_INFO("profile prefill: n=%d lin=%.1fms full=%.1fms lm_head=%.1fms total=%.1fms (%.2f tok/s)",
+               static_cast<int>(tokens.size()), ms_lin, ms_full, ms_head, ms_tot,
+               ms_tot > 0 ? 1000.0 * tokens.size() / ms_tot : 0.0);
+      if (kAutoPrefillProfLeft > 0) --kAutoPrefillProfLeft;
+    } else {
+      LOG_INFO("profile decode: lin=%.1fms full=%.1fms lm_head=%.1fms total=%.1fms (%.2f tok/s)",
+               ms_lin, ms_full, ms_head, ms_tot, ms_tot > 0 ? 1000.0 / ms_tot : 0.0);
+      if (kAutoProfLeft > 0) --kAutoProfLeft;
+    }
   }
 }
 

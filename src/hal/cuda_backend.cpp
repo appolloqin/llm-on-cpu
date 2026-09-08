@@ -1413,6 +1413,46 @@ extern "C" __global__ void gated_delta_kernel(
   }
   out[h * dv + j] = out_j;
 }
+
+// Prefill: one launch per head runs the full token window (no per-token launch storm).
+extern "C" __global__ void gated_delta_seq_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    float* __restrict__ out, int seq, int n_heads, int dk, int dv, float scale) {
+  const int h = blockIdx.x;
+  const int j = threadIdx.x;
+  if (h >= n_heads || j >= dv) return;
+  float* st = state + (size_t)h * dk * dv;
+  for (int t = 0; t < seq; ++t) {
+    const float* qh = q + ((size_t)t * n_heads + h) * dk;
+    const float* kh = k + ((size_t)t * n_heads + h) * dk;
+    const float* vh = v + ((size_t)t * n_heads + h) * dv;
+    float g_log = g[t * n_heads + h];
+    float beta_t = beta[t * n_heads + h];
+    float qn = 0.f, kn = 0.f;
+    for (int i = 0; i < dk; ++i) { qn += qh[i]*qh[i]; kn += kh[i]*kh[i]; }
+    qn = rsqrtf(qn + 1e-12f); kn = rsqrtf(kn + 1e-12f);
+    g_log = fmaxf(-80.f, fminf(0.f, g_log));
+    const float g_t = expf(g_log);
+    beta_t = fminf(1.f, fmaxf(0.f, beta_t));
+    float kv_j = 0.f;
+    for (int i = 0; i < dk; ++i) {
+      float s = st[i * dv + j] * g_t;
+      st[i * dv + j] = s;
+      kv_j += kh[i] * kn * s;
+    }
+    const float delta_j = beta_t * (vh[j] - kv_j);
+    float out_j = 0.f;
+    for (int i = 0; i < dk; ++i) {
+      float s = st[i * dv + j] + kh[i] * kn * delta_j;
+      s = fminf(1e4f, fmaxf(-1e4f, s));
+      st[i * dv + j] = s;
+      out_j += qh[i] * qn * scale * s;
+    }
+    out[((size_t)t * n_heads + h) * dv + j] = out_j;
+  }
+}
 )CUDA";
 
 // Decode activation helpers (rmsnorm / silu× / add) for resident MLP path.
@@ -2293,11 +2333,15 @@ bool try_gated_delta_gpu_seq(const float* q, const float* k, const float* v, con
   if (seq == 1)
     return try_gated_delta_gpu(q, k, v, g, beta, state, out, n_heads, dk, dv);
 
-  void* fn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
-  if (!fn) return fail(g_status.c_str());
+  void* fn_seq = get_jit_kernel(kGdnSrc, "gated_delta_seq_kernel");
+  void* fn_step = nullptr;
+  if (!fn_seq) {
+    fn_step = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
+    if (!fn_step) return fail(g_status.c_str());
+  }
 
-  // Cap scratch so long prefills stay within a few hundred MiB.
-  constexpr int kChunk = 64;
+  // ~256 tokens/chunk: fewer H2D rounds; seq kernel = 1 launch per chunk.
+  constexpr int kChunk = 256;
   const size_t state_bytes = sizeof(float) * static_cast<size_t>(n_heads) * dk * dv;
   const size_t per_tok = sizeof(float) * (static_cast<size_t>(n_heads) * dk * 2 +
                                           static_cast<size_t>(n_heads) * dv * 2 +
@@ -2358,19 +2402,29 @@ bool try_gated_delta_gpu_seq(const float* q, const float* k, const float* v, con
                          kCudaMemcpyH2D) != kCudaSuccess)
       return fail("beta_h2d");
 
-    for (int t = 0; t < n; ++t) {
-      float* qt = d_q + static_cast<size_t>(t) * n_heads * dk;
-      float* kt = d_k + static_cast<size_t>(t) * n_heads * dk;
-      float* vt = d_v + static_cast<size_t>(t) * n_heads * dv;
-      float* gt = d_g + static_cast<size_t>(t) * n_heads;
-      float* bt = d_beta + static_cast<size_t>(t) * n_heads;
-      float* ot = d_out + static_cast<size_t>(t) * n_heads * dv;
-      int dk_i = dk, dv_i = dv;
+    if (fn_seq) {
+      int seq_i = n, nh_i = n_heads, dk_i = dk, dv_i = dv;
       float scale_mut = scale;
-      void* params[] = {&qt, &kt, &vt, &gt, &bt, &d_state, &ot, &dk_i, &dv_i, &scale_mut};
-      if (!jit_launch(fn, static_cast<unsigned>(n_heads), 1, 1, static_cast<unsigned>(dv), 1, 1, 0,
-                      params))
-        return fail("launch");
+      void* params[] = {&d_q, &d_k, &d_v, &d_g, &d_beta, &d_state, &d_out,
+                        &seq_i, &nh_i, &dk_i, &dv_i, &scale_mut};
+      if (!jit_launch(fn_seq, static_cast<unsigned>(n_heads), 1, 1, static_cast<unsigned>(dv), 1, 1,
+                      0, params))
+        return fail("launch_seq");
+    } else {
+      for (int t = 0; t < n; ++t) {
+        float* qt = d_q + static_cast<size_t>(t) * n_heads * dk;
+        float* kt = d_k + static_cast<size_t>(t) * n_heads * dk;
+        float* vt = d_v + static_cast<size_t>(t) * n_heads * dv;
+        float* gt = d_g + static_cast<size_t>(t) * n_heads;
+        float* bt = d_beta + static_cast<size_t>(t) * n_heads;
+        float* ot = d_out + static_cast<size_t>(t) * n_heads * dv;
+        int dk_i = dk, dv_i = dv;
+        float scale_mut = scale;
+        void* params[] = {&qt, &kt, &vt, &gt, &bt, &d_state, &ot, &dk_i, &dv_i, &scale_mut};
+        if (!jit_launch(fn_step, static_cast<unsigned>(n_heads), 1, 1, static_cast<unsigned>(dv), 1,
+                        1, 0, params))
+          return fail("launch");
+      }
     }
     if (g_api.cudaMemcpy(out + static_cast<size_t>(t0) * n_heads * dv, d_out, v_bytes,
                          kCudaMemcpyD2H) != kCudaSuccess)
