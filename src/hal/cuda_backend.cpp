@@ -2279,6 +2279,110 @@ bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const f
   return true;
 }
 
+bool try_gated_delta_gpu_seq(const float* q, const float* k, const float* v, const float* g,
+                             const float* beta, float* state, float* out, int seq, int n_heads,
+                             int dk, int dv) {
+  auto fail = [&](const char* why) {
+    g_gdn_last_err = why;
+    ++g_gdn_fail;
+    return false;
+  };
+  if (!g_enabled || !jit_available() || !g_resident) return false;
+  if (!q || !k || !v || !g || !beta || !state || !out) return fail("null_arg");
+  if (seq <= 0 || n_heads <= 0 || dk <= 0 || dv <= 0) return fail("bad_dims");
+  if (seq == 1)
+    return try_gated_delta_gpu(q, k, v, g, beta, state, out, n_heads, dk, dv);
+
+  void* fn = get_jit_kernel(kGdnSrc, "gated_delta_kernel");
+  if (!fn) return fail(g_status.c_str());
+
+  // Cap scratch so long prefills stay within a few hundred MiB.
+  constexpr int kChunk = 64;
+  const size_t state_bytes = sizeof(float) * static_cast<size_t>(n_heads) * dk * dv;
+  const size_t per_tok = sizeof(float) * (static_cast<size_t>(n_heads) * dk * 2 +
+                                          static_cast<size_t>(n_heads) * dv * 2 +
+                                          static_cast<size_t>(n_heads) * 2);
+  const size_t io_bytes = per_tok * static_cast<size_t>(kChunk);
+
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_gdn_state.find(state);
+  if (it == g_gdn_state.end()) {
+    void* d_state_v = nullptr;
+    if (g_api.cudaMalloc(&d_state_v, state_bytes) != kCudaSuccess) return fail("state_malloc");
+    if (g_api.cudaMemcpy(d_state_v, state, state_bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+      g_api.cudaFree(d_state_v);
+      return fail("state_h2d");
+    }
+    g_gdn_state[state] = static_cast<float*>(d_state_v);
+    it = g_gdn_state.find(state);
+  }
+  float* d_state = it->second;
+  if (io_bytes > g_gdn_buf_cap) {
+    if (g_gdn_buf) g_api.cudaFree(g_gdn_buf);
+    void* buf_v = nullptr;
+    if (g_api.cudaMalloc(&buf_v, io_bytes) != kCudaSuccess) {
+      g_gdn_buf = nullptr;
+      g_gdn_buf_cap = 0;
+      return fail("io_malloc");
+    }
+    g_gdn_buf = static_cast<float*>(buf_v);
+    g_gdn_buf_cap = io_bytes;
+  }
+
+  const float scale = 1.f / sqrtf(static_cast<float>(dk));
+  for (int t0 = 0; t0 < seq; t0 += kChunk) {
+    const int n = (t0 + kChunk <= seq) ? kChunk : (seq - t0);
+    float* d_q = g_gdn_buf;
+    float* d_k = d_q + static_cast<size_t>(n) * n_heads * dk;
+    float* d_v = d_k + static_cast<size_t>(n) * n_heads * dk;
+    float* d_g = d_v + static_cast<size_t>(n) * n_heads * dv;
+    float* d_beta = d_g + static_cast<size_t>(n) * n_heads;
+    float* d_out = d_beta + static_cast<size_t>(n) * n_heads;
+
+    const size_t q_bytes = sizeof(float) * static_cast<size_t>(n) * n_heads * dk;
+    const size_t v_bytes = sizeof(float) * static_cast<size_t>(n) * n_heads * dv;
+    const size_t g_bytes = sizeof(float) * static_cast<size_t>(n) * n_heads;
+    if (g_api.cudaMemcpy(d_q, q + static_cast<size_t>(t0) * n_heads * dk, q_bytes,
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return fail("q_h2d");
+    if (g_api.cudaMemcpy(d_k, k + static_cast<size_t>(t0) * n_heads * dk, q_bytes,
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return fail("k_h2d");
+    if (g_api.cudaMemcpy(d_v, v + static_cast<size_t>(t0) * n_heads * dv, v_bytes,
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return fail("v_h2d");
+    if (g_api.cudaMemcpy(d_g, g + static_cast<size_t>(t0) * n_heads, g_bytes, kCudaMemcpyH2D) !=
+        kCudaSuccess)
+      return fail("g_h2d");
+    if (g_api.cudaMemcpy(d_beta, beta + static_cast<size_t>(t0) * n_heads, g_bytes,
+                         kCudaMemcpyH2D) != kCudaSuccess)
+      return fail("beta_h2d");
+
+    for (int t = 0; t < n; ++t) {
+      float* qt = d_q + static_cast<size_t>(t) * n_heads * dk;
+      float* kt = d_k + static_cast<size_t>(t) * n_heads * dk;
+      float* vt = d_v + static_cast<size_t>(t) * n_heads * dv;
+      float* gt = d_g + static_cast<size_t>(t) * n_heads;
+      float* bt = d_beta + static_cast<size_t>(t) * n_heads;
+      float* ot = d_out + static_cast<size_t>(t) * n_heads * dv;
+      int dk_i = dk, dv_i = dv;
+      float scale_mut = scale;
+      void* params[] = {&qt, &kt, &vt, &gt, &bt, &d_state, &ot, &dk_i, &dv_i, &scale_mut};
+      if (!jit_launch(fn, static_cast<unsigned>(n_heads), 1, 1, static_cast<unsigned>(dv), 1, 1, 0,
+                      params))
+        return fail("launch");
+    }
+    if (g_api.cudaMemcpy(out + static_cast<size_t>(t0) * n_heads * dv, d_out, v_bytes,
+                         kCudaMemcpyD2H) != kCudaSuccess)
+      return fail("out_d2h");
+  }
+  g_gdn_ok += static_cast<uint64_t>(seq);
+  return true;
+}
+
+const char* gdn_last_error() { return g_gdn_last_err.empty() ? "" : g_gdn_last_err.c_str(); }
+uint64_t gdn_fail_count() { return g_gdn_fail; }
+
 void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv) {
   if (!g_enabled || !host_state || n_heads <= 0 || dk <= 0 || dv <= 0) return;
   const size_t state_bytes = sizeof(float) * static_cast<size_t>(n_heads) * dk * dv;

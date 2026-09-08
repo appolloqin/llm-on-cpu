@@ -31,6 +31,7 @@ class GraphExecutor final : public ICausalLM {
   void prepare_speculative_snapshot(SessionCache& cache) override;
   void apply_speculative_restore(SessionCache& cache) override;
   void set_decode_pos(int pos) override;
+  void release_session_device_state(SessionCache& cache) override;
   bool has_mtp() const override;
   bool draft_propose(const std::vector<int32_t>& history, int draft_k,
                      std::vector<int32_t>& out, int32_t pin_first = -1) override;

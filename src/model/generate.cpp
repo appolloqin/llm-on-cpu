@@ -580,6 +580,7 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
     LOG_WARN(
         "gen decode <0.5 tok/s — for ~27B BF16 on CPU this can be expected; check OpenMP "
         "(OMP_NUM_THREADS), RAM not swapping, Release build, and LLMOC_PROFILE=1 layer breakdown");
+  model_->release_session_device_state(cache);
   return out;
 }
 

@@ -71,6 +71,10 @@ void GraphExecutor::set_decode_pos(int pos) {
   if (legacy_) legacy_->set_decode_pos(pos);
 }
 
+void GraphExecutor::release_session_device_state(SessionCache& cache) {
+  if (legacy_) legacy_->release_session_device_state(cache);
+}
+
 bool GraphExecutor::has_mtp() const {
   return legacy_ && legacy_->has_mtp();
 }

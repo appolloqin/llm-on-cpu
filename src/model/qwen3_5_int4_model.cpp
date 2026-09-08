@@ -997,6 +997,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
         }
       }
     }
+    // has_state after conv window is live; GDN may still run on GPU-only mirror.
     Lkv.linear.has_state = true;
 
     const int rep = nv / nk;
@@ -1023,26 +1024,29 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
 
     bool gdn_ok = false;
     if (resident_gpu_) {
-      // Decode (n=1) and long prefill: keep GDN state on device. Prefill used to force
-      // host gated_delta_recurrent for n>1 → ~0.1 layer/s at T~1k on pure_gpu/AWQ.
-      // Multi-token windows (MTP verify): sync host←device first so a mid-window GPU fail
-      // can safely fall back to CPU from the pre-window state.
-      if (n_tok > 1)
+      // Prefill/MTP n>1: batched H2D/D2H (try_gated_delta_gpu_seq). Per-token sync was
+      // ~ms×T and collapsed long prefill to ~0.1 layer/s.
+      // MTP decode reject path only: flush device→host before multi-token window.
+      if (!is_prefill && n_tok > 1)
         hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
-      gdn_ok = true;
-      for (int t = 0; t < n_tok; ++t) {
-        if (!hal::cuda::try_gated_delta_gpu(
-                sc.q.data() + static_cast<size_t>(t) * nv * dk,
-                sc.k.data() + static_cast<size_t>(t) * nv * dk,
-                sc.v.data() + static_cast<size_t>(t) * nv * dv, sc.g.data() + t * nv,
-                sc.beta.data() + t * nv, Lkv.linear.recurrent.data(),
-                sc.core.data() + static_cast<size_t>(t) * nv * dv, nv, dk, dv)) {
-          gdn_ok = false;
-          break;
-        }
+      if (n_tok > 1) {
+        gdn_ok = hal::cuda::try_gated_delta_gpu_seq(
+            sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
+            Lkv.linear.recurrent.data(), sc.core.data(), n_tok, nv, dk, dv);
+      } else {
+        gdn_ok = hal::cuda::try_gated_delta_gpu(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(),
+                                                sc.beta.data(), Lkv.linear.recurrent.data(),
+                                                sc.core.data(), nv, dk, dv);
       }
       if (!gdn_ok) {
-        // Drop partial device window; recompute from host (synced above when n_tok>1).
+        if (is_prefill) {
+          static std::atomic<int> warn_left{4};
+          if (warn_left.fetch_sub(1) > 0) {
+            LOG_WARN("gdn GPU prefill fallback→CPU n_tok=%d err=%s fail=%llu", n_tok,
+                     hal::cuda::gdn_last_error(),
+                     static_cast<unsigned long long>(hal::cuda::gdn_fail_count()));
+          }
+        }
         if (n_tok == 1)
           hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
         else
@@ -1725,6 +1729,10 @@ void Qwen35Int4Model::apply_speculative_restore(SessionCache& cache) {
     auto& lin = cache.layer(i).linear;
     if (!lin.recurrent.empty()) hal::cuda::invalidate_gdn_state(lin.recurrent.data());
   }
+}
+
+void Qwen35Int4Model::release_session_device_state(SessionCache& cache) {
+  apply_speculative_restore(cache);
 }
 
 bool Qwen35Int4Model::mtp_has_cb(void* ctx, const std::string& name) {

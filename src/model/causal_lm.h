@@ -65,6 +65,8 @@ class ICausalLM {
   virtual void apply_speculative_restore(SessionCache& /*cache*/) {}
   // 文本 decode 的下一 RoPE 下标（与 full-attn seq 对齐）
   virtual void set_decode_pos(int /*pos*/) {}
+  // 会话结束：释放按 host 指针缓存的 GPU GDN（避免指针复用 / 显存泄漏）
+  virtual void release_session_device_state(SessionCache& /*cache*/) {}
 
   // P0 MTP：无头时保持 false；禁止用随机草稿充数
   virtual bool has_mtp() const { return false; }
