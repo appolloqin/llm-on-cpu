@@ -1,10 +1,11 @@
-// llm-on-cpu :: src/server/main_int4.cpp
-// INT4/QLWC 专用入口 —— 不修改原 llmoc_server / BF16 路径。
+// llm-on-cpu :: src/server/main_int4_moe.cpp
+// INT4/QLWC MoE-only. Dense QLWC → llmoc_server_int4.
 
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "common/engine_config.h"
 #include "common/log.h"
@@ -13,96 +14,29 @@
 #include "exec/nccl_probe.h"
 #include "hal/cuda_backend.h"
 #include "model/generate.h"
-#include "model/qwen3_5_int4_model.h"
 #include "model/qwen3_6_moe_int4_model.h"
-#include "model/qwen3_8_int4_model.h"
 #include "model/qwen3_8_moe_int4_model.h"
-#include <fstream>
-#include <memory>
-#include <nlohmann/json.hpp>
 #include "model/tokenizer_hf.h"
 #include "sched/mode_controller.h"
 #include "sched/scheduler.h"
 #include "server/http_api.h"
+#include "server/int4_detect.h"
 #include "weights/layer_stream.h"
 #include "weights/qlwc_store.h"
 
-namespace {
-
-uint64_t file_size_u64(const std::string& p) {
-  std::error_code ec;
-  const auto sz = std::filesystem::file_size(p, ec);
-  return ec ? 0 : static_cast<uint64_t>(sz);
-}
-
-bool hf_config_looks_moe(const std::string& config_json_path) {
-  std::ifstream in(config_json_path);
-  if (!in) return false;
-  nlohmann::json root;
-  try {
-    in >> root;
-  } catch (...) {
-    return false;
-  }
-  const auto& tc = root.contains("text_config") ? root["text_config"] : root;
-  const int n = tc.value("num_experts", tc.value("n_routed_experts", 0));
-  return n > 0;
-}
-
-std::string lower_ascii(std::string s) {
-  for (char& c : s) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-  }
-  return s;
-}
-
-bool path_looks_qwen36(const std::string& s) {
-  const std::string l = lower_ascii(s);
-  return l.find("qwen3.6") != std::string::npos || l.find("qwen36") != std::string::npos ||
-         l.find("3.6-35") != std::string::npos || l.find("a3b") != std::string::npos;
-}
-
-bool path_looks_qwen38(const std::string& s) {
-  const std::string l = lower_ascii(s);
-  return l.find("qwen3.8") != std::string::npos || l.find("qwen38") != std::string::npos ||
-         l.find("3.8-27") != std::string::npos;
-}
-
-// Family 3.8 (dense or MoE). Path wins; dense geometry fallback must not steal 3.6 MoE.
-bool hf_config_looks_qwen38(const std::string& config_json_path, const std::string& model_path_hint,
-                            bool is_moe) {
-  if (path_looks_qwen38(config_json_path) || path_looks_qwen38(model_path_hint)) return true;
-  if (path_looks_qwen36(config_json_path) || path_looks_qwen36(model_path_hint)) return false;
-  if (is_moe) return false;  // unnamed MoE → 3.6 MoE entry
-
-  std::ifstream in(config_json_path);
-  if (!in) return false;
-  nlohmann::json root;
-  try {
-    in >> root;
-  } catch (...) {
-    return false;
-  }
-  const auto& tc = root.contains("text_config") ? root["text_config"] : root;
-  const int H = tc.value("hidden_size", 0);
-  const int L = tc.value("num_hidden_layers", 0);
-  // 3.8-27B dense: hidden=5120 layers=64; keep clear of 3.5-4B (2560/32).
-  return H >= 4096 || L >= 48;
-}
-
-}  // namespace
-
 int main(int argc, char** argv) {
-  std::string cfg_path = "configs/engine_int4.yaml";
+  std::string cfg_path = "configs/engine_int4_qwen3_6a3b.yaml";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
     else if (!std::strcmp(argv[i], "--help")) {
-      std::printf("usage: llmoc_server_int4 --config configs/engine_int4.yaml\n");
+      std::printf("usage: llmoc_server_int4_moe --config configs/engine_int4_qwen3_6a3b.yaml\n");
+      std::printf("  INT4 MoE only. Dense QLWC → llmoc_server_int4\n");
       std::printf("  modes: pure_cpu | hybrid_gpu | pure_gpu | auto | layer_stream\n");
       return 0;
     }
   }
   try {
+    using namespace llmoc::server::int4_detect;
     llmoc::log::init(nullptr);
     auto cfg = llmoc::EngineConfig::load(cfg_path);
     const std::string tok_dir = cfg.resolve_tokenizer_dir();
@@ -123,7 +57,6 @@ int main(int argc, char** argv) {
     } else if (req == llmoc::sched::ExecMode::kAuto) {
       const bool cuda_ok = llmoc::hal::cuda::probe_available();
       mode = llmoc::sched::resolve_mode(req, cuda_ok, &degraded, &mode_err);
-      // S4：CPU 且权重大于 DRAM 热区预算 → 层流式（可运行优先）
       if (cfg.auto_layer_stream && mode == llmoc::sched::ExecMode::kPureCpu && weight_bytes > 0 &&
           dram_budget > 0 && weight_bytes > dram_budget) {
         mode = llmoc::sched::ExecMode::kLayerStream;
@@ -146,7 +79,7 @@ int main(int argc, char** argv) {
         std::string mesh_err;
         if (!llmoc::sched::resolve_mesh_for_mode(mode, cfg.mesh_spec(),
                                                  llmoc::hal::cuda::device_count(),
-                                                 llmoc::exec::nccl_available(), false, &mesh,
+                                                 llmoc::exec::nccl_available(), true, &mesh,
                                                  &mesh_err)) {
           throw std::runtime_error(mesh_err.empty() ? "device mesh resolve failed" : mesh_err);
         }
@@ -160,13 +93,13 @@ int main(int argc, char** argv) {
 
         double vram_gb = cfg.gpu_vram_gb > 0 ? cfg.gpu_vram_gb : 8.0;
         size_t want = static_cast<size_t>(vram_gb * (1ull << 30));
-        // Cap by device free VRAM so yaml 20GiB on an 8GiB card does not over-promise.
         size_t free_b = 0, total_b = 0;
-        if (llmoc::hal::cuda::device_mem_info(&free_b, &total_b) && free_b > 0) {
-          const size_t cap = free_b > (512ull << 20) ? free_b - (512ull << 20) : free_b;
+        if (llmoc::hal::cuda::device_mem_info(&free_b, &total_b) && total_b > 0) {
+          const size_t margin = 512ull << 20;
+          const size_t cap = total_b > margin ? total_b - margin : total_b;
           if (want > cap) {
-            LOG_INFO("vram budget clamp: config=%.2fGiB → device_free=%.2fGiB (total=%.2fGiB)",
-                     vram_gb, cap / double(1ull << 30), total_b / double(1ull << 30));
+            LOG_INFO("vram budget clamp: config=%.2fGiB → device_total-margin=%.2fGiB (free=%.2fGiB)",
+                     vram_gb, cap / double(1ull << 30), free_b / double(1ull << 30));
             want = cap;
           }
         }
@@ -179,7 +112,7 @@ int main(int argc, char** argv) {
     }
 
     llmoc::tune_openmp_for_decode();
-    LOG_INFO("[int4] mode=%s model=%s tokenizer=%s port=%d max_seq=%d",
+    LOG_INFO("[int4-moe] mode=%s model=%s tokenizer=%s port=%d max_seq=%d",
              llmoc::sched::mode_name(mode), cfg.model_path.c_str(), tok_dir.c_str(),
              cfg.server_port, cfg.max_seq);
 
@@ -214,11 +147,9 @@ int main(int argc, char** argv) {
       LOG_INFO("layer_stream: window=%d device=%s loaded_bootstrap", lsc.window_layers,
                lsc.device.c_str());
     } else {
-      // MoE / 大 QLWC：全量 open 会把全部专家读进 DRAM（可卡数分钟且无日志）。
-      // >4GiB 默认 lazy：只装目录 + 非 layers.*；专家按需 ensure。
       llmoc::qlwc::OpenOptions oopt;
       oopt.lazy = weight_bytes > (4ull << 30);
-      LOG_INFO("qlwc open: %s (%.2f GiB, lazy=%d) — MoE may take a while on first decode",
+      LOG_INFO("qlwc open: %s (%.2f GiB, lazy=%d) — MoE experts fill on demand",
                cfg.model_path.c_str(), weight_bytes / (1024.0 * 1024.0 * 1024.0),
                oopt.lazy ? 1 : 0);
       store.open(cfg.model_path, oopt);
@@ -232,27 +163,19 @@ int main(int argc, char** argv) {
     tok.load(tok_dir + "/tokenizer.json");
 
     const std::string cfg_json = tok_dir + "/config.json";
-    bool want_moe = hf_config_looks_moe(cfg_json);
-    if (!want_moe && store_ptr) {
-      // Some AWQ dumps omit num_experts in config.json
-      want_moe = store_ptr->has("language_model.layers.0.mlp.experts.0.gate_proj.weight") ||
-                 store_ptr->has("language_model.layers.0.mlp.gate.weight") ||
-                 store_ptr->has("layers.0.mlp.experts.0.gate_proj.weight");
+    const bool want_moe = hf_config_looks_moe(cfg_json) || store_looks_moe(store_ptr);
+    if (!want_moe) {
+      throw std::runtime_error(
+          "Dense INT4/QLWC detected. Use llmoc_server_int4 instead of llmoc_server_int4_moe.");
     }
-    const bool want_38 = hf_config_looks_qwen38(cfg_json, cfg.model_path, want_moe);
-    std::unique_ptr<llmoc::model::Qwen35Int4Model> model_holder;
-    if (want_moe && want_38) {
+    const bool want_38 = hf_config_looks_qwen38(cfg_json, cfg.model_path, /*is_moe=*/true);
+    std::unique_ptr<llmoc::model::Qwen36MoeInt4Model> model_holder;
+    if (want_38) {
       model_holder = std::make_unique<llmoc::model::Qwen38MoeInt4Model>();
       LOG_INFO("INT4 model class=Qwen38MoeInt4Model (3.8 MoE)");
-    } else if (want_moe) {
+    } else {
       model_holder = std::make_unique<llmoc::model::Qwen36MoeInt4Model>();
       LOG_INFO("INT4 model class=Qwen36MoeInt4Model (3.6 MoE)");
-    } else if (want_38) {
-      model_holder = std::make_unique<llmoc::model::Qwen38Int4Model>();
-      LOG_INFO("INT4 model class=Qwen38Int4Model (3.8 dense)");
-    } else {
-      model_holder = std::make_unique<llmoc::model::Qwen35Int4Model>();
-      LOG_INFO("INT4 model class=Qwen35Int4Model (3.5 dense)");
     }
     auto& model = *model_holder;
     model.load(store_ptr, cfg_json);
@@ -260,10 +183,8 @@ int main(int argc, char** argv) {
       model.enable_layer_stream(streamer.get());
     }
 
-    // FreeToken-isomorphic MoE offload: fill host banks first (no cudaHostRegister yet).
-    auto* moe36 = dynamic_cast<llmoc::model::Qwen36MoeInt4Model*>(&model);
     size_t moe_reserve = 0;
-    if (moe36 && !use_stream) {
+    if (!use_stream) {
       llmoc::model::MoeOffloadRuntimeConfig mcfg;
       mcfg.backend = cfg.moe_backend;
       mcfg.cache_slots = cfg.moe_cache_slots;
@@ -272,8 +193,8 @@ int main(int argc, char** argv) {
       mcfg.hybrid_fetch_frac = cfg.moe_hybrid_fetch_frac;
       mcfg.dram_hot_gb = cfg.dram_hot_gb;
       const size_t bud0 = llmoc::hal::cuda::enabled() ? llmoc::hal::cuda::vram_budget() : 0;
-      moe36->init_moe_offload(mcfg);
-      moe_reserve = moe36->moe_slot_reserve_bytes();
+      model.init_moe_offload(mcfg);
+      moe_reserve = model.moe_slot_reserve_bytes();
       if (llmoc::hal::cuda::enabled() && moe_reserve > 0 && bud0 > moe_reserve) {
         llmoc::hal::cuda::set_vram_budget(bud0 - moe_reserve);
         LOG_INFO("moe-first VRAM: reserve=%.2fGiB attn_budget=%.2fGiB (of %.2fGiB)",
@@ -284,8 +205,8 @@ int main(int argc, char** argv) {
 
     if (llmoc::hal::cuda::enabled() && !use_stream) {
       LOG_INFO("warm_gpu_int4: pinning attn/shared/router (experts stay LRU)…");
-      model.warm_gpu_int4_weights();
-      // Restore full budget so expert slot H2D can use the MoE reserve.
+      int warm_ok = 0, warm_fail = 0;
+      model.warm_gpu_int4_weights(&warm_ok, &warm_fail);
       if (moe_reserve > 0) {
         const size_t cur = llmoc::hal::cuda::vram_budget();
         llmoc::hal::cuda::set_vram_budget(cur + moe_reserve);
@@ -294,31 +215,31 @@ int main(int argc, char** argv) {
       const double need_g = need / double(1ull << 30);
       const double used_g = llmoc::hal::cuda::vram_used() / double(1ull << 30);
       const double bud_g = llmoc::hal::cuda::vram_budget() / double(1ull << 30);
-      if (llmoc::hal::cuda::try_enable_resident_gpu(need)) {
+      const bool warm_healthy = warm_ok > 0 && warm_ok >= warm_fail;
+      if (warm_healthy && llmoc::hal::cuda::try_enable_resident_gpu(need)) {
         model.enable_resident_gpu(true);
-        LOG_INFO("resident_gpu=ON need=%.2fGiB used=%.2fGiB budget=%.2fGiB", need_g,
-                 llmoc::hal::cuda::vram_used() / double(1ull << 30), bud_g);
+        LOG_INFO("resident_gpu=ON need=%.2fGiB used=%.2fGiB budget=%.2fGiB warm_ok=%d fail=%d",
+                 need_g, llmoc::hal::cuda::vram_used() / double(1ull << 30), bud_g, warm_ok,
+                 warm_fail);
       } else {
-        LOG_INFO("resident_gpu=OFF need=%.2fGiB used=%.2fGiB budget=%.2fGiB jit=%d (%s)", need_g,
-                 used_g, bud_g, llmoc::hal::cuda::jit_available() ? 1 : 0,
-                 llmoc::hal::cuda::status());
+        model.enable_resident_gpu(false);
+        LOG_INFO("resident_gpu=OFF need=%.2fGiB used=%.2fGiB budget=%.2fGiB jit=%d warm_ok=%d "
+                 "fail=%d (%s)",
+                 need_g, used_g, bud_g, llmoc::hal::cuda::jit_available() ? 1 : 0, warm_ok,
+                 warm_fail, llmoc::hal::cuda::status());
       }
     }
 
-    // cudaHostRegister AFTER attn warm — capped so WDDM pin quota does not kill cudaMalloc/JIT.
-    if (moe36 && !use_stream) {
-      moe36->pin_moe_host_banks();
+    if (!use_stream) {
+      model.pin_moe_host_banks();
     }
 
-    // 预热（MoE+offload：专家已在 host banks；首次仅 H2D top-k）
     {
       LOG_INFO("int4 warmup starting…");
-      if (moe36) {
-        if (moe36->moe_offload_ready()) {
-          LOG_INFO("moe offload ready: slots=%d host_pin path active", moe36->moe_cache_slots());
-        } else {
-          LOG_INFO("moe: legacy ensure path (host banks not ready)");
-        }
+      if (model.moe_offload_ready()) {
+        LOG_INFO("moe offload ready: slots=%d host_pin path active", model.moe_cache_slots());
+      } else {
+        LOG_INFO("moe: legacy ensure path (host banks not ready)");
       }
       llmoc::model::SessionCache wc;
       model.init_cache(wc, 256);
@@ -354,7 +275,7 @@ int main(int argc, char** argv) {
     api.listen();
     return 0;
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "FATAL[int4]: %s\n", e.what());
+    std::fprintf(stderr, "FATAL[int4-moe]: %s\n", e.what());
     return 1;
   }
 }

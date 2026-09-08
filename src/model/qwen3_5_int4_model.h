@@ -55,7 +55,8 @@ class Qwen35Int4Model : public ICausalLM {
   void enable_layer_stream(wt::ILayerStreamLoader* loader);
   bool layer_stream_enabled() const { return streamer_ != nullptr; }
   // hybrid/pure_gpu：将层投影 INT4 反量化上传 VRAM（跳过 embed/lm_head）
-  void warm_gpu_int4_weights();
+  // Returns pinned/prefetch ok & fail counts (for resident_gpu gating).
+  void warm_gpu_int4_weights(int* out_ok = nullptr, int* out_fail = nullptr);
   // Estimate GDN states + scratch for auto resident-GPU probe (after warm).
   size_t resident_workspace_bytes() const;
   void enable_resident_gpu(bool on);

@@ -5,7 +5,8 @@
 
 TINY_TEST(FamilyStub, DsForwardSynthetic) {
   llmoc::families::deepseek::DsStubModel m;
-  m.load_synthetic({}, llmoc::contracts::ExecMode::kPureCpu);
+  m.load_synthetic({}, llmoc::contracts::ExecMode::kPureCpu,
+                   llmoc::families::deepseek::ExpertQuant::kNvfp4);
   llmoc::model::SessionCache cache;
   m.init_cache(cache, 64);
   std::vector<float> logits;

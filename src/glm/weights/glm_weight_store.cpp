@@ -1,5 +1,6 @@
 // llm-on-cpu :: glm/weights/glm_weight_store.cpp
 #include "glm/weights/glm_weight_store.h"
+#include "glm/glm_config.h"
 
 #include <cstring>
 #include <fstream>
@@ -83,7 +84,6 @@ void GlmWeightStore::close() {
 
 void GlmWeightStore::open(const std::string& path, QuantKind expect) {
   close();
-  (void)expect;
 
   // Prefer mmap so NVFP4/AWQ MoE packs (tens–100+ GiB) do not need full RAM.
   bool mapped = false;
@@ -161,6 +161,13 @@ void GlmWeightStore::open(const std::string& path, QuantKind expect) {
   if (q == GlmqQuant::kAwqInt4) quant_ = QuantKind::kAwqInt4;
   else if (q == GlmqQuant::kNvfp4) quant_ = QuantKind::kNvfp4;
   else quant_ = QuantKind::kBf16;
+
+  if (quant_ != expect) {
+    throw std::runtime_error(std::string("glm: weight quant mismatch: file=") +
+                             GlmEngineConfig::quant_name(quant_) + " expect=" +
+                             GlmEngineConfig::quant_name(expect) +
+                             " (use matching llmoc_server_glm_* binary)");
+  }
 
   uint32_t gs = 0;
   std::memcpy(&gs, hdr_.reserved, 4);

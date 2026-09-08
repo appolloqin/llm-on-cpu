@@ -9,8 +9,9 @@
 #include <stdexcept>
 
 #include "common/log.h"
-#include "hal/cuda_backend.h"
+#include "glm/hal/glm_awq_int4_ops.h"
 #include "glm/hal/glm_nvfp4_ops.h"
+#include "hal/cuda_backend.h"
 
 namespace llmoc::families::deepseek {
 namespace {
@@ -39,6 +40,43 @@ void rmsnorm_f(const float* x, const uint16_t* w, float* y, int n) {
   }
 }
 
+void pack_bf16_exp(DsStubModel::ExpW& e, int M, int K) {
+  e.M = M;
+  e.K = K;
+  fill_bf16(e.bf16, static_cast<size_t>(M) * K, 0.01f);
+}
+
+void pack_awq(DsStubModel::ExpW& e, int M, int K) {
+  e.M = M;
+  e.K = K;
+  const int gs = 128;
+  const int ng = (K + gs - 1) / gs;
+  e.q.assign(static_cast<size_t>(M) * ((K + 1) / 2), 0x77);
+  e.scales_u16.assign(static_cast<size_t>(M) * ng, f32_to_bf16(0.02f));
+  e.scales_f32.assign(static_cast<size_t>(M) * ng, 0.02f);
+  e.awq.qweight = e.q.data();
+  e.awq.scales = e.scales_u16.data();
+  e.awq.scales_f32 = e.scales_f32.data();
+  e.awq.M = M;
+  e.awq.K = K;
+  e.awq.group_size = gs;
+}
+
+void pack_nv(DsStubModel::ExpW& e, int M, int K) {
+  e.M = M;
+  e.K = K;
+  e.q.assign(static_cast<size_t>(M) * ((K + 1) / 2), 0x12);
+  const int gs = 16;
+  const int ng = (K + gs - 1) / gs;
+  e.scales_fp8.assign(static_cast<size_t>(M) * ng, 0x38);
+  e.nv.qweight = e.q.data();
+  e.nv.scales_fp8 = e.scales_fp8.data();
+  e.nv.global_scale = 0.05f;
+  e.nv.M = M;
+  e.nv.K = K;
+  e.nv.group_size = gs;
+}
+
 }  // namespace
 
 void DsStubModel::gemm_bf16(const float* x, const uint16_t* W, float* y, int M, int K) {
@@ -56,9 +94,21 @@ void DsStubModel::gemm_bf16(const float* x, const uint16_t* W, float* y, int M, 
   }
 }
 
-void DsStubModel::gemm_nv(const float* x, const hal::Nvfp4View& W, float* y) {
-  if (use_gpu_ && hal::cuda::try_gemm_nvfp4(x, W, y)) return;
-  glm::hal::gemm_nvfp4(x, W, y);
+void DsStubModel::gemm_expert(const float* x, const ExpW& W, float* y) {
+  switch (expert_q_) {
+    case ExpertQuant::kBf16:
+      gemm_bf16(x, W.bf16.data(), y, W.M, W.K);
+      break;
+    case ExpertQuant::kAwqInt4:
+      if (use_gpu_ && hal::cuda::try_gemm_awq(x, W.awq, y)) return;
+      glm::hal::gemm_awq_int4(x, W.awq, y);
+      break;
+    case ExpertQuant::kNvfp4:
+    default:
+      if (use_gpu_ && hal::cuda::try_gemm_nvfp4(x, W.nv, y)) return;
+      glm::hal::gemm_nvfp4(x, W.nv, y);
+      break;
+  }
 }
 
 void DsStubModel::finish_load(contracts::ExecMode mode) {
@@ -69,27 +119,16 @@ void DsStubModel::finish_load(contracts::ExecMode mode) {
   meta_.n_kv = 1;
   meta_.head_dim = g_.d_latent;
   meta_.is_moe = true;
-  meta_.kind = "deepseek_v4_stub";
+  meta_.kind = std::string("deepseek_v4_stub_") + expert_quant_name(expert_q_);
   use_gpu_ = false;
-  LOG_INFO("DsStub: H=%d L=%d V=%d E=%d topk=%d d_c=%d mode=%s", g_.hidden, g_.layers, g_.vocab,
-           g_.n_experts, g_.top_k, g_.d_latent, contracts::mode_name(mode_));
+  LOG_INFO("DsStub: H=%d L=%d V=%d E=%d topk=%d d_c=%d expert_q=%s mode=%s", g_.hidden, g_.layers,
+           g_.vocab, g_.n_experts, g_.top_k, g_.d_latent, expert_quant_name(expert_q_),
+           contracts::mode_name(mode_));
 }
 
-static void pack_nv(DsStubModel::ExpW& e, int M, int K) {
-  e.q.assign(static_cast<size_t>(M) * ((K + 1) / 2), 0x12);
-  const int gs = 16;
-  const int ng = (K + gs - 1) / gs;
-  e.scales.assign(static_cast<size_t>(M) * ng, 0x38);
-  e.view.qweight = e.q.data();
-  e.view.scales_fp8 = e.scales.data();
-  e.view.global_scale = 0.05f;
-  e.view.M = M;
-  e.view.K = K;
-  e.view.group_size = gs;
-}
-
-void DsStubModel::load_synthetic(DsStubGeometry g, contracts::ExecMode mode) {
+void DsStubModel::load_synthetic(DsStubGeometry g, contracts::ExecMode mode, ExpertQuant expert_q) {
   g_ = g;
+  expert_q_ = expert_q;
   const int H = g_.hidden, V = g_.vocab, L = g_.layers, E = g_.n_experts;
   const int dc = g_.d_latent, I = g_.intermediate;
   fill_bf16(embed_, static_cast<size_t>(V) * H, 0.02f);
@@ -110,15 +149,30 @@ void DsStubModel::load_synthetic(DsStubGeometry g, contracts::ExecMode mode) {
     fill_bf16(w_out_[l], static_cast<size_t>(H) * dc, 0.01f);
     fill_bf16(w_gate_[l], static_cast<size_t>(E) * H, 0.01f);
     for (int e = 0; e < E; ++e) {
-      pack_nv(exp_gate_[l][e], I, H);
-      pack_nv(exp_up_[l][e], I, H);
-      pack_nv(exp_down_[l][e], H, I);
+      switch (expert_q_) {
+        case ExpertQuant::kBf16:
+          pack_bf16_exp(exp_gate_[l][e], I, H);
+          pack_bf16_exp(exp_up_[l][e], I, H);
+          pack_bf16_exp(exp_down_[l][e], H, I);
+          break;
+        case ExpertQuant::kAwqInt4:
+          pack_awq(exp_gate_[l][e], I, H);
+          pack_awq(exp_up_[l][e], I, H);
+          pack_awq(exp_down_[l][e], H, I);
+          break;
+        case ExpertQuant::kNvfp4:
+        default:
+          pack_nv(exp_gate_[l][e], I, H);
+          pack_nv(exp_up_[l][e], I, H);
+          pack_nv(exp_down_[l][e], H, I);
+          break;
+      }
     }
   }
   finish_load(mode);
 }
 
-void DsStubModel::load_file(const std::string& path, contracts::ExecMode mode) {
+void DsStubModel::load_file(const std::string& path, contracts::ExecMode mode, ExpertQuant expert_q) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("ds stub open failed: " + path);
   char magic[4];
@@ -136,8 +190,9 @@ void DsStubModel::load_file(const std::string& path, contracts::ExecMode mode) {
   in.read(reinterpret_cast<char*>(&g.d_latent), 4);
   in.read(reinterpret_cast<char*>(&g.intermediate), 4);
   (void)ver;
-  load_synthetic(g, mode);
-  LOG_INFO("DsStub: loaded header from %s (synthetic fill)", path.c_str());
+  load_synthetic(g, mode, expert_q);
+  LOG_INFO("DsStub: loaded header from %s (synthetic fill, expert_q=%s)", path.c_str(),
+           expert_quant_name(expert_q));
 }
 
 void DsStubModel::warm_gpu_weights() {
@@ -152,9 +207,30 @@ void DsStubModel::warm_gpu_weights() {
     if (hal::cuda::prefetch_w16(w_gate_[l].data(), E, H, false)) ++n;
     if (mode_ == contracts::ExecMode::kPureGpu) {
       for (int e = 0; e < E; ++e) {
-        if (hal::cuda::prefetch_nvfp4_weight(exp_gate_[l][e].view)) ++n;
-        if (hal::cuda::prefetch_nvfp4_weight(exp_up_[l][e].view)) ++n;
-        if (hal::cuda::prefetch_nvfp4_weight(exp_down_[l][e].view)) ++n;
+        switch (expert_q_) {
+          case ExpertQuant::kBf16:
+            if (hal::cuda::prefetch_w16(exp_gate_[l][e].bf16.data(), exp_gate_[l][e].M,
+                                        exp_gate_[l][e].K, false))
+              ++n;
+            if (hal::cuda::prefetch_w16(exp_up_[l][e].bf16.data(), exp_up_[l][e].M,
+                                        exp_up_[l][e].K, false))
+              ++n;
+            if (hal::cuda::prefetch_w16(exp_down_[l][e].bf16.data(), exp_down_[l][e].M,
+                                        exp_down_[l][e].K, false))
+              ++n;
+            break;
+          case ExpertQuant::kAwqInt4:
+            if (hal::cuda::prefetch_awq_weight(exp_gate_[l][e].awq)) ++n;
+            if (hal::cuda::prefetch_awq_weight(exp_up_[l][e].awq)) ++n;
+            if (hal::cuda::prefetch_awq_weight(exp_down_[l][e].awq)) ++n;
+            break;
+          case ExpertQuant::kNvfp4:
+          default:
+            if (hal::cuda::prefetch_nvfp4_weight(exp_gate_[l][e].nv)) ++n;
+            if (hal::cuda::prefetch_nvfp4_weight(exp_up_[l][e].nv)) ++n;
+            if (hal::cuda::prefetch_nvfp4_weight(exp_down_[l][e].nv)) ++n;
+            break;
+        }
       }
     }
   }
@@ -183,7 +259,6 @@ void DsStubModel::forward(const std::vector<int32_t>& tokens, model::SessionCach
       uint32_t u = static_cast<uint32_t>(embed_[static_cast<size_t>(tok) * H + i]) << 16;
       std::memcpy(&h[i], &u, 4);
     }
-    // use layer0 seq as global pos
     const int pos = cache.layer(0).seq;
     for (int L = 0; L < g_.layers; ++L) {
       auto& Lkv = cache.layer(L);
@@ -219,13 +294,13 @@ void DsStubModel::forward(const std::vector<int32_t>& tokens, model::SessionCach
       for (int i = 0; i < g_.top_k; ++i) {
         const int e = idx[i];
         const float ww = std::exp(gate[e]) / (wsum > 0 ? wsum : 1.f);
-        gemm_nv(n2.data(), exp_gate_[L][e].view, eg.data());
-        gemm_nv(n2.data(), exp_up_[L][e].view, eu.data());
+        gemm_expert(n2.data(), exp_gate_[L][e], eg.data());
+        gemm_expert(n2.data(), exp_up_[L][e], eu.data());
         for (int j = 0; j < I; ++j) {
           const float silu = eg[j] / (1.f + std::exp(-eg[j]));
           mid[j] = silu * eu[j];
         }
-        gemm_nv(mid.data(), exp_down_[L][e].view, down.data());
+        gemm_expert(mid.data(), exp_down_[L][e], down.data());
         for (int j = 0; j < H; ++j) acc[j] += ww * down[j];
       }
       for (int i = 0; i < H; ++i) h[i] += acc[i];

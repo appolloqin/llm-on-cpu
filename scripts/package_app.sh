@@ -25,10 +25,18 @@ mkdir -p "${STAGE}/bin" "${STAGE}/configs" "${STAGE}/docs" "${STAGE}/tools" "${S
 
 BINS=(
   llmoc_server
+  llmoc_server_moe
   llmoc_server_int4
-  llmoc_server_glm
-  llmoc_server_ds
-  llmoc_server_kimi
+  llmoc_server_int4_moe
+  llmoc_server_glm_bf16
+  llmoc_server_glm_int4
+  llmoc_server_glm_nvfp4
+  llmoc_server_ds_bf16
+  llmoc_server_ds_int4
+  llmoc_server_ds_nvfp4
+  llmoc_server_kimi_bf16
+  llmoc_server_kimi_int4
+  llmoc_server_kimi_nvfp4
   make_fake_glmq
   make_fake_ds
   make_fake_kimi
@@ -46,15 +54,15 @@ for b in "${BINS[@]}"; do
   if [[ -f "${BIN_DIR}/${b}.exe" ]]; then
     cp "${BIN_DIR}/${b}.exe" "${STAGE}/bin/"
     copied=$((copied + 1))
-    [[ "$b" == "llmoc_server_glm" ]] && have_glm=1
-    [[ "$b" == "llmoc_server_ds" ]] && have_ds=1
-    [[ "$b" == "llmoc_server_kimi" ]] && have_kimi=1
+    [[ "$b" == llmoc_server_glm_* ]] && have_glm=1
+    [[ "$b" == llmoc_server_ds_* ]] && have_ds=1
+    [[ "$b" == llmoc_server_kimi_* ]] && have_kimi=1
   elif [[ -f "${BIN_DIR}/${b}" ]]; then
     cp "${BIN_DIR}/${b}" "${STAGE}/bin/"
     copied=$((copied + 1))
-    [[ "$b" == "llmoc_server_glm" ]] && have_glm=1
-    [[ "$b" == "llmoc_server_ds" ]] && have_ds=1
-    [[ "$b" == "llmoc_server_kimi" ]] && have_kimi=1
+    [[ "$b" == llmoc_server_glm_* ]] && have_glm=1
+    [[ "$b" == llmoc_server_ds_* ]] && have_ds=1
+    [[ "$b" == llmoc_server_kimi_* ]] && have_kimi=1
   else
     echo "WARN: missing ${BIN_DIR}/${b}[.exe]" >&2
   fi
@@ -64,21 +72,23 @@ if [[ "$copied" -lt 2 ]]; then
   exit 1
 fi
 if [[ "$have_glm" -eq 0 ]]; then
-  echo "ERROR: llmoc_server_glm missing under ${BIN_DIR} (GLM must be in the app package)" >&2
+  echo "ERROR: llmoc_server_glm_* missing under ${BIN_DIR} (GLM must be in the app package)" >&2
   exit 1
 fi
 if [[ "$have_ds" -eq 0 || "$have_kimi" -eq 0 ]]; then
-  echo "ERROR: llmoc_server_ds / llmoc_server_kimi missing under ${BIN_DIR}" >&2
+  echo "ERROR: llmoc_server_ds_* / llmoc_server_kimi_* missing under ${BIN_DIR}" >&2
   exit 1
 fi
 
-cp configs/engine.yaml configs/engine_int4.yaml \
-   configs/engine_glm_int4.yaml configs/engine_glm_nvfp4.yaml \
-   configs/engine_ds_nvfp4.yaml configs/engine_kimi_hybrid.yaml \
+cp configs/engine.yaml configs/engine_moe.yaml \
+   configs/engine_int4.yaml configs/engine_int4_qwen3_6a3b.yaml \
+   configs/engine_glm_bf16.yaml configs/engine_glm_int4.yaml configs/engine_glm_nvfp4.yaml \
+   configs/engine_ds_bf16.yaml configs/engine_ds_int4.yaml configs/engine_ds_nvfp4.yaml \
+   configs/engine_kimi_bf16.yaml configs/engine_kimi_int4.yaml configs/engine_kimi_nvfp4.yaml \
    "${STAGE}/configs/"
 [[ -f configs/engine_int4_mtp.yaml ]] && cp configs/engine_int4_mtp.yaml "${STAGE}/configs/"
-[[ -f configs/engine_int4_qwen3_6a3b.yaml ]] && cp configs/engine_int4_qwen3_6a3b.yaml "${STAGE}/configs/"
 [[ -f configs/engine_int4_hybrid.yaml ]] && cp configs/engine_int4_hybrid.yaml "${STAGE}/configs/"
+[[ -f configs/engine_kimi_hybrid.yaml ]] && cp configs/engine_kimi_hybrid.yaml "${STAGE}/configs/"
 cp README.md "${STAGE}/"
 [[ -f README.en.md ]] && cp README.en.md "${STAGE}/"
 [[ -f docs/USAGE.md ]] && cp docs/USAGE.md "${STAGE}/docs/"

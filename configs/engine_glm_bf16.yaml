@@ -1,0 +1,26 @@
+# GLM-5.3-Flash — BF16 MoE（llmoc_server_glm_bf16）
+model:
+  path: models/GLM-5.3-Flash.bf16.glmq
+  dtype: bf16
+  arch: glm53_flash
+  tokenizer_dir: models/GLM-5.3-Flash-hf
+
+mode: pure_cpu
+quant: bf16
+
+tiers:
+  dram_hot_gb: 48
+  gpu_vram_gb: 20
+  kv_pool_gb: 2
+  prefetch_buf_gb: 4
+
+decode:
+  max_seq: 16384
+  max_new_tokens: 2048
+
+io:
+  workers: 4
+
+server:
+  port: 15085
+  api_key_env: LLMOC_API_KEY

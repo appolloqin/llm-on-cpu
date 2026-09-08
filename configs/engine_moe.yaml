@@ -1,0 +1,25 @@
+# llm-on-cpu BF16 MoE entry (llmoc_server_moe)
+# Dense BF16 → configs/engine.yaml + llmoc_server
+
+model:
+  path: models/Qwen3.5-MoE.lwc
+  dtype: bf16
+  mtp: false
+
+mode: pure_cpu
+
+tiers:
+  dram_hot_gb: 32
+  kv_pool_gb: 2
+  prefetch_buf_gb: 1
+  # gpu_vram_gb: 8
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  max_seq: 16384
+
+io:
+  workers: 4
+
+# has_moe_hint: true

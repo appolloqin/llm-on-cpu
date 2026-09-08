@@ -178,18 +178,28 @@ if(WIN32)
   target_link_libraries(llmoc_server_lib PUBLIC ws2_32)
 endif()
 
+# ---------- BF16/LWC：dense / MoE 分入口 ----------
 add_executable(llmoc_server src/server/main.cpp)
 target_link_libraries(llmoc_server PRIVATE llmoc_server_lib)
 
-# ---------- INT4/QLWC 路径（独立可执行文件，不改 BF16 llmoc_server） ----------
+add_executable(llmoc_server_moe src/server/main_moe.cpp)
+target_link_libraries(llmoc_server_moe PRIVATE llmoc_server_lib)
+
+# ---------- INT4/QLWC：dense / MoE 分入口 ----------
 add_executable(llmoc_server_int4
-  src/server/main_int4.cpp
+  src/server/main_int4_dense.cpp
   src/model/qwen3_5_int4_model.cpp
-  src/model/qwen3_6_moe_int4_model.cpp
   src/model/qwen3_8_int4_model.cpp
-  src/model/qwen3_8_moe_int4_model.cpp
 )
 target_link_libraries(llmoc_server_int4 PRIVATE llmoc_server_lib)
+
+add_executable(llmoc_server_int4_moe
+  src/server/main_int4_moe.cpp
+  src/model/qwen3_5_int4_model.cpp
+  src/model/qwen3_6_moe_int4_model.cpp
+  src/model/qwen3_8_moe_int4_model.cpp
+)
+target_link_libraries(llmoc_server_int4_moe PRIVATE llmoc_server_lib)
 
 # ---------- 单元测试 ----------
 add_executable(llmoc_unit_tests
@@ -278,13 +288,18 @@ else()
   message(STATUS "GLM CUDA: runtime dynamic cudart/cublas (no nvcc required)")
 endif()
 
-add_executable(llmoc_server_glm src/server/main_glm.cpp)
-target_link_libraries(llmoc_server_glm PRIVATE llmoc_glm llmoc_server_lib)
+# ---------- GLM MoE：bf16 / int4 / nvfp4 分入口 ----------
+add_executable(llmoc_server_glm_bf16 src/server/main_glm_bf16.cpp)
+target_link_libraries(llmoc_server_glm_bf16 PRIVATE llmoc_glm llmoc_server_lib)
+add_executable(llmoc_server_glm_int4 src/server/main_glm_int4.cpp)
+target_link_libraries(llmoc_server_glm_int4 PRIVATE llmoc_glm llmoc_server_lib)
+add_executable(llmoc_server_glm_nvfp4 src/server/main_glm_nvfp4.cpp)
+target_link_libraries(llmoc_server_glm_nvfp4 PRIVATE llmoc_glm llmoc_server_lib)
 
 add_executable(make_fake_glmq tools/glm/make_fake_glmq.cpp)
 target_link_libraries(make_fake_glmq PRIVATE llmoc_glm)
 
-# ---------- DeepSeek / Kimi stubs ----------
+# ---------- DeepSeek / Kimi MoE stubs：bf16 / int4 / nvfp4 分入口 ----------
 add_library(llmoc_family_stubs STATIC
   src/families/deepseek_v4/ds_stub_model.cpp
   src/families/kimi_k3/kimi_stub_model.cpp
@@ -292,11 +307,19 @@ add_library(llmoc_family_stubs STATIC
 target_include_directories(llmoc_family_stubs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(llmoc_family_stubs PUBLIC llmoc_weights llmoc_model llmoc_glm)
 
-add_executable(llmoc_server_ds src/server/main_ds.cpp)
-target_link_libraries(llmoc_server_ds PRIVATE llmoc_family_stubs llmoc_server_lib)
+add_executable(llmoc_server_ds_bf16 src/server/main_ds_bf16.cpp)
+target_link_libraries(llmoc_server_ds_bf16 PRIVATE llmoc_family_stubs llmoc_server_lib)
+add_executable(llmoc_server_ds_int4 src/server/main_ds_int4.cpp)
+target_link_libraries(llmoc_server_ds_int4 PRIVATE llmoc_family_stubs llmoc_server_lib)
+add_executable(llmoc_server_ds_nvfp4 src/server/main_ds_nvfp4.cpp)
+target_link_libraries(llmoc_server_ds_nvfp4 PRIVATE llmoc_family_stubs llmoc_server_lib)
 
-add_executable(llmoc_server_kimi src/server/main_kimi.cpp)
-target_link_libraries(llmoc_server_kimi PRIVATE llmoc_family_stubs llmoc_server_lib)
+add_executable(llmoc_server_kimi_bf16 src/server/main_kimi_bf16.cpp)
+target_link_libraries(llmoc_server_kimi_bf16 PRIVATE llmoc_family_stubs llmoc_server_lib)
+add_executable(llmoc_server_kimi_int4 src/server/main_kimi_int4.cpp)
+target_link_libraries(llmoc_server_kimi_int4 PRIVATE llmoc_family_stubs llmoc_server_lib)
+add_executable(llmoc_server_kimi_nvfp4 src/server/main_kimi_nvfp4.cpp)
+target_link_libraries(llmoc_server_kimi_nvfp4 PRIVATE llmoc_family_stubs llmoc_server_lib)
 
 add_executable(make_fake_ds tools/make_fake_ds/main.cpp)
 target_link_libraries(make_fake_ds PRIVATE llmoc_family_stubs)

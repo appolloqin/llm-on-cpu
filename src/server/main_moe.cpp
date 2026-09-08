@@ -1,5 +1,5 @@
-// llm-on-cpu :: src/server/main.cpp
-// BF16/LWC dense-only entry. MoE weights → use llmoc_server_moe.
+// llm-on-cpu :: src/server/main_moe.cpp
+// BF16/LWC MoE-only entry. Dense weights → use llmoc_server.
 
 #include <algorithm>
 #include <cstdio>
@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/engine_config.h"
 #include "common/log.h"
@@ -15,12 +16,13 @@
 #include "exec/nccl_probe.h"
 #include "hal/cuda_backend.h"
 #include "model/generate.h"
-#include "model/qwen3_5_model.h"
+#include "model/moe_model.h"
 #include "model/tokenizer_hf.h"
 #include "sched/mode_controller.h"
 #include "sched/placement_planner.h"
 #include "sched/scheduler.h"
 #include "server/http_api.h"
+#include "weights/prefetch_pipeline.h"
 #include "weights/weight_manager.h"
 
 namespace {
@@ -32,12 +34,12 @@ uint64_t file_size_u64(const std::string& p) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string cfg_path = "configs/engine.yaml";
+  std::string cfg_path = "configs/engine_moe.yaml";
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
     else if (!std::strcmp(argv[i], "--help")) {
-      std::printf("usage: llmoc_server --config configs/engine.yaml\n");
-      std::printf("  BF16 dense only. MoE LWC → llmoc_server_moe\n");
+      std::printf("usage: llmoc_server_moe --config configs/engine_moe.yaml\n");
+      std::printf("  BF16 MoE only. Dense LWC → llmoc_server\n");
       std::printf("  modes: pure_cpu | hybrid_gpu | pure_gpu | auto | layer_stream\n");
       return 0;
     }
@@ -109,7 +111,7 @@ int main(int argc, char** argv) {
       std::string mesh_err;
       if (!llmoc::sched::resolve_mesh_for_mode(mode, cfg.mesh_spec(),
                                                cuda_ok ? llmoc::hal::cuda::device_count() : 0,
-                                               llmoc::exec::nccl_available(), false, &mesh,
+                                               llmoc::exec::nccl_available(), true, &mesh,
                                                &mesh_err)) {
         throw std::runtime_error(mesh_err.empty() ? "device mesh resolve failed" : mesh_err);
       }
@@ -138,7 +140,7 @@ int main(int argc, char** argv) {
         pcfg.strict_vram = cfg.strict_vram;
         pcfg.margin_bytes = static_cast<uint64_t>(cfg.margin_mb) << 20;
         llmoc::contracts::ActiveSetProfile ap;
-        ap.has_moe = false;
+        ap.has_moe = true;
         auto plan = llmoc::sched::PlacementPlanner::solve_active(mode, pcfg, mesh, ap);
         if (!plan.ok) throw std::runtime_error(plan.error);
         exec_backend->configure(plan);
@@ -152,7 +154,7 @@ int main(int argc, char** argv) {
     }
 
     llmoc::tune_openmp_for_decode();
-    LOG_INFO("[bf16-dense] mode=%s model=%s tokenizer=%s port=%d dram_hot=%.1fG gpu_vram=%.1fG",
+    LOG_INFO("[bf16-moe] mode=%s model=%s tokenizer=%s port=%d dram_hot=%.1fG gpu_vram=%.1fG",
              llmoc::sched::mode_name(mode), cfg.model_path.c_str(), tok_dir.c_str(),
              cfg.server_port, cfg.dram_hot_gb, cfg.gpu_vram_gb);
 
@@ -165,28 +167,55 @@ int main(int argc, char** argv) {
       if (cfg.layer_stream_max_window_mb)
         wcfg.lru_budget_bytes = cfg.layer_stream_max_window_mb * (1ull << 20);
       else
-        wcfg.lru_budget_bytes = std::max<uint64_t>(wcfg.lru_budget_bytes / 8, 256ull << 20);
+        wcfg.lru_budget_bytes =
+            std::max<uint64_t>(wcfg.lru_budget_bytes / 8, 256ull << 20);
       LOG_INFO("BF16 layer_stream: stream_dense_layers=1 lru_budget=%.1f MiB",
                wcfg.lru_budget_bytes / (1024.0 * 1024.0));
     }
     wm.open(cfg.model_path, wcfg);
 
-    if (!wm.header().groups.empty()) {
+    if (wm.header().groups.empty()) {
       throw std::runtime_error(
-          "MoE LWC detected (non-empty expert groups). Use llmoc_server_moe instead of "
-          "llmoc_server.");
+          "Dense LWC detected (no expert groups). Use llmoc_server instead of llmoc_server_moe.");
+    }
+
+    if ((mode == llmoc::sched::ExecMode::kHybridGpu || mode == llmoc::sched::ExecMode::kPureGpu)) {
+      std::vector<llmoc::sched::ExpertHint> hints;
+      for (const auto& g : wm.header().groups) {
+        llmoc::sched::ExpertHint h;
+        h.layer = static_cast<int>(g.layer);
+        h.expert = static_cast<int>(g.expert_id);
+        h.freq = 1.0;
+        h.bytes = 0;
+        for (const auto& tn : g.tensor_names) {
+          try {
+            h.bytes += wm.get(tn).size();
+          } catch (...) {
+          }
+        }
+        hints.push_back(h);
+      }
+      llmoc::sched::PlacementPlanner::Config pcfg;
+      pcfg.vram_bytes = llmoc::hal::cuda::vram_budget();
+      pcfg.dram_bytes = wcfg.lru_budget_bytes;
+      auto plan = llmoc::sched::PlacementPlanner::solve(mode, pcfg, hints);
+      LOG_INFO("placement(moe): %s", plan.summary.c_str());
     }
 
     llmoc::model::HfTokenizer tok;
     tok.load(tok_dir + "/tokenizer.json");
 
-    auto q = std::make_unique<llmoc::model::Qwen35Model>();
-    q->load(&wm, tok_dir + "/config.json");
-    if (llmoc::hal::cuda::enabled()) q->warm_gpu_bf16_weights();
-    LOG_INFO("backend=qwen3_5 (BF16 dense)");
+    auto pref = std::make_unique<llmoc::wt::ExpertPrefetcher>();
+    llmoc::wt::ExpertPrefetcher::Config pcfg;
+    pcfg.io_workers = cfg.io_workers;
+    pcfg.slot_bytes = 128u << 20;
+    pref->open(cfg.model_path, pcfg);
+    auto moe = std::make_unique<llmoc::model::MoeModel>();
+    moe->load(&wm, pref.get(), tok_dir + "/config.json");
+    LOG_INFO("backend=moe (LWC groups=%zu)", wm.header().groups.size());
 
     llmoc::model::Generator gen;
-    gen.init(q.get(), &tok, cfg.max_seq > 0 ? cfg.max_seq : 16384);
+    gen.init(moe.get(), &tok, cfg.max_seq > 0 ? cfg.max_seq : 16384);
 
     llmoc::sched::Scheduler sched;
     sched.start(&gen);
@@ -196,7 +225,7 @@ int main(int argc, char** argv) {
     api.listen();
     return 0;
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "FATAL: %s\n", e.what());
+    std::fprintf(stderr, "FATAL[moe]: %s\n", e.what());
     return 1;
   }
 }

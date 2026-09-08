@@ -585,7 +585,9 @@ void Qwen35Int4Model::gemm_opt_batch(const float* X, int n, const OptW& W, float
   hal::gemm_bias_free_batch(X, n, W.pass, Y, W.M, W.K, W.dt);
 }
 
-void Qwen35Int4Model::warm_gpu_int4_weights() {
+void Qwen35Int4Model::warm_gpu_int4_weights(int* out_ok, int* out_fail) {
+  if (out_ok) *out_ok = 0;
+  if (out_fail) *out_fail = 0;
   if (!hal::cuda::enabled()) return;
   int n_ok = 0, n_fail = 0;
   auto try_one = [&](const qlwc::Int4View& W, bool pin = false) {
@@ -632,7 +634,7 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
     }
   }
   // lm_head resident: INT4 → ensure_int4_resident; BF16 pass → packed W16 (no FP32 inflate)
-  LOG_INFO("Qwen35Int4: warm_gpu_int4 layers=%d fail=%d used=%.2fGiB / budget=%.2fGiB (lm_int4=%d lm_pass=%d tie=%d)",
+  LOG_INFO("Qwen35Int4: warm_gpu_int4 ok=%d fail=%d used=%.2fGiB / budget=%.2fGiB (lm_int4=%d lm_pass=%d tie=%d)",
            n_ok, n_fail, hal::cuda::vram_used() / double(1ull << 30),
            hal::cuda::vram_budget() / double(1ull << 30), lm_is_int4_ ? 1 : 0,
            lm_pass_ ? 1 : 0, cfg_.tie_embeddings ? 1 : 0);
@@ -647,11 +649,14 @@ void Qwen35Int4Model::warm_gpu_int4_weights() {
       LOG_INFO("Qwen35Int4: lm_head W16-pack prefetch FAILED (%.2fGiB needed; used=%.2fGiB budget=%.2fGiB)",
                mbytes / double(1ull << 30), hal::cuda::vram_used() / double(1ull << 30),
                hal::cuda::vram_budget() / double(1ull << 30));
+      ++n_fail;
     }
   }
   // embed (tied 时跟 lm 同)
   if (emb_is_int4_ && emb_int4_.qweight && emb_int4_.qweight != lm_int4_.qweight) try_one(emb_int4_);
   hal::cuda::log_status();
+  if (out_ok) *out_ok = n_ok;
+  if (out_fail) *out_fail = n_fail;
 }
 
 size_t Qwen35Int4Model::resident_workspace_bytes() const {
