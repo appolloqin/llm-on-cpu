@@ -59,6 +59,18 @@ void GraphExecutor::commit_prefix_state(int pos) {
   if (legacy_) legacy_->commit_prefix_state(pos);
 }
 
+void GraphExecutor::prepare_speculative_snapshot(SessionCache& cache) {
+  if (legacy_) legacy_->prepare_speculative_snapshot(cache);
+}
+
+void GraphExecutor::apply_speculative_restore(SessionCache& cache) {
+  if (legacy_) legacy_->apply_speculative_restore(cache);
+}
+
+void GraphExecutor::set_decode_pos(int pos) {
+  if (legacy_) legacy_->set_decode_pos(pos);
+}
+
 bool GraphExecutor::has_mtp() const {
   return legacy_ && legacy_->has_mtp();
 }

@@ -1025,6 +1025,10 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     if (resident_gpu_) {
       // Decode (n=1) and long prefill: keep GDN state on device. Prefill used to force
       // host gated_delta_recurrent for n>1 → ~0.1 layer/s at T~1k on pure_gpu/AWQ.
+      // Multi-token windows (MTP verify): sync host←device first so a mid-window GPU fail
+      // can safely fall back to CPU from the pre-window state.
+      if (n_tok > 1)
+        hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
       gdn_ok = true;
       for (int t = 0; t < n_tok; ++t) {
         if (!hal::cuda::try_gated_delta_gpu(
@@ -1038,12 +1042,13 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
         }
       }
       if (!gdn_ok) {
-        // Partial device steps are not mirrored on host — drop device cache and recompute.
-        hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
-        if (n_tok > 1) {
-          // Multi-token GPU path assumes this call starts from zeros (standard prefill).
+        // Drop partial device window; recompute from host (synced above when n_tok>1).
+        if (n_tok == 1)
+          hal::cuda::flush_gdn_state_to_host(Lkv.linear.recurrent.data(), nv, dk, dv);
+        else
+          hal::cuda::invalidate_gdn_state(Lkv.linear.recurrent.data());
+        if (is_prefill && !Lkv.linear.has_state)
           std::fill(Lkv.linear.recurrent.begin(), Lkv.linear.recurrent.end(), 0.f);
-        }
         hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(),
                                    sc.beta.data(), Lkv.linear.recurrent.data(), sc.core.data(),
                                    n_tok, nv, dk, dv, true);
@@ -1697,6 +1702,28 @@ void Qwen35Int4Model::commit_prefix_state(int pos) {
   if (prefix_logits_.size() >= static_cast<size_t>(pos + 1) * V) {
     last_logits_.assign(prefix_logits_.begin() + static_cast<size_t>(pos) * V,
                         prefix_logits_.begin() + static_cast<size_t>(pos + 1) * V);
+  }
+}
+
+void Qwen35Int4Model::prepare_speculative_snapshot(SessionCache& cache) {
+  if (!resident_gpu_) return;
+  const int nv = cfg_.linear_num_v, dk = cfg_.linear_dk, dv = cfg_.linear_dv;
+  for (int i = 0; i < cache.n_layers(); ++i) {
+    if (i >= static_cast<int>(cfg_.layer_types.size()) || cfg_.layer_types[i] != "linear_attention")
+      continue;
+    auto& lin = cache.layer(i).linear;
+    if (!lin.recurrent.empty())
+      hal::cuda::flush_gdn_state_to_host(lin.recurrent.data(), nv, dk, dv);
+  }
+}
+
+void Qwen35Int4Model::apply_speculative_restore(SessionCache& cache) {
+  if (!resident_gpu_) return;
+  for (int i = 0; i < cache.n_layers(); ++i) {
+    if (i >= static_cast<int>(cfg_.layer_types.size()) || cfg_.layer_types[i] != "linear_attention")
+      continue;
+    auto& lin = cache.layer(i).linear;
+    if (!lin.recurrent.empty()) hal::cuda::invalidate_gdn_state(lin.recurrent.data());
   }
 }
 

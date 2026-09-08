@@ -401,7 +401,7 @@ document.getElementById('f').onsubmit=async(e)=>{
   add('user',text,imgs);
   const bot=add('assistant','…');go.disabled=true;st.textContent=imgs.length?'视觉编码中…':'生成中…';
   try{
-    const payload={messages:history,max_tokens:2048,stream:true,temperature:0,enable_thinking:__THINK_ENABLE__};
+    const payload={messages:history,max_tokens:__MAX_TOKENS__,stream:true,temperature:0,enable_thinking:__THINK_ENABLE__};
     const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(payload)});
     if(!r.ok)throw new Error(await r.text());
@@ -442,6 +442,9 @@ fetch('/healthz').then(r=>r.json()).then(()=>st.textContent='服务正常 · 已
     const char* think_js = cfg_.thinking_enable ? "true" : "false";
     const auto pos = html.find("__THINK_ENABLE__");
     if (pos != std::string::npos) html.replace(pos, 16, think_js);
+    const auto mpos = html.find("__MAX_TOKENS__");
+    if (mpos != std::string::npos)
+      html.replace(mpos, 14, std::to_string(cfg_.max_new_tokens > 0 ? cfg_.max_new_tokens : 256));
     res.set_content(html, "text/html; charset=utf-8");
   });
 

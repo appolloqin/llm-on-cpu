@@ -60,6 +60,12 @@ class ICausalLM {
   // 批量 verify 截断后：把 last_hidden/last_logits 切到 forward_all 的第 pos 个位置
   virtual void commit_prefix_state(int /*pos*/) {}
 
+  // MTP：snapshot 前把 GPU GDN 刷回 host；restore 后丢掉 device mirror。
+  virtual void prepare_speculative_snapshot(SessionCache& /*cache*/) {}
+  virtual void apply_speculative_restore(SessionCache& /*cache*/) {}
+  // 文本 decode 的下一 RoPE 下标（与 full-attn seq 对齐）
+  virtual void set_decode_pos(int /*pos*/) {}
+
   // P0 MTP：无头时保持 false；禁止用随机草稿充数
   virtual bool has_mtp() const { return false; }
   // 基于已提交 history 草拟至多 draft_k 个 token；失败返回 false

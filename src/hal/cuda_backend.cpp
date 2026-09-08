@@ -2290,6 +2290,15 @@ void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv) {
   g_gdn_state.erase(it);
 }
 
+void invalidate_gdn_state(float* host_state) {
+  if (!g_enabled || !host_state) return;
+  std::lock_guard<std::mutex> lock(g_mu);
+  auto it = g_gdn_state.find(host_state);
+  if (it == g_gdn_state.end() || !it->second) return;
+  g_api.cudaFree(it->second);
+  g_gdn_state.erase(it);
+}
+
 void flush_conv_state_to_host(float* host_conv, int conv_dim, int conv_k) {
   if (!g_enabled || !host_conv || conv_dim <= 0 || conv_k <= 0) return;
   const size_t bytes = sizeof(float) * static_cast<size_t>(conv_dim) * conv_k;

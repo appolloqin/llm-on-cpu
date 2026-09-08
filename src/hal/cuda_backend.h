@@ -130,6 +130,8 @@ bool try_attn_prefill(const float* q, const float* k, const float* v, float* out
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out, int n_heads, int dk, int dv);
 void flush_gdn_state_to_host(float* host_state, int n_heads, int dk, int dv);
+// Drop device GDN mirror so the next try_gated_delta_gpu re-uploads from host (MTP restore).
+void invalidate_gdn_state(float* host_state);
 void flush_conv_state_to_host(float* host_conv, int conv_dim, int conv_k);
 
 // Path A S3 stats (full-attn act residual path).

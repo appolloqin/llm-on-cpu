@@ -448,6 +448,7 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
       }
 
       ++out.mtp_verify_steps;
+      model_->prepare_speculative_snapshot(cache);
       const auto snap = cache.snapshot();
       std::vector<float> all_logits;
       model_->forward_all_logits(drafts, cache, all_logits, false);
@@ -463,12 +464,23 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
       }
 
       if (accepted < k) {
+        // Snapshot restore alone is not enough for hybrid GDN: linear state must match the
+        // accepted prefix (not pre-draft). Replay accepted drafts after restore.
         cache.restore(snap);
-        for (int li = 0; li < cache.n_layers(); ++li)
-          cache.layer(li).seq = snap.seq[static_cast<size_t>(li)] + accepted;
-        logits.assign(all_logits.begin() + static_cast<size_t>(accepted - 1) * V,
-                      all_logits.begin() + static_cast<size_t>(accepted) * V);
-        model_->commit_prefix_state(accepted - 1);
+        model_->apply_speculative_restore(cache);
+        int rope_pos = 0;
+        for (int li = 0; li < cache.n_layers(); ++li) {
+          if (!cache.layer(li).k.empty()) {
+            rope_pos = cache.layer(li).seq;
+            break;
+          }
+        }
+        model_->set_decode_pos(rope_pos);
+        std::vector<int32_t> kept(drafts.begin(), drafts.begin() + accepted);
+        std::vector<float> kept_logits;
+        model_->forward_all_logits(kept, cache, kept_logits, false);
+        logits.assign(kept_logits.begin() + static_cast<size_t>(accepted - 1) * V,
+                      kept_logits.begin() + static_cast<size_t>(accepted) * V);
       } else {
         logits.assign(all_logits.begin() + static_cast<size_t>(k - 1) * V, all_logits.end());
       }
