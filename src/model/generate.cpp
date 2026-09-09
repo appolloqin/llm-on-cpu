@@ -214,10 +214,12 @@ bool resolve_use_mtp(const ICausalLM* model, const GenerateRequest& req, bool* l
   if (!mtp_wanted(req.mtp) || req.spec_k <= 0 || req.temperature > 1e-5f) return false;
   if (!model->has_mtp()) return false;
   if (req.mtp == "true" || req.mtp == "1" || mtp_force_env()) return true;
-  // auto：HX/INT4 上 MTP 草稿+verify 仍慢于 greedy（2026-08-31）；SPR+AMX 再默认开
-  if (model->meta().kind == "qwen3_5_int4") {
+  // auto：INT4 上 MTP 草稿+verify 仍慢于 greedy，且 3.8 易吃掉回答预算；强制开：true 或 LLMOC_MTP=1
+  const std::string& kind = model->meta().kind;
+  if (kind == "qwen3_5_int4" || kind.find("qwen3_8") != std::string::npos) {
     if (logged_auto_skip && !*logged_auto_skip) {
-      LOG_INFO("mtp auto: INT4 CPU stays greedy (model.mtp=true or LLMOC_MTP=1 to force MTP)");
+      LOG_INFO("mtp auto: INT4 stays greedy for %s (model.mtp=true or LLMOC_MTP=1 to force MTP)",
+               kind.c_str());
       *logged_auto_skip = true;
     }
     return false;

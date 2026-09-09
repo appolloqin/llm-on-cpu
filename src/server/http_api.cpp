@@ -251,19 +251,31 @@ window.addEventListener('resize',autosizeQ);
 autosizeQ();
 function stripThink(t){
   t=String(t||'');
+  const open='<think>';
   const close='</think>';
-  const re=/<think>([\s\S]*?)<\/think>/g;
-  let m, answer=t, paired=false;
-  while((m=re.exec(t))){paired=true;}
-  if(paired){
-    answer=t.replace(/<think>[\s\S]*?<\/think>/g,'').replace(/^\s+/,'').trim();
-  }else{
-    const c=t.indexOf(close);
+  let answer=t;
+  let paired=false;
+  // Closed pairs first (same as C++ strip_qwen_think).
+  for(;;){
+    const a=answer.indexOf(open);
+    if(a<0) break;
+    paired=true;
+    const b=answer.indexOf(close,a+open.length);
+    if(b<0){
+      // Unclosed think: drop from open tag to end (token budget cut mid-CoT).
+      answer=answer.slice(0,a);
+      break;
+    }
+    answer=answer.slice(0,a)+answer.slice(b+close.length);
+  }
+  if(!paired){
+    const c=answer.indexOf(close);
     if(c>=0){
       // 预填空 think 后模型仍可能输出「草稿…</think>正文」——丢弃闭合前草稿
-      answer=t.slice(c+close.length).replace(/^\s+/,'').trim();
+      answer=answer.slice(c+close.length);
     }
   }
+  answer=answer.replace(/^\s+/,'').trim();
   // 聊天页 strip 思考区展示；默认 enable_thinking 见 configs thinking.enable
   return {thinking:'',answer};
 }

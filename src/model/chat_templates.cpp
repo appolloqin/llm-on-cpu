@@ -25,9 +25,12 @@ ThinkingOffStyle resolve_off_style(ChatFamily family, ThinkingOffStyle cfg) {
   if (cfg != ThinkingOffStyle::kFamily) return cfg;
   switch (family) {
     case ChatFamily::kQwen35:
-      return ThinkingOffStyle::kEmptyPrefill;
     case ChatFamily::kQwen36:
     case ChatFamily::kQwen38:
+      // Official Qwen hybrid template: empty <think></think> is the hard "thinking off"
+      // switch. no_tags lets the model still emit a long CoT that burns max_new_tokens
+      // and leaves only a fragment of the real answer after strip.
+      return ThinkingOffStyle::kEmptyPrefill;
     case ChatFamily::kGlm:
     case ChatFamily::kDeepSeek:
     case ChatFamily::kKimi:

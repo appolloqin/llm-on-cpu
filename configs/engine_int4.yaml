@@ -12,7 +12,7 @@ model:
 # thinking:
 #   enable: false          # API/UI 默认；请求体 enable_thinking 可覆盖
 #   off_style: family      # family | empty_prefill | no_tags
-#                          # Qwen3.5 family → empty_prefill；3.6/3.8 → no_tags
+#                          # Qwen3.5/3.6/3.8 family → empty_prefill（官方硬关思考）
 thinking:
   enable: false
   off_style: family
