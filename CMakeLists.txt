@@ -221,6 +221,7 @@ add_executable(llmoc_unit_tests
   tests/unit/test_m5_mode.cpp
   tests/unit/test_exec_mesh.cpp
   tests/unit/test_gpu_quant_gemm.cpp
+  tests/unit/test_attn_prefill.cpp
   tests/unit/test_ds_kimi_stub.cpp
 )
 target_link_libraries(llmoc_unit_tests PRIVATE llmoc_weights llmoc_model)
@@ -256,6 +257,12 @@ target_link_libraries(int4_gemm_bench PRIVATE llmoc_weights)
 
 add_executable(lmhead_jit_bench tools/lmhead_jit_bench/main.cpp)
 target_link_libraries(lmhead_jit_bench PRIVATE llmoc_weights)
+
+add_executable(attn_prefill_bench tools/attn_prefill_bench/main.cpp)
+target_link_libraries(attn_prefill_bench PRIVATE llmoc_weights)
+
+add_executable(gdn_bench tools/gdn_bench/main.cpp)
+target_link_libraries(gdn_bench PRIVATE llmoc_weights)
 
 add_executable(nan_probe
   tools/nan_probe/main.cpp

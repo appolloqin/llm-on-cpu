@@ -823,8 +823,17 @@ void Qwen35Int4Model::moe_ffn_token(int /*layer*/, const float* /*normed*/, floa
   throw std::runtime_error("moe_ffn_token: MoE requires Qwen36MoeInt4Model");
 }
 
-void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, int pos_start, int n_tok,
-                                    bool is_prefill) {
+bool gpu_gdn_enabled() {
+  // GPU seq GDN/conv 实测比 CPU AVX2 慢（占用率低）；默认关, 需要 A/B 时 LLMOC_GPU_GDN=1
+  static const int e = [] {
+    const char* p = std::getenv("LLMOC_GPU_GDN");
+    return (p && p[0] != '0' && p[0] != '\0') ? 1 : 0;
+  }();
+  return e != 0;
+}
+
+void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, int pos_start,
+                                    int n_tok, bool is_prefill) {
   const auto& lp = layers_[layer];
   const int H = cfg_.hidden;
   const int I = cfg_.intermediate;
@@ -925,9 +934,13 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     } else {
       for (int t = 0; t < n_tok; ++t) {
         const int seq_len = Lkv.seq + t + 1;
-          hal::attn_decode_one(sc.qq.data() + t * nh * hd, Lkv.k.data(), Lkv.v.data(),
-                             sc.attn_heads.data() + t * nh * hd, nh, nkv, hd, seq_len,
-                             cache.max_seq(), scale);
+        float* qth = sc.qq.data() + t * nh * hd;
+        float* oth = sc.attn_heads.data() + t * nh * hd;
+        if (!hal::cuda::try_attn_decode_gpu(qth, Lkv.k.data(), Lkv.v.data(), oth, seq_len,
+                                            cache.max_seq(), nh, nkv, hd, scale)) {
+          hal::attn_decode_one(qth, Lkv.k.data(), Lkv.v.data(), oth, nh, nkv, hd, seq_len,
+                               cache.max_seq(), scale);
+        }
       }
     }
     Lkv.seq += n_tok;
@@ -992,7 +1005,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     const float* cw = lp.conv_w_f.data();
     const int ck = cfg_.conv_k;
     bool conv_gpu = false;
-    if (n_tok >= 64 && ck == 4 && resident_gpu_) {
+    if (n_tok >= 64 && ck == 4 && resident_gpu_ && gpu_gdn_enabled()) {
       conv_gpu = hal::cuda::try_dwconv_silu_k4_seq(sc.mixed.data(), conv_state.data(), cw,
                                                      sc.mixed_c.data(), n_tok, conv_dim);
       if (!conv_gpu) {
@@ -1065,7 +1078,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     }
 
     bool gdn_ok = false;
-    if (resident_gpu_) {
+    if (resident_gpu_ && gpu_gdn_enabled()) {
       // Prefill/MTP n>1: batched H2D/D2H (try_gated_delta_gpu_seq). Per-token sync was
       // ~ms×T and collapsed long prefill to ~0.1 layer/s.
       // MTP decode reject path only: flush device→host before multi-token window.
@@ -1372,8 +1385,11 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
 
   const int seq_len = Lkv.seq + 1;
   const int kv_pos = Lkv.seq;
-  hal::attn_decode_one(sc.qq.data(), Lkv.k.data(), Lkv.v.data(), sc.attn_heads.data(), nh, nkv, hd,
-                       seq_len, cache.max_seq(), scale);
+  if (!hal::cuda::try_attn_decode_gpu(sc.qq.data(), Lkv.k.data(), Lkv.v.data(), sc.attn_heads.data(),
+                                      seq_len, cache.max_seq(), nh, nkv, hd, scale)) {
+    hal::attn_decode_one(sc.qq.data(), Lkv.k.data(), Lkv.v.data(), sc.attn_heads.data(), nh, nkv, hd,
+                         seq_len, cache.max_seq(), scale);
+  }
 
   for (int i = 0; i < nh * hd; ++i) sc.attn_heads[i] *= sigmoid(sc.gate[i]);
 

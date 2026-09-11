@@ -73,6 +73,13 @@ int main(int argc, char** argv) {
       if (llmoc::hal::cuda::probe_available() &&
           llmoc::hal::cuda::enable(static_cast<size_t>(vram_gb * (1ull << 30)))) {
         m->warm_gpu_int4_weights();
+        // 复现服务端：resident_gpu 开启（纯 GPU 预取，会走 GDN/conv GPU seq kernel）
+        if (std::getenv("LLMOC_BENCH_RESIDENT")) {
+          if (llmoc::hal::cuda::try_enable_resident_gpu(0)) {
+            m->enable_resident_gpu(true);
+            LOG_INFO("bench resident_gpu ON (LLMOC_BENCH_RESIDENT)");
+          }
+        }
       }
     }
     model = std::move(m);

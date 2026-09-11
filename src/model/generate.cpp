@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <random>
 #include <sstream>
@@ -378,8 +379,12 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
 
   std::string utf8_carry;
   int ws_run = 0;
+  const char* stop_reason = "max_new_tokens";
   auto emit_one = [&](int32_t next, const std::vector<float>* logits_for_lp) -> bool {
-    if (next == eos || (tok_->eos_id() >= 0 && next == tok_->eos_id())) return false;
+    if (next == eos || (tok_->eos_id() >= 0 && next == tok_->eos_id())) {
+      stop_reason = "eos";
+      return false;
+    }
     out.token_ids.push_back(next);
     const std::string piece = tok_->decode({next}, true);
     out.text += piece;
@@ -392,7 +397,10 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
     }
 
     if (only_ws_piece(piece)) {
-      if (++ws_run >= 8) return false;
+      if (++ws_run >= 8) {
+        stop_reason = "whitespace_run";
+        return false;
+      }
     } else {
       ws_run = 0;
     }
@@ -573,11 +581,18 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
                 static_cast<double>(out.mtp_verify_steps * req.spec_k)
           : 0.0;
   LOG_INFO(
-      "gen done: prompt=%d new=%d steps=%d | prefill=%.1fms (%.2f t/s) decode=%.1fms (%.2f t/s) "
-      "slowest_step=%.1fms wall=%.1fms e2e=%.2f t/s | mtp_verify=%d mtp_accept=%d mtp_alpha=%.2f",
-      out.prompt_tokens, out.completion_tokens, decode_steps, prefill_ms, prefill_tps, decode_ms,
-      decode_tps, slowest_step_ms, wall_ms, e2e_tps, out.mtp_verify_steps, out.mtp_draft_accepted,
-      mtp_accept_ratio);
+      "gen done: prompt=%d new=%d steps=%d stop=%s max_new=%d | prefill=%.1fms (%.2f t/s) "
+      "decode=%.1fms (%.2f t/s) slowest_step=%.1fms wall=%.1fms e2e=%.2f t/s | "
+      "mtp_verify=%d mtp_accept=%d mtp_alpha=%.2f",
+      out.prompt_tokens, out.completion_tokens, decode_steps, stop_reason, greq.max_new_tokens,
+      prefill_ms, prefill_tps, decode_ms, decode_tps, slowest_step_ms, wall_ms, e2e_tps,
+      out.mtp_verify_steps, out.mtp_draft_accepted, mtp_accept_ratio);
+  if (std::strcmp(stop_reason, "max_new_tokens") == 0)
+    LOG_WARN(
+        "gen stopped at max_new_tokens=%d (answer likely truncated). Raise decode.max_new_tokens "
+        "and decode.max_seq in the config; if the model emits a long <think> CoT, ensure "
+        "thinking.enable=false / off_style=empty_prefill, or strip is wasting the budget",
+        greq.max_new_tokens);
   if (out.completion_tokens > 0 && decode_tps < 0.5)
     LOG_WARN(
         "gen decode <0.5 tok/s — for ~27B BF16 on CPU this can be expected; check OpenMP "

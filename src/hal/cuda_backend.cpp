@@ -189,6 +189,16 @@ std::unordered_map<std::string, void*> g_jit_kernels;  // kernel 名→CUfunctio
 std::unordered_map<const float*, float*> g_gdn_state;
 float* g_gdn_buf = nullptr;   // device scratch for q/k/v/g/beta/out uploads
 size_t g_gdn_buf_cap = 0;
+// Tensor-core prefill GEMM fp16 scratch
+unsigned short* g_tc_w_f16 = nullptr;  // W fp16 [M,K]
+size_t g_tc_w_f16_cap = 0;
+unsigned short* g_tc_x_f16 = nullptr;  // X fp16 [n,K]
+size_t g_tc_x_f16_cap = 0;
+// 单 query decode attention buffers
+float* g_dec_q = nullptr; size_t g_dec_q_cap = 0;
+float* g_dec_k = nullptr; size_t g_dec_k_cap = 0;
+float* g_dec_v = nullptr; size_t g_dec_v_cap = 0;
+float* g_dec_o = nullptr; size_t g_dec_o_cap = 0;
 uint64_t g_gdn_ok = 0;
 uint64_t g_gdn_fail = 0;
 uint64_t g_act_ffn_ok = 0;
@@ -930,6 +940,16 @@ void disable() {
   if (g_gdn_buf) g_api.cudaFree(g_gdn_buf);
   g_gdn_buf = nullptr;
   g_gdn_buf_cap = 0;
+  if (g_tc_w_f16) g_api.cudaFree(g_tc_w_f16);
+  if (g_tc_x_f16) g_api.cudaFree(g_tc_x_f16);
+  g_tc_w_f16 = g_tc_x_f16 = nullptr;
+  g_tc_w_f16_cap = g_tc_x_f16_cap = 0;
+  if (g_dec_q) g_api.cudaFree(g_dec_q);
+  if (g_dec_k) g_api.cudaFree(g_dec_k);
+  if (g_dec_v) g_api.cudaFree(g_dec_v);
+  if (g_dec_o) g_api.cudaFree(g_dec_o);
+  g_dec_q = g_dec_k = g_dec_v = g_dec_o = nullptr;
+  g_dec_q_cap = g_dec_k_cap = g_dec_v_cap = g_dec_o_cap = 0;
   g_gdn_ok = g_gdn_fail = 0;
   g_act_ffn_ok = g_act_ffn_try = g_act_lm_ok = 0;
   g_act_lin_ok = g_act_lin_try = 0;
@@ -1530,6 +1550,148 @@ extern "C" __global__ void gated_delta_seq_kernel(
 }
 )CUDA";
 
+// Tensor-core prefill GEMM: INT4 resident → device FP16 weights, cuBLAS GemmEx (FP16×FP16→FP32).
+const char* kTcSrc = R"CUDA(
+__device__ __forceinline__ float tc_f16_to_f32(unsigned short h) {
+  unsigned int sign = (h & 0x8000u) << 16;
+  unsigned int exp = (h >> 10) & 0x1Fu;
+  unsigned int man = h & 0x3FFu;
+  unsigned int bits;
+  if (exp == 0u) {
+    if (man == 0u) bits = sign;
+    else { exp = 1u; while ((man & 0x400u) == 0u) { man <<= 1; exp -= 1u; } man &= 0x3FFu; bits = sign | ((exp + 112u) << 23) | (man << 13); }
+  } else if (exp == 31u) bits = sign | 0x7F800000u | (man << 13);
+  else bits = sign | ((exp + 112u) << 23) | (man << 13);
+  return __uint_as_float(bits);
+}
+__device__ __forceinline__ unsigned short tc_f32_to_f16(float f) {
+  // 手动 round-to-nearest-even（不依赖 __half 类型，NVRTC 通用）
+  unsigned int i = __float_as_uint(f);
+  unsigned int s = (i >> 16) & 0x8000u;
+  int e = (int)((i >> 23) & 0xff) - 127 + 15;
+  unsigned int m = i & 0x7fffffu;
+  unsigned short out;
+  if (e >= 30) {
+    out = (unsigned short)(s | 0x7c00u);  // inf/nan
+  } else if (e <= 0) {
+    if (e < -10) {
+      out = (unsigned short)s;  // 下溢→0
+    } else {
+      m |= 0x800000u;           // 规格化尾数
+      int sh = 14 - e;
+      unsigned int m10 = m >> (sh + 13);
+      unsigned int rem = m & ((1u << (sh + 13)) - 1u);
+      if (rem > (1u << (sh + 12)) ||
+          (rem == (1u << (sh + 12)) && (m10 & 1u)))
+        m10++;
+      out = (unsigned short)(s | m10);
+    }
+  } else {
+    unsigned int m10 = m >> 13;
+    unsigned int rem = m & 0x1fffu;
+    unsigned int round_up = rem > 0x1000u || (rem == 0x1000u && (m10 & 1u));
+    if (round_up) {
+      m10++;
+      if (m10 == 0x400u) { m10 = 0; e++; }
+    }
+    out = (unsigned short)(s | ((unsigned int)e << 10) | m10);
+  }
+  return out;
+}
+// W [M,K] row-major INT4 → FP16。语义与 gemv_int4 完全一致。
+extern "C" __global__ void int4_to_f16(const unsigned char* __restrict__ qw,
+                                       const unsigned short* __restrict__ sc,
+                                       const unsigned short* __restrict__ z,
+                                       unsigned short* __restrict__ w16, int M, int K, int ng,
+                                       int gs, int is_awq, int awq_zp) {
+  const int rb = (K + 1) >> 1;
+  const size_t total = (size_t)M * K;
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t m = i / K;
+    const size_t k = i - m * K;
+    const int g = (int)(k / gs);
+    const unsigned char b = qw[m * rb + (k >> 1)];
+    const int qi = (k & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+    const float s = tc_f16_to_f32(sc[m * ng + g]);
+    float w;
+    if (is_awq) w = (float)(qi - awq_zp) * s;
+    else {
+      const float zz = tc_f16_to_f32(z[m * ng + g]);
+      w = (float)qi * s + zz;
+    }
+    w16[i] = tc_f32_to_f16(w);
+  }
+}
+extern "C" __global__ void f32_to_f16_buf(const float* __restrict__ in,
+                                          unsigned short* __restrict__ out, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = tc_f32_to_f16(in[i]);
+}
+)CUDA";
+
+// 单 query flash decode attention：每个 query head 一个 block，seq 并行算分数+并行 softmax+V。
+// k_cache/v_cache 布局 [hkv*stride + t]*hd，stride = cache_cap(max_seq)。CPU 回退。
+const char* kAttnDecodeSrc = R"CUDA(
+__device__ __forceinline__ float dd_wp_max(float x) {
+  for (int o = 16; o > 0; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o));
+  return x;
+}
+__device__ __forceinline__ float dd_wp_sum(float x) {
+  for (int o = 16; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+  return x;
+}
+extern "C" __global__ void attn_decode_flash(
+    const float* __restrict__ q, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, float* __restrict__ out, int seq_len, int stride,
+    int n_heads, int n_kv, int hd, float scale) {
+  const int h = blockIdx.x;
+  if (h >= n_heads) return;
+  const int g = n_heads / n_kv, hkv = h / g;
+  const int tid = threadIdx.x, nt = blockDim.x;
+  extern __shared__ float sm[];
+  float* sh_q = sm;                     // hd
+  float* sc = sm + hd;                  // seq_len
+  float* red = sm + hd + ((seq_len + 3u) & ~3u);  // reduce scratch
+  const float* qh = q + (size_t)h * hd;
+  for (int d = tid; d < hd; d += nt) sh_q[d] = qh[d];
+  __syncthreads();
+  for (int t = tid; t < seq_len; t += nt) {
+    const float* kt = k_cache + ((size_t)hkv * stride + (size_t)t) * hd;
+    float dot = 0.f;
+    for (int d = 0; d < hd; ++d) dot += sh_q[d] * kt[d];
+    sc[t] = dot * scale;
+  }
+  __syncthreads();
+  float m = -1e30f;
+  for (int t = tid; t < seq_len; t += nt) m = fmaxf(m, sc[t]);
+  m = dd_wp_max(m);
+  if ((tid & 31) == 0) red[tid >> 5] = m;
+  __syncthreads();
+  if (tid == 0) { float M = red[0]; for (int i = 1; i < nt / 32; ++i) M = fmaxf(M, red[i]); red[0] = M; }
+  __syncthreads();
+  m = red[0];
+  float s = 0.f;
+  for (int t = tid; t < seq_len; t += nt) { sc[t] = expf(sc[t] - m); s += sc[t]; }
+  __syncthreads();
+  s = dd_wp_sum(s);
+  if ((tid & 31) == 0) red[tid >> 5] = s;
+  __syncthreads();
+  if (tid == 0) { float S = 0.f; for (int i = 0; i < nt / 32; ++i) S += red[i]; red[0] = S; }
+  __syncthreads();
+  const float inv = 1.f / red[0];
+  float* oh = out + (size_t)h * hd;
+  for (int d = tid; d < hd; d += nt) {
+    float acc = 0.f;
+    for (int t = 0; t < seq_len; ++t) {
+      const float* vt = v_cache + ((size_t)hkv * stride + (size_t)t) * hd;
+      acc += sc[t] * vt[d];
+    }
+    oh[d] = acc * inv;
+  }
+}
+)CUDA";
+
 // Depthwise conv+SiLU — separate from kActSrc so seq kernel JIT can't fail with the huge act TU.
 const char* kDwconvSrc = R"CUDA(
 extern "C" __global__ void dwconv_silu_k4(const float* __restrict__ xin, float* __restrict__ state,
@@ -1811,6 +1973,125 @@ extern "C" __global__ void attn_prefill_naive(
     oh[d] = acc;
   }
 }
+
+// FlashPrefill-V2 风格 kernel（算子重写+均值校正稀疏）：
+//  - scores 计算：每 warp 一个 K 位置、lane 按 float4 分 hd 维，warp-reduce 得点积（向量化）
+//  - softmax：多线程并行 max/sum（而非单线程串行）
+//  - V 累加：lane 按 float4 分 dim，逐 K 流式
+//  - 稀疏跳块：softmax 后按块最大概率 < exp(-tau)*(1+mean_corr/n) 跳过 V 访存（FlashPrefill V2 动态阈值+均值校正）
+//  tau=+inf（默认）→ 与 dense 完全一致；head_dim % 4 == 0 时走 float4 路径。
+__device__ __forceinline__ float wp_reduce_max(float x) {
+  for (int o = 16; o > 0; o >>= 1) x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, o));
+  return x;
+}
+__device__ __forceinline__ float wp_reduce_sum(float x) {
+  for (int o = 16; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffffu, x, o);
+  return x;
+}
+__device__ __forceinline__ float blk_reduce_max(float x, float* r, int tid) {
+  x = wp_reduce_max(x);
+  if ((tid & 31) == 0) r[tid >> 5] = x;
+  __syncthreads();
+  if (tid == 0) {
+    float m = r[0];
+    for (int i = 1; i < 128 / 32; ++i) m = fmaxf(m, r[i]);
+    r[0] = m;
+  }
+  __syncthreads();
+  return r[0];
+}
+__device__ __forceinline__ float blk_reduce_sum(float x, float* r, int tid) {
+  x = wp_reduce_sum(x);
+  if ((tid & 31) == 0) r[tid >> 5] = x;
+  __syncthreads();
+  if (tid == 0) {
+    float s = r[0];
+    for (int i = 1; i < 128 / 32; ++i) s += r[i];
+    r[0] = s;
+  }
+  __syncthreads();
+  return r[0];
+}
+extern "C" __global__ void attn_prefill_flash(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    float* __restrict__ out, int seq, int n_heads, int n_kv, int hd, float scale,
+    float tau, float mean_corr, int sparse) {
+  const int tq = blockIdx.x, h = blockIdx.y;
+  if (tq >= seq || h >= n_heads) return;
+  const int g = n_heads / n_kv;
+  const int hkv = h / g;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int nt = blockDim.x;  // 128
+  extern __shared__ float sm[];
+  float* score = sm;
+  float* rb = sm + seq + 4;           // reduce scratch
+  const float* qh = q + ((size_t)tq * n_heads + h) * hd;
+  const int d4 = lane * 4;
+  const bool dims_ok = (hd % 4 == 0) && (d4 + 3 < hd);
+  float q0 = dims_ok ? qh[d4] : 0.f, q1 = dims_ok ? qh[d4 + 1] : 0.f;
+  float q2 = dims_ok ? qh[d4 + 2] : 0.f, q3 = dims_ok ? qh[d4 + 3] : 0.f;
+  // Phase 1: scores (4 warps 并行 4 个 K 位置, float4 点积 + warp reduce)
+  for (int base = 0; base <= tq; base += 4) {
+    const int tk = base + warp;
+    if (tk <= tq) {
+      const float* kt = k + ((size_t)tk * n_kv + hkv) * hd;
+      float dot = 0.f;
+      if (dims_ok)
+        dot = q0 * kt[d4] + q1 * kt[d4 + 1] + q2 * kt[d4 + 2] + q3 * kt[d4 + 3];
+      dot = wp_reduce_sum(dot);
+      if (lane == 0) score[tk] = dot * scale;
+    }
+  }
+  __syncthreads();
+  const int n = tq + 1;
+  // Phase 2: 并行 softmax
+  float lm = -1e30f;
+  for (int i = tid; i < n; i += nt) lm = fmaxf(lm, score[i]);
+  lm = blk_reduce_max(lm, rb, tid);
+  float ls = 0.f;
+  for (int i = tid; i < n; i += nt) {
+    score[i] = expf(score[i] - lm);
+    ls += score[i];
+  }
+  ls = blk_reduce_sum(ls, rb, tid);
+  const float inv = 1.f / ls;
+  for (int i = tid; i < n; i += nt) score[i] *= inv;
+  __syncthreads();  // phase3 需读全部 score[]
+  // Phase 2.5: 每块最大概率（稀疏跳块判定依据）
+  const int B = 256;
+  const int nb = (n + B - 1) / B;
+  float* bmax = sm + seq + 16;
+  if (sparse) {
+    for (int b = tid; b < nb; b += nt) {
+      const int lo = b * B, hi = (b + 1) * B < n ? (b + 1) * B : n;
+      float m = 0.f;
+      for (int i = lo; i < hi; ++i) m = fmaxf(m, score[i]);
+      bmax[b] = m;
+    }
+    __syncthreads();
+  }
+  const float gate = sparse ? expf(-tau) * (1.f + mean_corr / (float)n) : 0.f;
+  // Phase 3: V 累加（float4, 稀疏跳块）
+  float* oh = out + ((size_t)tq * n_heads + h) * hd;
+  float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+  for (int tk = 0; tk <= tq; ++tk) {
+    if (sparse && bmax[tk / B] < gate) continue;
+    const float w = score[tk];
+    const float* vt = v + ((size_t)tk * n_kv + hkv) * hd;
+    if (dims_ok) {
+      o0 += w * vt[d4];
+      o1 += w * vt[d4 + 1];
+      o2 += w * vt[d4 + 2];
+      o3 += w * vt[d4 + 3];
+    }
+  }
+  if (dims_ok) {
+    oh[d4] = o0;
+    oh[d4 + 1] = o1;
+    oh[d4 + 2] = o2;
+    oh[d4 + 3] = o3;
+  }
+}
 )CUDA";
 
 // kernel 名→句柄缓存(避免每 token 重编译; 与 g_jit_kernels 共享生命周期, disable 时清空)
@@ -1886,12 +2167,13 @@ bool weight_budget_ok(size_t nbytes, bool need_headroom) {
 }
 
 // Upload packed BF16/F16 weights (no FP32 inflate). Key = host pass pointer.
+static uint16_t bf16_to_f16_bits_host(uint16_t h);  // 见 ensure_w16_pack 下方实现
 const W16Pack* ensure_w16_pack(const uint16_t* W, int M, int K, bool is_f16) {
   if (!g_enabled || !W || M <= 0 || K <= 0) return nullptr;
   if (M >= kMaxGpuInt4Rows) return nullptr;
   auto it = g_w16_pack.find(W);
   if (it != g_w16_pack.end()) {
-    if (it->second.M != M || it->second.K != K || it->second.is_f16 != is_f16) return nullptr;
+    if (it->second.M != M || it->second.K != K) return nullptr;
     return &it->second;
   }
   const size_t nbytes = sizeof(uint16_t) * static_cast<size_t>(M) * static_cast<size_t>(K);
@@ -1899,7 +2181,15 @@ const W16Pack* ensure_w16_pack(const uint16_t* W, int M, int K, bool is_f16) {
   if (!weight_budget_ok(nbytes, M >= kW16PackMinRows)) return nullptr;
   void* d = nullptr;
   if (g_api.cudaMalloc(&d, nbytes) != kCudaSuccess) return nullptr;
-  if (g_api.cudaMemcpy(d, W, nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
+  std::vector<uint16_t> hbuf;
+  const uint16_t* upload = W;
+  if (!is_f16) {
+    // bf16 → fp16：正常段精确移位（fp16 尾数 10 位含 bf16 的 8 位），次正规段经 float+llrintf 舍入
+    hbuf.resize(static_cast<size_t>(M) * static_cast<size_t>(K));
+    for (size_t i = 0; i < hbuf.size(); ++i) hbuf[i] = bf16_to_f16_bits_host(W[i]);
+    upload = hbuf.data();
+  }
+  if (g_api.cudaMemcpy(d, upload, nbytes, kCudaMemcpyH2D) != kCudaSuccess) {
     g_api.cudaFree(d);
     return nullptr;
   }
@@ -1907,11 +2197,29 @@ const W16Pack* ensure_w16_pack(const uint16_t* W, int M, int K, bool is_f16) {
   e.d_w = d;
   e.M = M;
   e.K = K;
-  e.is_f16 = is_f16;
+  e.is_f16 = true;  // 统一按 fp16 存储（bf16 已正确转 fp16）
   e.bytes = nbytes;
   g_w16_pack[W] = e;
   g_used += nbytes;
   return &g_w16_pack[W];
+}
+
+// host: bf16(16bit) → fp16(16bit)。正常段精确；次正规用 float 舍入，避免位运算 UB。
+static uint16_t bf16_to_f16_bits_host(uint16_t h) {
+  const uint32_t s = h & 0x8000u;
+  const uint32_t e8 = (h >> 7) & 0xffu;
+  const uint32_t m8 = h & 0x7fu;
+  if (e8 == 0u) return (uint16_t)s;                     // ±0 / bf16 次正规（<2^-126）→ fp16 0
+  if (e8 == 0xffu) return (uint16_t)(s | 0x7c00u);      // inf/nan
+  const int e16 = (int)e8 - 127 + 15;
+  if (e16 >= 31) return (uint16_t)(s | 0x7c00u);        // 溢出 → inf
+  if (e16 >= 1) return (uint16_t)(s | ((uint32_t)e16 << 10) | (m8 << 3));  // 正常：精确
+  // 次正规：value = (128|m8)*2^(e8-135)；m10 = value*2^24
+  const float val = (float)(128u | m8) * std::exp2f((float)((int)e8 - 135));
+  uint32_t m10 = (uint32_t)std::llrintf(val * 16777216.0f);
+  if (m10 == 0u) return (uint16_t)s;
+  if (m10 > 1024u) m10 = 1023u;
+  return (uint16_t)(s | m10);
 }
 
 // FP32 inflate for cublas (out/a/b). Faster than naive gemv_w16; uses more VRAM.
@@ -1980,7 +2288,43 @@ bool ensure_w16_tile(int rows, int K) {
 // cublasGemmEx(BF16×FP32) was tried but measured slower here (lm_head ~26ms vs ~18ms tiled).
 bool gemv_w16_tiled_cublas(const uint16_t* d_W, const float* d_x, float* d_y, int M, int K,
                            bool is_f16) {
-  if (!d_W || !d_x || !d_y || M <= 0 || K <= 0 || !g_cublas || !g_api.cublasSgemm) return false;
+  if (!d_W || !d_x || !d_y || M <= 0 || K <= 0 || !g_cublas) return false;
+  // FP16 权重 + cublasGemmEx → tensor-core GEMV（打包已统一为 fp16 且验证正确；LLMOC_TC_LM=0 关闭）
+  const char* tc_lm_on = std::getenv("LLMOC_TC_LM");
+  const bool tc_lm = !(tc_lm_on && tc_lm_on[0] == '0');
+  if (is_f16 && tc_lm && g_api.cublasGemmEx) {
+    void* fx = get_jit_kernel(kTcSrc, "f32_to_f16_buf");
+    if (fx) {
+      std::lock_guard<std::mutex> lock(g_mu);
+      const size_t need = sizeof(unsigned short) * static_cast<size_t>(K);
+      if (!g_tc_x_f16 || need > g_tc_x_f16_cap) {
+        if (g_tc_x_f16) g_api.cudaFree(g_tc_x_f16);
+        void* p = nullptr;
+        if (g_api.cudaMalloc(&p, need) == kCudaSuccess) {
+          g_tc_x_f16 = static_cast<unsigned short*>(p);
+          g_tc_x_f16_cap = need;
+        } else {
+          g_tc_x_f16 = nullptr;
+          g_tc_x_f16_cap = 0;
+        }
+      }
+      if (g_tc_x_f16) {
+        int nk = K;
+        const unsigned nxt = static_cast<unsigned>((K + 255) / 256);
+        void* xp[] = {(void*)&d_x, (void*)&g_tc_x_f16, (void*)&nk};
+        if (jit_launch(fx, nxt < 65535u ? nxt : 65535u, 1, 1, 256, 1, 1, 0, xp)) {
+          const float alpha = 1.f, beta = 0.f;
+          if (g_api.cublasGemmEx(g_cublas, kCublasOpT, kCublasOpN, M, 1, K, &alpha, d_W,
+                                 kCudaR_16F, K, g_tc_x_f16, kCudaR_16F, K, &beta, d_y,
+                                 kCudaR_32F, M, kCublasCompute32F, kCublasGemmDefault) ==
+              kCublasSuccess)
+            return true;
+        }
+      }
+    }
+    // 失败则落到下方 tiled FP32 路径
+  }
+  if (!g_api.cublasSgemm) return false;
   void* fn = get_jit_kernel(kActSrc, "w16_tile_to_f32");
   if (!fn) return false;
   const int tile = (M < kW16TileRows) ? M : kW16TileRows;
@@ -2186,6 +2530,80 @@ bool try_gemm_int4_batch_cublas_scratch(const float* X, int n, const qlwc::Int4V
   return gemm_dev_batch(g_dequant_scratch, X, n, Y, res->M, res->K);
 }
 
+// Tensor-core FP16 prefill GEMM: upload X(fp32) → dequant W resident int4→fp16 → convert X→fp16 →
+// cublasGemmEx(FP16×FP16→FP32)。仅长 batch（FLOP 密集）值得。
+bool tc_gemm_int4_batch_f16(const float* X, int n, const qlwc::Int4View& W, float* Y) {
+  if (!g_enabled || !X || !Y || n <= 0) return false;
+  if (!g_api.cublasGemmEx) return false;
+  {
+    // tc FP16 GEMM 已在真实权重验证正确（长 prefill n>=64 首选）；LLMOC_TC_GEMM=0 关闭
+    const char* e = std::getenv("LLMOC_TC_GEMM");
+    if (e && e[0] == '0') return false;
+  }
+  const Int4Resident* res = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    res = ensure_int4_resident(W);
+  }
+  if (!res || !jit_available()) return false;
+  if (!res->d_qweight || !res->d_scales) return false;
+  const int M = res->M, K = res->K;
+  if (M <= 0 || K <= 0 || res->ng <= 0 || res->gs <= 0) return false;
+  const size_t wb = sizeof(unsigned short) * static_cast<size_t>(M) * K;
+  const size_t xb = sizeof(unsigned short) * static_cast<size_t>(n) * K;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_tc_w_f16 || wb > g_tc_w_f16_cap) {
+      if (g_tc_w_f16) g_api.cudaFree(g_tc_w_f16);
+      void* p = nullptr;
+      if (g_api.cudaMalloc(&p, wb) != kCudaSuccess) { g_tc_w_f16 = nullptr; g_tc_w_f16_cap = 0; return false; }
+      g_tc_w_f16 = static_cast<unsigned short*>(p);
+      g_tc_w_f16_cap = wb;
+    }
+    if (!g_tc_x_f16 || xb > g_tc_x_f16_cap) {
+      if (g_tc_x_f16) g_api.cudaFree(g_tc_x_f16);
+      void* p = nullptr;
+      if (g_api.cudaMalloc(&p, xb) != kCudaSuccess) { g_tc_x_f16 = nullptr; g_tc_x_f16_cap = 0; return false; }
+      g_tc_x_f16 = static_cast<unsigned short*>(p);
+      g_tc_x_f16_cap = xb;
+    }
+    if (!ensure_xy(M, K, n)) return false;
+    if (g_api.cudaMemcpy(g_dx, X, sizeof(float) * static_cast<size_t>(n) * K, kCudaMemcpyH2D) !=
+        kCudaSuccess)
+      return false;
+  }
+  void* dq = get_jit_kernel(kTcSrc, "int4_to_f16");
+  void* cx = get_jit_kernel(kTcSrc, "f32_to_f16_buf");
+  if (!dq || !cx) return false;
+  const int ng = res->ng, gs = res->gs, is_awq = res->is_awq ? 1 : 0, awq_zp = res->awq_zp;
+  const unsigned wtotal = static_cast<unsigned>((M * (unsigned long)K + 255u) / 256u);
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    void* dp[] = {(void*)&res->d_qweight, (void*)&res->d_scales, (void*)&res->d_zeros,
+                  (void*)&g_tc_w_f16, (void*)&M, (void*)&K, (void*)&ng, (void*)&gs,
+                  (void*)&is_awq, (void*)&awq_zp};
+    if (!jit_launch(dq, wtotal < 65535u ? wtotal : 65535u, 1, 1, 256, 1, 1, 0, dp)) return false;
+    const int nx = n * K;
+    const unsigned nxt = static_cast<unsigned>((nx + 255) / 256);
+    void* xp[] = {(void*)&g_dx, (void*)&g_tc_x_f16, (void*)&nx};
+    if (!jit_launch(cx, nxt < 65535u ? nxt : 65535u, 1, 1, 256, 1, 1, 0, xp)) return false;
+  }
+  const float alpha = 1.f, beta = 0.f;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    int st = kCublasCompute32F;
+    if (g_api.cublasGemmEx(g_cublas, kCublasOpT, kCublasOpN, M, n, K, &alpha, g_tc_w_f16,
+                           kCudaR_16F, K, g_tc_x_f16, kCudaR_16F, K, &beta,
+                           reinterpret_cast<float*>(g_dy), kCudaR_32F, M, st, kCublasGemmDefault) !=
+        kCublasSuccess)
+      return false;
+    if (g_api.cudaMemcpy(Y, g_dy, sizeof(float) * static_cast<size_t>(n) * M, kCudaMemcpyD2H) !=
+        kCudaSuccess)
+      return false;
+  }
+  return true;
+}
+
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y) {
   if (!g_enabled || !X || !Y || n <= 0) return false;
   if (n == 1) {
@@ -2273,8 +2691,8 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
   };
 
   if (n >= kLongPrefillN) {
-    // Prefer on-the-fly INT4 JIT (smem-tiled). Full FP32 dequant+cublas was 5–10× slower
-    // on long prefill (re-expand M×K every call; measured ~0.2 layer/s vs ~1.7).
+    // 长 prefill：Tensor-core FP16 (INT4→FP16 + cublasGemmEx) 最优先；JIT 与 FP32 兜底。
+    if (tc_gemm_int4_batch_f16(X, n, W, Y)) return true;
     if (try_int4_jit_batch()) return true;
     if (try_gemm_int4_batch_cublas_scratch(X, n, W, Y)) return true;
     if (try_cublas_fp32_batch()) return true;
@@ -2419,19 +2837,50 @@ bool try_gemm_int4_multi(const float* x, const qlwc::Int4View* const* Ws, float*
 // q/k: [n_heads, dk], v: [n_heads, dv], g/beta: [n_heads], state: [n_heads, dk, dv], out: [n_heads, dv]
 bool try_attn_prefill(const float* q, const float* k, const float* v, float* out, int seq,
                       int n_heads, int n_kv_heads, int head_dim, float scale) {
-  if (!g_enabled || !q || !k || !v || !out) return false;
   {
     const char* e = std::getenv("LLMOC_GPU_ATTN");
     if (e && e[0] == '0') return false;  // A/B: force CPU attn
   }
+  const float tau = []
+  {
+    const char* e = std::getenv("LLMOC_PREFILL_TAU");
+    return e && e[0] ? static_cast<float>(std::atof(e)) : 1e9f;
+  }();
+  const float mean_corr = []
+  {
+    const char* e = std::getenv("LLMOC_PREFILL_MEANCORR");
+    return e && e[0] ? static_cast<float>(std::atof(e)) : 0.f;
+  }();
+  return try_attn_prefill_sparse(q, k, v, out, seq, n_heads, n_kv_heads, head_dim, scale, tau,
+                                 mean_corr);
+}
+
+bool try_attn_prefill_sparse(const float* q, const float* k, const float* v, float* out, int seq,
+                             int n_heads, int n_kv_heads, int head_dim, float scale, float tau,
+                             float mean_corr) {
+  if (!g_enabled || !q || !k || !v || !out) return false;
   if (seq <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0) return false;
   if (n_heads % n_kv_heads != 0) return false;
   if (!jit_available()) return false;
-  // scores[seq] in shared memory; default limit ~48KiB
-  const size_t shmem = sizeof(float) * static_cast<size_t>(seq);
-  if (shmem > 48ull * 1024ull) return false;
 
-  void* fn = get_jit_kernel(kAttnPrefillSrc, "attn_prefill_naive");
+  // FlashPrefill-V2 风格 kernel：并行 softmax + float4 向量化 + 稀疏跳块（均值校正）。
+  //   LLMOC_ATTN_PREFILL=naive 强制旧 kernel；LLMOC_PREFILL_TAU=…（默认 1e9=关)
+  //   开稀疏时代价：每块最大概率 < exp(-tau)*(1+mean_corr/n) 的被剪掉 V 访存（long ctx 才划算）。
+  bool use_flash = true;
+  {
+    const char* e = std::getenv("LLMOC_ATTN_PREFILL");
+    if (e && e[0] == 'n') use_flash = false;
+  }
+  const int sparse = (tau < 50.f) ? 1 : 0;
+
+  // Flash kernel 需要 hd%4==0；naive 对所有形状可用。共享上限 ~48KiB（score+nb）。
+  const int nb = (seq + 255) / 256;
+  const size_t shmem_flash = sizeof(float) * static_cast<size_t>(seq + 16 + nb);
+  const size_t shmem_naive = sizeof(float) * static_cast<size_t>(seq);
+  if (shmem_flash > 48ull * 1024ull) return false;
+  if (shmem_naive > 48ull * 1024ull) return false;
+  const bool flash_ok = use_flash && (head_dim % 4 == 0) && (head_dim > 0);
+  void* fn = get_jit_kernel(kAttnPrefillSrc, flash_ok ? "attn_prefill_flash" : "attn_prefill_naive");
   if (!fn) return false;
 
   const size_t qb = sizeof(float) * static_cast<size_t>(seq) * n_heads * head_dim;
@@ -2469,11 +2918,78 @@ bool try_attn_prefill(const float* q, const float* k, const float* v, float* out
   void* dk = g_attn_k;
   void* dv = g_attn_v;
   void* dout = g_attn_o;
-  void* params[] = {&dq, &dk, &dv, &dout, &seq_i, &nh, &nkv, &hd, &scale_mut};
-  if (!jit_launch(fn, static_cast<unsigned>(seq), static_cast<unsigned>(n_heads), 1, 256, 1, 1,
-                  static_cast<unsigned>(shmem), params))
-    return false;
+  if (flash_ok) {
+    float tau_mut = tau, mc_mut = mean_corr;
+    int sparse_i = sparse;
+    void* params[] = {&dq, &dk, &dv, &dout, &seq_i, &nh, &nkv, &hd, &scale_mut,
+                      &tau_mut, &mc_mut, &sparse_i};
+    if (!jit_launch(fn, static_cast<unsigned>(seq), static_cast<unsigned>(n_heads), 1, 128, 1, 1,
+                    static_cast<unsigned>(shmem_flash), params))
+      return false;
+  } else {
+    void* params[] = {&dq, &dk, &dv, &dout, &seq_i, &nh, &nkv, &hd, &scale_mut};
+    if (!jit_launch(fn, static_cast<unsigned>(seq), static_cast<unsigned>(n_heads), 1, 256, 1, 1,
+                    static_cast<unsigned>(shmem_naive), params))
+      return false;
+  }
   return d2h(out, g_attn_o, ob);
+}
+
+// 单 query decode attention：flash kernel（seq 并行）。k/v_cache 上传当前使用的 nkv*seq_len*stride 切片。
+bool try_attn_decode_gpu(const float* q, const float* k_cache, const float* v_cache, float* out,
+                         int seq_len, int stride, int n_heads, int n_kv, int hd, float scale) {
+  if (!g_enabled || !jit_available()) return false;
+  {
+    const char* e = std::getenv("LLMOC_GPU_DECODE");
+    if (e && e[0] == '0') return false;  // A/B：force CPU attn_decode_one
+  }
+  if (!q || !k_cache || !v_cache || !out) return false;
+  if (seq_len <= 0 || n_heads <= 0 || n_kv <= 0 || hd <= 0 || n_heads % n_kv) return false;
+  const size_t smem = sizeof(float) * (static_cast<size_t>(hd) + seq_len + 16);
+  if (smem > 48ull * 1024ull) return false;
+  void* fn = get_jit_kernel(kAttnDecodeSrc, "attn_decode_flash");
+  if (!fn) return false;
+  const size_t qb = sizeof(float) * static_cast<size_t>(n_heads) * hd;
+  const size_t kvb = sizeof(float) * static_cast<size_t>(n_kv) * static_cast<size_t>(seq_len) * hd;
+  const size_t kv_row = sizeof(float) * static_cast<size_t>(hd) * static_cast<size_t>(seq_len);
+  const size_t ob = qb;
+  auto ensure = [&](float*& p, size_t& cap, size_t need) -> bool {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (need <= cap && p) return true;
+    if (p) g_api.cudaFree(p);
+    void* v = nullptr;
+    if (g_api.cudaMalloc(&v, need) != kCudaSuccess) { p = nullptr; cap = 0; return false; }
+    p = static_cast<float*>(v);
+    cap = need;
+    return true;
+  };
+  if (!ensure(g_dec_q, g_dec_q_cap, qb)) return false;
+  if (!ensure(g_dec_k, g_dec_k_cap, kvb)) return false;
+  if (!ensure(g_dec_v, g_dec_v_cap, kvb)) return false;
+  if (!ensure(g_dec_o, g_dec_o_cap, ob)) return false;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_api.cudaMemcpy(g_dec_q, q, qb, kCudaMemcpyH2D) != kCudaSuccess) return false;
+    // 只上传实际使用的 seq_len 切片：逐 kv 行（原 layout [hkv*stride+t]*hd → 设备 packed [hkv*seq_len+t]*hd）
+    for (int hkv = 0; hkv < n_kv; ++hkv) {
+      const float* ksrc = k_cache + ((size_t)hkv * stride) * hd;
+      const float* vsrc = v_cache + ((size_t)hkv * stride) * hd;
+      float* kdst = g_dec_k + ((size_t)hkv * seq_len) * hd;
+      float* vdst = g_dec_v + ((size_t)hkv * seq_len) * hd;
+      if (g_api.cudaMemcpy(kdst, ksrc, kv_row, kCudaMemcpyH2D) != kCudaSuccess) return false;
+      if (g_api.cudaMemcpy(vdst, vsrc, kv_row, kCudaMemcpyH2D) != kCudaSuccess) return false;
+    }
+  }
+  float scale_m = scale;
+  int sl = seq_len, st = seq_len /*设备 packed  row stride=seq_len*/, nh = n_heads, nkv = n_kv, hdd = hd;
+  void* dp[] = {(void*)&g_dec_q, (void*)&g_dec_k, (void*)&g_dec_v, (void*)&g_dec_o,
+                (void*)&sl, (void*)&st, (void*)&nh, (void*)&nkv, (void*)&hdd, (void*)&scale_m};
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!jit_launch(fn, n_heads, 1, 1, 256, 1, 1, static_cast<unsigned>(smem), dp))
+      return false;
+    return g_api.cudaMemcpy(out, g_dec_o, ob, kCudaMemcpyD2H) == kCudaSuccess;
+  }
 }
 
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,

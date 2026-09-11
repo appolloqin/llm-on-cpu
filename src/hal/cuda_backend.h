@@ -97,6 +97,8 @@ bool prefetch_w16(const uint16_t* W, int M, int K, bool is_f16);
 
 bool try_gemm_int4(const float* x, const qlwc::Int4View& W, float* y);
 bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* Y);
+// Tensor-core FP16 prefill GEMM (resident INT4 → device FP16 → cublasGemmEx). 长 batch 快，短回退。
+bool tc_gemm_int4_batch_f16(const float* X, int n, const qlwc::Int4View& W, float* Y);
 // Prefill: shared X across up to 4 INT4 weights (one H2D per chunk, then N GEMMs).
 bool try_gemm_int4_batch_multi(const float* X, int n, const qlwc::Int4View* const* Ws,
                                float* const* Ys, int nW);
@@ -129,6 +131,13 @@ bool d2h(void* dst, const void* src, size_t bytes);
 
 bool try_attn_prefill(const float* q, const float* k, const float* v, float* out, int seq,
                       int n_heads, int n_kv_heads, int head_dim, float scale);
+// FlashPrefill-V2 变体：显式 tau/mean_corr（tau<50 → 稀疏跳块；mean_corr 为均值校正项）。
+bool try_attn_prefill_sparse(const float* q, const float* k, const float* v, float* out, int seq,
+                             int n_heads, int n_kv_heads, int head_dim, float scale, float tau,
+                             float mean_corr);
+// 单 query decode attention: GPU flash kernel, 失败回退 CPU。
+bool try_attn_decode_gpu(const float* q, const float* k_cache, const float* v_cache, float* out,
+                         int seq_len, int stride, int n_heads, int n_kv, int hd, float scale);
 
 bool try_gated_delta_gpu(const float* q, const float* k, const float* v, const float* g,
                          const float* beta, float* state, float* out, int n_heads, int dk, int dv);
