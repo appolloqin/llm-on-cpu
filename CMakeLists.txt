@@ -19,23 +19,36 @@ endif()
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 include(CheckCXXCompilerFlag)
 include(CheckCXXSourceCompiles)
-include(FetchContent)
 
-# ---------- third_party ----------
-FetchContent_Declare(
-  json
-  URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-# 本引擎只提供明文 HTTP；关掉 OpenSSL 自动探测，避免 Windows 发布包依赖 libssl-*.dll
-set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
-set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-  httplib
-  URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-FetchContent_MakeAvailable(json httplib)
+# ---------- third_party (prefer vendored copies; FetchContent needs GitHub) ----------
+set(LLMOC_JSON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann")
+set(LLMOC_HTTPLIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cpp-httplib")
+if(EXISTS "${LLMOC_JSON_DIR}/json.hpp" AND EXISTS "${LLMOC_HTTPLIB_DIR}/httplib.h")
+  message(STATUS "Using vendored nlohmann/json + cpp-httplib under third_party/")
+  add_library(nlohmann_json INTERFACE)
+  add_library(nlohmann_json::nlohmann_json ALIAS nlohmann_json)
+  target_include_directories(nlohmann_json INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+
+  add_library(httplib INTERFACE)
+  add_library(httplib::httplib ALIAS httplib)
+  target_include_directories(httplib INTERFACE "${LLMOC_HTTPLIB_DIR}")
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  )
+  # 本引擎只提供明文 HTTP；关掉 OpenSSL 自动探测，避免 Windows 发布包依赖 libssl-*.dll
+  set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+  set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    httplib
+    URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.3.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  )
+  FetchContent_MakeAvailable(json httplib)
+endif()
 
 # ---------- AMX 微内核探测(仅编译开关; 运行时仍需 SPR 硬件) ----------
 add_library(llmoc_weights STATIC
@@ -211,6 +224,7 @@ add_executable(llmoc_unit_tests
   tests/unit/test_prefetch_pipeline.cpp
   tests/unit/test_spec_decode.cpp
   tests/unit/test_tokenizer.cpp
+  tests/unit/test_gen_stop.cpp
   tests/unit/test_moe_forward.cpp
   tests/unit/test_int4_gemm.cpp
   tests/unit/test_gated_delta_chunk.cpp

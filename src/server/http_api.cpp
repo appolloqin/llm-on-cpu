@@ -281,7 +281,22 @@ function stripThink(t){
 }
 function normalize(t){
   t=String(t||'').replace(/\r\n/g,'\n').replace(/[\u200b\ufeff]/g,'');
-  return t.replace(/\n{3,}/g,'\n\n').trim();
+  t=t.replace(/\n{3,}/g,'\n\n').trim();
+  // Collapse consecutive identical blocks (greedy n-gram loops that slipped past decode stop).
+  for(let guard=0;guard<8;guard++){
+    const parts=t.split(/\n---\n/);
+    if(parts.length<3) break;
+    let changed=false;
+    const out=[parts[0]];
+    for(let i=1;i<parts.length;i++){
+      if(parts[i].trim()===out[out.length-1].trim()){changed=true;continue;}
+      out.push(parts[i]);
+    }
+    const next=out.join('\n---\n');
+    if(!changed||next===t) break;
+    t=next;
+  }
+  return t;
 }
 function escHtml(s){
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');

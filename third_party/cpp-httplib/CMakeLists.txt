@@ -1,0 +1,6 @@
+﻿cmake_minimum_required(VERSION 3.25)
+project(httplib_local CXX)
+add_library(httplib INTERFACE)
+add_library(httplib::httplib ALIAS httplib)
+target_include_directories(httplib INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(httplib INTERFACE CPPHTTPLIB_NO_EXCEPTIONS=0)

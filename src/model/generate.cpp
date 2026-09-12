@@ -18,6 +18,7 @@
 
 #include "common/log.h"
 #include "model/chat_templates.h"
+#include "model/gen_stop.h"
 
 namespace llmoc::model {
 namespace {
@@ -403,6 +404,21 @@ GenerateResult Generator::generate(const GenerateRequest& req, const TokenSink& 
       }
     } else {
       ws_run = 0;
+    }
+    // Greedy / low-temp can lock onto a phrase and burn max_new_tokens (e.g. repeating
+    // 「最终状态总结」). Stop once a token n-gram cycle is clear, then drop extra copies.
+    const int cycle = find_token_cycle_period(out.token_ids);
+    if (cycle > 0) {
+      stop_reason = "token_cycle";
+      const int before = static_cast<int>(out.token_ids.size());
+      trim_trailing_token_cycles(out.token_ids, cycle);
+      const int dropped = before - static_cast<int>(out.token_ids.size());
+      if (dropped > 0 && !out.logprobs.empty()) {
+        const int keep = static_cast<int>(out.logprobs.size()) - dropped;
+        out.logprobs.resize(keep > 0 ? static_cast<size_t>(keep) : 0);
+      }
+      // text rebuilt from token_ids after the decode loop
+      return false;
     }
     if (on_token) {
       if (greq.logprobs) {
