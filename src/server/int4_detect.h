@@ -47,6 +47,13 @@ inline std::string lower_ascii(std::string s) {
   return s;
 }
 
+inline bool path_looks_qwen35(const std::string& s) {
+  const std::string l = lower_ascii(s);
+  return l.find("qwen3.5") != std::string::npos || l.find("qwen35") != std::string::npos ||
+         l.find("3.5-9") != std::string::npos || l.find("3.5-4") != std::string::npos ||
+         l.find("3.5-2") != std::string::npos;
+}
+
 inline bool path_looks_qwen36(const std::string& s) {
   const std::string l = lower_ascii(s);
   return l.find("qwen3.6") != std::string::npos || l.find("qwen36") != std::string::npos ||
@@ -59,11 +66,13 @@ inline bool path_looks_qwen38(const std::string& s) {
          l.find("3.8-27") != std::string::npos;
 }
 
-// Family 3.8 (dense or MoE). Path wins; dense geometry fallback must not steal 3.6 MoE.
+// Family 3.8 (dense or MoE). Path wins; dense geometry fallback must not steal 3.5-9B or 3.6 MoE.
 inline bool hf_config_looks_qwen38(const std::string& config_json_path,
                                    const std::string& model_path_hint, bool is_moe) {
   if (path_looks_qwen38(config_json_path) || path_looks_qwen38(model_path_hint)) return true;
   if (path_looks_qwen36(config_json_path) || path_looks_qwen36(model_path_hint)) return false;
+  // Qwen3.5-9B is also hidden=4096 — must not classify as 3.8 by H alone.
+  if (path_looks_qwen35(config_json_path) || path_looks_qwen35(model_path_hint)) return false;
   if (is_moe) return false;  // unnamed MoE → 3.6 MoE entry
 
   std::ifstream in(config_json_path);
@@ -77,8 +86,9 @@ inline bool hf_config_looks_qwen38(const std::string& config_json_path,
   const auto& tc = root.contains("text_config") ? root["text_config"] : root;
   const int H = tc.value("hidden_size", 0);
   const int L = tc.value("num_hidden_layers", 0);
-  // 3.8-27B dense: hidden=5120 layers=64; keep clear of 3.5-4B (2560/32).
-  return H >= 4096 || L >= 48;
+  // 3.8-27B dense: hidden=5120 layers=64.
+  // Do NOT use H>=4096: that false-positives Qwen3.5-9B (H=4096, L=32, head_dim=256).
+  return H >= 5120 || L >= 60;
 }
 
 }  // namespace llmoc::server::int4_detect

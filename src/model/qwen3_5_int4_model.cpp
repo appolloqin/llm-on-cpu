@@ -149,6 +149,24 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
   else
     throw std::runtime_error("cannot find embed_tokens in QLWC");
 
+  // Official Qwen3.5-9B is untied (tie_word_embeddings=false). A wrong/missing HF flag
+  // defaults to tie=true and reuses embed as lm_head → multilingual garbage decode.
+  {
+    const bool has_lm = store_->has(prefix_ + "lm_head.weight") || store_->has("lm_head.weight");
+    if (has_lm && cfg_.tie_embeddings) {
+      LOG_WARN(
+          "tie_word_embeddings=true in config but lm_head.weight exists in QLWC — forcing "
+          "untied lm_head (fixes Qwen3.5-9B garbage when HF flag is wrong/missing)");
+      cfg_.tie_embeddings = false;
+    } else if (!has_lm && cfg_.tie_embeddings && cfg_.hidden >= 4096 && cfg_.layers <= 48 &&
+               !cfg_.is_moe) {
+      LOG_WARN(
+          "geometry looks like Qwen3.5-9B (H=%d L=%d) with tied embeddings and no lm_head in "
+          "QLWC — official 9B is untied; re-convert/import so lm_head.weight is present",
+          cfg_.hidden, cfg_.layers);
+    }
+  }
+
   meta_.hidden = cfg_.hidden;
   meta_.layers = cfg_.layers;
   meta_.vocab = cfg_.vocab;
@@ -212,16 +230,18 @@ void Qwen35Int4Model::load(qlwc::QlwcStore* store, const std::string& hf_config_
     LOG_INFO("Qwen35Int4 qlwc: scheme=%s int4=%zu with_zeros=%zu hf_quant=%s zero_point=%d",
              sch == qlwc::Scheme::kAwqSym ? "awq_sym" : "gptq_asym", int4_n, zeros_n, qmethod.c_str(),
              hf_zp ? 1 : 0);
-    if (cfg_.is_moe && hf_zp && sch == qlwc::Scheme::kAwqSym) {
+    // Dense or MoE: AutoAWQ zero_point:true → must keep qzeros (gptq_asym). awq_sym drops them
+    // and decode collapses to sticky garbage (e.g. 「消毒语文」).
+    if (hf_zp && sch == qlwc::Scheme::kAwqSym) {
       throw std::runtime_error(
-          "MoE QLWC scheme=awq_sym but HF quantization_config.zero_point=true — qzeros were "
-          "dropped at import, decode collapses (ici/endah/…). Re-import with current "
+          "QLWC scheme=awq_sym but HF quantization_config.zero_point=true — qzeros were "
+          "dropped at import, decode collapses (garbage tokens). Re-import with current "
           "tools/import_awq_hf_qlwc.mjs (expect scheme=gptq), then: node tools/qlwc_info.mjs "
           "<file.qlwc>");
     }
-    if (cfg_.is_moe && sch == qlwc::Scheme::kGptqAsym && zeros_n == 0 && int4_n > 0) {
+    if (sch == qlwc::Scheme::kGptqAsym && zeros_n == 0 && int4_n > 0) {
       throw std::runtime_error(
-          "MoE QLWC scheme=gptq_asym but no zeros blobs — corrupt import; re-run import_awq_hf_qlwc");
+          "QLWC scheme=gptq_asym but no zeros blobs — corrupt import; re-run import_awq_hf_qlwc");
     }
   }
 
@@ -295,9 +315,11 @@ void Qwen35Int4Model::build_layer_packs() {
     }
   }
   build_global_packs();
-  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d lin_v=%d tie=%d moe=%d experts=%d topk=%d",
-           cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0,
-           cfg_.is_moe ? 1 : 0, cfg_.n_experts, cfg_.topk);
+  LOG_INFO("Qwen35Int4: layers=%d hidden=%d heads=%d head_dim=%d inter=%d lin_v=%d tie=%d moe=%d "
+           "experts=%d topk=%d",
+           cfg_.layers, cfg_.hidden, cfg_.n_heads, cfg_.head_dim, cfg_.intermediate,
+           cfg_.linear_num_v, cfg_.tie_embeddings ? 1 : 0, cfg_.is_moe ? 1 : 0, cfg_.n_experts,
+           cfg_.topk);
   if (cfg_.is_moe) {
     const auto sch = store_->header().scheme;
     const char* sch_s = sch == qlwc::Scheme::kAwqSym ? "awq_sym_zp7" : "gptq_asym";
@@ -823,8 +845,8 @@ void Qwen35Int4Model::moe_ffn_token(int /*layer*/, const float* /*normed*/, floa
   throw std::runtime_error("moe_ffn_token: MoE requires Qwen36MoeInt4Model");
 }
 
+// GPU seq GDN/conv 实测比 CPU AVX2 慢（占用率低）；默认关, 需要 A/B 时 LLMOC_GPU_GDN=1
 bool gpu_gdn_enabled() {
-  // GPU seq GDN/conv 实测比 CPU AVX2 慢（占用率低）；默认关, 需要 A/B 时 LLMOC_GPU_GDN=1
   static const int e = [] {
     const char* p = std::getenv("LLMOC_GPU_GDN");
     return (p && p[0] != '0' && p[0] != '\0') ? 1 : 0;

@@ -119,6 +119,9 @@ TINY_TEST(Attn, FlashPrefillMatchesRef) {
   run_case(128, 8, 4, 64);
   run_case(256, 8, 4, 128);
   run_case(512, 8, 4, 128);
+  // Qwen3.5-4B/9B full attention uses head_dim=256 — must tile along hd.
+  run_case(64, 4, 2, 256);
+  run_case(128, 8, 4, 256);
 }
 
 static uint16_t f32_to_f16_bits(float f) {

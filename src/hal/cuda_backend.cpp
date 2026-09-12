@@ -1,13 +1,14 @@
 // llm-on-cpu :: hal/cuda_backend.cpp — M5 dynamic CUDA (no nvcc)
 #include "hal/cuda_backend.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
-#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -2026,18 +2027,17 @@ extern "C" __global__ void attn_prefill_flash(
   float* score = sm;
   float* rb = sm + seq + 4;           // reduce scratch
   const float* qh = q + ((size_t)tq * n_heads + h) * hd;
-  const int d4 = lane * 4;
-  const bool dims_ok = (hd % 4 == 0) && (d4 + 3 < hd);
-  float q0 = dims_ok ? qh[d4] : 0.f, q1 = dims_ok ? qh[d4 + 1] : 0.f;
-  float q2 = dims_ok ? qh[d4 + 2] : 0.f, q3 = dims_ok ? qh[d4 + 3] : 0.f;
+  // hd may be 256 (Qwen3.5-4B/9B). One warp only covers 32*4=128 dims — tile along hd.
+  const int d_stride = 32 * 4;
   // Phase 1: scores (4 warps 并行 4 个 K 位置, float4 点积 + warp reduce)
   for (int base = 0; base <= tq; base += 4) {
     const int tk = base + warp;
     if (tk <= tq) {
       const float* kt = k + ((size_t)tk * n_kv + hkv) * hd;
       float dot = 0.f;
-      if (dims_ok)
-        dot = q0 * kt[d4] + q1 * kt[d4 + 1] + q2 * kt[d4 + 2] + q3 * kt[d4 + 3];
+      for (int d4 = lane * 4; d4 + 3 < hd; d4 += d_stride)
+        dot += qh[d4] * kt[d4] + qh[d4 + 1] * kt[d4 + 1] + qh[d4 + 2] * kt[d4 + 2] +
+               qh[d4 + 3] * kt[d4 + 3];
       dot = wp_reduce_sum(dot);
       if (lane == 0) score[tk] = dot * scale;
     }
@@ -2071,21 +2071,19 @@ extern "C" __global__ void attn_prefill_flash(
     __syncthreads();
   }
   const float gate = sparse ? expf(-tau) * (1.f + mean_corr / (float)n) : 0.f;
-  // Phase 3: V 累加（float4, 稀疏跳块）
+  // Phase 3: V 累加（float4 tiles along hd, 稀疏跳块）
   float* oh = out + ((size_t)tq * n_heads + h) * hd;
-  float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
-  for (int tk = 0; tk <= tq; ++tk) {
-    if (sparse && bmax[tk / B] < gate) continue;
-    const float w = score[tk];
-    const float* vt = v + ((size_t)tk * n_kv + hkv) * hd;
-    if (dims_ok) {
+  for (int d4 = lane * 4; d4 + 3 < hd; d4 += d_stride) {
+    float o0 = 0.f, o1 = 0.f, o2 = 0.f, o3 = 0.f;
+    for (int tk = 0; tk <= tq; ++tk) {
+      if (sparse && bmax[tk / B] < gate) continue;
+      const float w = score[tk];
+      const float* vt = v + ((size_t)tk * n_kv + hkv) * hd;
       o0 += w * vt[d4];
       o1 += w * vt[d4 + 1];
       o2 += w * vt[d4 + 2];
       o3 += w * vt[d4 + 3];
     }
-  }
-  if (dims_ok) {
     oh[d4] = o0;
     oh[d4 + 1] = o1;
     oh[d4 + 2] = o2;
@@ -2691,6 +2689,33 @@ bool try_gemm_int4_batch(const float* X, int n, const qlwc::Int4View& W, float* 
   };
 
   if (n >= kLongPrefillN) {
+    // 很长 prefill：优先 FP32（INT4→FP32 scratch / device），减轻 32 层累积的 FP16 误差；
+    // 短于阈值仍先试 Tensor-core（吞吐优先）。
+    auto log_gemm_once = [&](const char* path) {
+      static std::atomic<int> once{1};
+      if (once.fetch_sub(1) > 0)
+        LOG_INFO("gemm prefill: path=%s n=%d M=%d K=%d (LLMOC_TC_GEMM=0 forces no TC)", path, n,
+                 W.M, W.K);
+    };
+    if (n >= 512) {
+      if (try_gemm_int4_batch_cublas_scratch(X, n, W, Y)) {
+        log_gemm_once("fp32_scratch");
+        return true;
+      }
+      if (try_cublas_fp32_batch()) {
+        log_gemm_once("fp32_device");
+        return true;
+      }
+      if (try_int4_jit_batch()) {
+        log_gemm_once("int4_jit");
+        return true;
+      }
+      if (tc_gemm_int4_batch_f16(X, n, W, Y)) {
+        log_gemm_once("tc_fp16_fallback");
+        return true;
+      }
+      return false;
+    }
     // 长 prefill：Tensor-core FP16 (INT4→FP16 + cublasGemmEx) 最优先；JIT 与 FP32 兜底。
     if (tc_gemm_int4_batch_f16(X, n, W, Y)) return true;
     if (try_int4_jit_batch()) return true;
@@ -2863,13 +2888,18 @@ bool try_attn_prefill_sparse(const float* q, const float* k, const float* v, flo
   if (n_heads % n_kv_heads != 0) return false;
   if (!jit_available()) return false;
 
-  // FlashPrefill-V2 风格 kernel：并行 softmax + float4 向量化 + 稀疏跳块（均值校正）。
-  //   LLMOC_ATTN_PREFILL=naive 强制旧 kernel；LLMOC_PREFILL_TAU=…（默认 1e9=关)
-  //   开稀疏时代价：每块最大概率 < exp(-tau)*(1+mean_corr/n) 的被剪掉 V 访存（long ctx 才划算）。
+  // FlashPrefill: default on for hd<=128. Qwen3.5 full-attn uses hd=256 — tiled flash exists
+  // but long-prefill still shows early-EOS quality issues; prefer naive (full-hd loops) unless
+  // LLMOC_ATTN_PREFILL=flash. Force naive: =naive|n.
   bool use_flash = true;
   {
     const char* e = std::getenv("LLMOC_ATTN_PREFILL");
-    if (e && e[0] == 'n') use_flash = false;
+    if (e && (e[0] == 'n' || e[0] == 'N'))
+      use_flash = false;
+    else if (e && (e[0] == 'f' || e[0] == 'F'))
+      use_flash = true;
+    else if (head_dim > 128)
+      use_flash = false;
   }
   const int sparse = (tau < 50.f) ? 1 : 0;
 
@@ -2877,9 +2907,20 @@ bool try_attn_prefill_sparse(const float* q, const float* k, const float* v, flo
   const int nb = (seq + 255) / 256;
   const size_t shmem_flash = sizeof(float) * static_cast<size_t>(seq + 16 + nb);
   const size_t shmem_naive = sizeof(float) * static_cast<size_t>(seq);
-  if (shmem_flash > 48ull * 1024ull) return false;
+  if (use_flash && shmem_flash > 48ull * 1024ull) use_flash = false;
   if (shmem_naive > 48ull * 1024ull) return false;
   const bool flash_ok = use_flash && (head_dim % 4 == 0) && (head_dim > 0);
+  if (flash_ok && seq >= 1024 && head_dim >= 256) {
+    static std::atomic<int> once{1};
+    if (once.fetch_sub(1) > 0)
+      LOG_INFO("attn prefill: flash hd=%d seq=%d (set LLMOC_ATTN_PREFILL=naive to compare)",
+               head_dim, seq);
+  } else if (!flash_ok && head_dim > 128 && seq >= 256) {
+    static std::atomic<int> once{1};
+    if (once.fetch_sub(1) > 0)
+      LOG_INFO("attn prefill: naive hd=%d seq=%d (safer for Qwen3.5 hd=256; FLASH to force flash)",
+               head_dim, seq);
+  }
   void* fn = get_jit_kernel(kAttnPrefillSrc, flash_ok ? "attn_prefill_flash" : "attn_prefill_naive");
   if (!fn) return false;
 

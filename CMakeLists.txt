@@ -225,6 +225,7 @@ add_executable(llmoc_unit_tests
   tests/unit/test_spec_decode.cpp
   tests/unit/test_tokenizer.cpp
   tests/unit/test_gen_stop.cpp
+  tests/unit/test_int4_detect.cpp
   tests/unit/test_moe_forward.cpp
   tests/unit/test_int4_gemm.cpp
   tests/unit/test_gated_delta_chunk.cpp
