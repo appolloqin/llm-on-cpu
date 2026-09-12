@@ -250,6 +250,37 @@ size_t g_attn_k_bytes = 0;
 size_t g_attn_v_bytes = 0;
 size_t g_attn_o_bytes = 0;
 
+// ---- Resident prefill (n>1): X stays on device across all layers ----
+float* g_pf_arena = nullptr;
+size_t g_pf_arena_cap = 0;
+PrefillResidentDims g_pf_dims;
+bool g_pf_active = false;
+std::string g_pf_last_err;
+float* g_pf_x = nullptr;         // n*H   residual stream
+float* g_pf_normed = nullptr;    // n*H
+float* g_pf_c1 = nullptr;        // n*C1  (mixed | qg | gproj; C1 = max(conv_dim, 2*nh*hd, I))
+float* g_pf_c2 = nullptr;        // n*C2  (mixed_c | qq | uproj; C2 = max(conv_dim, I, nh*hd))
+float* g_pf_z = nullptr;         // n*VD  (z | attn gate; VD = max(value_dim, nh*hd))
+float* g_pf_b = nullptr;         // n*nv
+float* g_pf_a = nullptr;         // n*nv
+float* g_pf_q = nullptr;         // n*nv*dk (gdn q | full kk)
+float* g_pf_k = nullptr;         // n*nv*dk (gdn k | full vv)
+float* g_pf_v = nullptr;         // n*VD    (gdn v)
+float* g_pf_g = nullptr;         // n*nv
+float* g_pf_beta = nullptr;      // n*nv
+float* g_pf_core = nullptr;      // n*VD  (gdn core | attn heads)
+float* g_pf_attn_out = nullptr;  // n*H
+float* g_pf_down = nullptr;      // n*H
+float* g_pf_kraw = nullptr;      // n*nkv*hd (wk GEMM out)
+float* g_pf_vraw = nullptr;      // n*nkv*hd (wv GEMM out)
+float* g_pf_kstage = nullptr;    // nkv*n*hd [h][t][hd] → strided-free D2H into host KV cache
+float* g_pf_vstage = nullptr;    // nkv*n*hd
+int* g_pf_pos = nullptr;         // 3*n ints (t/h/w mrope positions)
+size_t g_pf_pos_cap = 0;
+// Per-layer small constants (ln/qn/kn/nrm u16, A_log/dt_bias f32) cached on device by host ptr.
+std::unordered_map<const void*, void*> g_pf_const;
+void pf_free_arena();  // defined next to the resident-prefill implementation
+
 // 累计性能采样: 用于诊断 GEMV 路径瓶颈。disable 时清零。
 double g_prof_h2d_us = 0.0;
 double g_prof_kernel_us = 0.0;
@@ -1001,6 +1032,12 @@ void disable() {
     g_lin_ws = nullptr;
     g_lin_ws_cap = 0;
   }
+  for (auto& kv : g_pf_const) {
+    if (kv.second) g_api.cudaFree(kv.second);
+  }
+  g_pf_const.clear();
+  pf_free_arena();
+  g_pf_last_err.clear();
   if (g_attn_q) g_api.cudaFree(g_attn_q);
   if (g_attn_k) g_api.cudaFree(g_attn_k);
   if (g_attn_v) g_api.cudaFree(g_attn_v);
@@ -1927,6 +1964,222 @@ extern "C" __global__ void w16_tile_to_f32(const unsigned short* __restrict__ W,
       continue;
     }
     out[i] = w16_to_f32(W[(size_t)m * (size_t)K + (size_t)c], is_f16);
+  }
+}
+)CUDA";
+
+// Resident-prefill batch kernels (n>1): X stays on device across all layers.
+const char* kPrefillBatchSrc = R"CUDA(
+__device__ __forceinline__ float pf_w16_to_f32(unsigned short h, int is_f16) {
+  if (is_f16) {
+    unsigned int sign = (h & 0x8000u) << 16;
+    unsigned int exp = (h >> 10) & 0x1Fu;
+    unsigned int man = (h & 0x3FFu);
+    unsigned int bits;
+    if (exp == 0u) {
+      if (man == 0u) bits = sign;
+      else {
+        exp = 1u;
+        while ((man & 0x400u) == 0u) { man <<= 1; exp -= 1u; }
+        man &= 0x3FFu;
+        bits = sign | ((exp + 112u) << 23) | (man << 13);
+      }
+    } else if (exp == 31u) {
+      bits = sign | 0x7F800000u | (man << 13);
+    } else {
+      bits = sign | ((exp + 112u) << 23) | (man << 13);
+    }
+    return __uint_as_float(bits);
+  }
+  unsigned int bits = ((unsigned int)h) << 16;
+  return __uint_as_float(bits);
+}
+
+// Batch RMSNorm (1+w), one block per token row. CPU: rmsnorm(..., one_plus_weight=true).
+extern "C" __global__ void rmsnorm_w16_batch(const float* __restrict__ x,
+                                             const unsigned short* __restrict__ w,
+                                             float* __restrict__ y, int H, float eps,
+                                             int is_f16) {
+  const int t = blockIdx.x;
+  const float* xt = x + (size_t)t * H;
+  float* yt = y + (size_t)t * H;
+  extern __shared__ float smem[];
+  const int tid = threadIdx.x;
+  float sum = 0.f;
+  for (int i = tid; i < H; i += blockDim.x) {
+    float v = xt[i];
+    if (!(v == v)) v = 0.f;
+    sum += v * v;
+  }
+  smem[tid] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) smem[tid] += smem[tid + s];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(smem[0] / (float)H + eps);
+  for (int i = tid; i < H; i += blockDim.x) {
+    float v = xt[i];
+    if (!(v == v)) v = 0.f;
+    float o = v * inv * (1.f + pf_w16_to_f32(w[i], is_f16));
+    yt[i] = (o == o) ? o : 0.f;
+  }
+}
+
+// GDN pack q/k (repeat nk→nv) + v copy, batched over tokens.
+extern "C" __global__ void gdn_pack_qkv_batch(const float* __restrict__ mixed_c,
+                                              float* __restrict__ q, float* __restrict__ k,
+                                              float* __restrict__ v, int n_tok, int nk, int nv,
+                                              int dk, int dv) {
+  const int key_dim = nk * dk;
+  const int value_dim = nv * dv;
+  const int conv_dim = key_dim * 2 + value_dim;
+  const int rep = nv / nk;
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nqk = n_tok * nv * dk;
+  if (tid < nqk) {
+    const int hh = tid % (nv * dk);
+    const int t = tid / (nv * dk);
+    const int d = hh % dk;
+    const int h = (hh / dk) / rep;
+    const float* mc = mixed_c + (size_t)t * conv_dim;
+    q[tid] = mc[h * dk + d];
+    k[tid] = mc[key_dim + h * dk + d];
+  }
+  const int nvv = n_tok * value_dim;
+  if (tid < nvv) {
+    const int e = tid % value_dim;
+    const int t = tid / value_dim;
+    v[tid] = mixed_c[(size_t)t * conv_dim + 2 * key_dim + e];
+  }
+}
+
+// beta = sigmoid(b); g = -clamp(exp(A_log)) * softplus(a + dt_bias), batched.
+extern "C" __global__ void gdn_prep_gb_batch(const float* __restrict__ b,
+                                             const float* __restrict__ a,
+                                             const float* __restrict__ A_log,
+                                             const float* __restrict__ dt_bias,
+                                             float* __restrict__ beta, float* __restrict__ g,
+                                             int n_tok, int nv) {
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid >= n_tok * nv) return;
+  const int h = tid % nv;
+  beta[tid] = 1.f / (1.f + expf(-b[tid]));
+  float A = expf(A_log[h]);
+  if (!(A == A) || A > 1e4f) A = 1e4f;
+  if (A < 1e-6f) A = 1e-6f;
+  const float x = a[tid] + dt_bias[h];
+  float sp;
+  if (x > 20.f) sp = x;
+  else if (x < -20.f) sp = expf(x);
+  else sp = logf(1.f + expf(x));
+  if (!(sp == sp)) sp = 0.f;
+  g[tid] = -A * sp;
+}
+
+// y[i] *= sigmoid(gate[i])  (full-attn output gate)
+extern "C" __global__ void sigmoid_mul(float* __restrict__ y, const float* __restrict__ gate,
+                                       int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  y[i] = y[i] * (1.f / (1.f + expf(-gate[i])));
+}
+
+// Full-attn QKV post-process, one block per (token, head):
+//   q heads: split qg[t][h][2hd] → rmsnorm(qn, 1+w) → mrope → qq[t][h][hd]; gate half → gate
+//   k heads: kraw[t][hkv][hd] → rmsnorm(kn) → mrope → kk[t][hkv][hd] and kstage[hkv][t][hd]
+//            (+ plain v copy vraw → vv[t][hkv][hd] and vstage[hkv][t][hd])
+extern "C" __global__ void qk_norm_rope_batch(
+    const float* __restrict__ qg, const float* __restrict__ kraw, const float* __restrict__ vraw,
+    float* __restrict__ qq, float* __restrict__ gate, float* __restrict__ kk,
+    float* __restrict__ vv, float* __restrict__ kstage, float* __restrict__ vstage,
+    const unsigned short* __restrict__ qn, const unsigned short* __restrict__ kn, int qk_f16,
+    const int* __restrict__ pos_t, const int* __restrict__ pos_h, const int* __restrict__ pos_w,
+    int n_tok, int nh, int nkv, int hd, int rotary_dim, float theta, int sec0, int sec1, int sec2,
+    int interleaved, float eps) {
+  const int nblk = nh + nkv;
+  const int t = blockIdx.x / nblk;
+  const int h = blockIdx.x % nblk;
+  if (t >= n_tok) return;
+  const int tid = threadIdx.x;
+  const int nt = blockDim.x;
+  extern __shared__ float sm[];
+  float* red = sm + hd;
+  const bool is_q = (h < nh);
+  const int hh = is_q ? h : (h - nh);
+  const float* src = is_q ? (qg + ((size_t)t * nh + h) * 2 * hd)
+                          : (kraw + ((size_t)t * nkv + hh) * hd);
+  const unsigned short* w = is_q ? qn : kn;
+
+  if (!is_q) {
+    const float* vs = vraw + ((size_t)t * nkv + hh) * hd;
+    float* vd = vv + ((size_t)t * nkv + hh) * hd;
+    float* vst = vstage + ((size_t)hh * n_tok + t) * hd;
+    for (int i = tid; i < hd; i += nt) {
+      const float val = vs[i];
+      vd[i] = val;
+      vst[i] = val;
+    }
+  } else {
+    float* gd = gate + ((size_t)t * nh + h) * hd;
+    for (int i = tid; i < hd; i += nt) gd[i] = src[hd + i];
+  }
+
+  float sum = 0.f;
+  for (int i = tid; i < hd; i += nt) {
+    float v = src[i];
+    if (!(v == v)) v = 0.f;
+    sum += v * v;
+  }
+  red[tid] = sum;
+  __syncthreads();
+  for (int s = nt / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  const float inv = rsqrtf(red[0] / (float)hd + eps);
+  for (int i = tid; i < hd; i += nt) {
+    float v = src[i];
+    if (!(v == v)) v = 0.f;
+    sm[i] = v * inv * (1.f + pf_w16_to_f32(w[i], qk_f16));
+  }
+  __syncthreads();
+
+  float* dst = is_q ? (qq + ((size_t)t * nh + h) * hd) : (kk + ((size_t)t * nkv + hh) * hd);
+  float* stage = is_q ? nullptr : (kstage + ((size_t)hh * n_tok + t) * hd);
+  const int pt = pos_t[t], ph = pos_h[t], pw = pos_w[t];
+  const bool eq = (pt == ph && ph == pw);
+  const int half = rotary_dim / 2;
+  const bool valid_sec = (sec0 + sec1 + sec2 == half);
+  for (int i = tid; i < half; i += nt) {
+    float pos;
+    if (!valid_sec || eq) {
+      pos = (float)pt;
+    } else if (interleaved) {
+      int dim = 0;
+      if (i < sec1 * 3 && (i % 3) == 1) dim = 1;
+      else if (i < sec2 * 3 && (i % 3) == 2) dim = 2;
+      pos = (float)(dim == 0 ? pt : (dim == 1 ? ph : pw));
+    } else {
+      const int dim = (i < sec0) ? 0 : ((i < sec0 + sec1) ? 1 : 2);
+      pos = (float)(dim == 0 ? pt : (dim == 1 ? ph : pw));
+    }
+    const float freq = 1.f / powf(theta, (float)i / (float)half);
+    const float ang = pos * freq;
+    const float c = cosf(ang), s = sinf(ang);
+    const float x1 = sm[i], x2 = sm[i + half];
+    const float r1 = x1 * c - x2 * s;
+    const float r2 = x1 * s + x2 * c;
+    dst[i] = r1;
+    dst[i + half] = r2;
+    if (stage) {
+      stage[i] = r1;
+      stage[i + half] = r2;
+    }
+  }
+  for (int i = rotary_dim + tid; i < hd; i += nt) {
+    dst[i] = sm[i];
+    if (stage) stage[i] = sm[i];
   }
 }
 )CUDA";
@@ -3346,6 +3599,723 @@ bool try_dwconv_silu_k4_seq(const float* xin, float* host_state, const float* w,
 
 const char* dwconv_last_error() {
   return g_dwconv_last_err.empty() ? "" : g_dwconv_last_err.c_str();
+}
+
+// ---------------------------------------------------------------------------
+// Resident prefill (n>1): X stays on device across all layers.
+// Fallback contract: every entry returns false → model reruns the layer on host.
+// ---------------------------------------------------------------------------
+namespace {
+
+void pf_free_arena() {
+  if (g_pf_arena) g_api.cudaFree(g_pf_arena);
+  g_pf_arena = nullptr;
+  g_pf_arena_cap = 0;
+  if (g_pf_pos) {
+    g_api.cudaFree(g_pf_pos);
+    g_pf_pos = nullptr;
+  }
+  g_pf_pos_cap = 0;
+  g_pf_x = g_pf_normed = g_pf_c1 = g_pf_c2 = g_pf_z = nullptr;
+  g_pf_b = g_pf_a = g_pf_q = g_pf_k = g_pf_v = g_pf_g = g_pf_beta = nullptr;
+  g_pf_core = g_pf_attn_out = g_pf_down = nullptr;
+  g_pf_kraw = g_pf_vraw = g_pf_kstage = g_pf_vstage = nullptr;
+  g_pf_active = false;
+}
+
+// Carve the arena for dims d; grow (free+malloc) only when bigger than current capacity.
+bool pf_fit(const PrefillResidentDims& d) {
+  const size_t n = static_cast<size_t>(d.n);
+  const int key_dim = d.nk * d.dk;
+  const int value_dim = d.nv * d.dv;
+  const int conv_dim = key_dim * 2 + value_dim;
+  const int qg_dim = d.nh * d.hd * 2;
+  const size_t c1 = static_cast<size_t>((std::max)((std::max)(conv_dim, qg_dim), d.I));
+  const size_t c2 = static_cast<size_t>((std::max)((std::max)(conv_dim, d.I), d.nh * d.hd));
+  const size_t vd = static_cast<size_t>((std::max)(value_dim, d.nh * d.hd));
+  const size_t align = 256;  // floats (1KiB)
+  // Offsets (in floats), aligned. Last block holds kstage+vstage (2 * nkv*n*hd).
+  size_t offs[18];
+  size_t sizes[18] = {n * d.H,          n * d.H, n * c1,          n * c2,
+                      n * vd,           n * d.nv, n * d.nv,       n * d.nv * d.dk,
+                      n * d.nv * d.dk,  n * vd,  n * d.nv,        n * d.nv,
+                      n * vd,           n * d.H, n * d.H,         n * d.nkv * d.hd,
+                      n * d.nkv * d.hd, static_cast<size_t>(2) * d.nkv * n * d.hd};
+  size_t cur = 0;
+  for (int i = 0; i < 18; ++i) {
+    cur = (cur + align - 1) / align * align;
+    offs[i] = cur;
+    cur += sizes[i];
+  }
+  const size_t need_bytes = cur * sizeof(float);
+  if (need_bytes > g_pf_arena_cap) {
+    if (g_pf_arena) {
+      g_api.cudaFree(g_pf_arena);
+      g_pf_arena = nullptr;
+      g_pf_arena_cap = 0;
+    }
+    void* v = nullptr;
+    if (g_api.cudaMalloc(&v, need_bytes) != kCudaSuccess) {
+      g_pf_last_err = "arena_malloc";
+      return false;
+    }
+    g_pf_arena = static_cast<float*>(v);
+    g_pf_arena_cap = need_bytes;
+  }
+  float* base = g_pf_arena;
+  g_pf_x = base + offs[0];
+  g_pf_normed = base + offs[1];
+  g_pf_c1 = base + offs[2];
+  g_pf_c2 = base + offs[3];
+  g_pf_z = base + offs[4];
+  g_pf_b = base + offs[5];
+  g_pf_a = base + offs[6];
+  g_pf_q = base + offs[7];
+  g_pf_k = base + offs[8];
+  g_pf_v = base + offs[9];
+  g_pf_g = base + offs[10];
+  g_pf_beta = base + offs[11];
+  g_pf_core = base + offs[12];
+  g_pf_attn_out = base + offs[13];
+  g_pf_down = base + offs[14];
+  g_pf_kraw = base + offs[15];
+  g_pf_vraw = base + offs[16];
+  g_pf_kstage = base + offs[17];
+  g_pf_vstage = g_pf_kstage + static_cast<size_t>(d.nkv) * n * d.hd;
+  return true;
+}
+
+// Estimated arena bytes for dims (for the VRAM headroom gate, before any alloc).
+size_t pf_estimate_bytes(const PrefillResidentDims& d) {
+  const size_t n = static_cast<size_t>(d.n);
+  const int key_dim = d.nk * d.dk;
+  const int value_dim = d.nv * d.dv;
+  const int conv_dim = key_dim * 2 + value_dim;
+  const int qg_dim = d.nh * d.hd * 2;
+  const size_t c1 = static_cast<size_t>((std::max)((std::max)(conv_dim, qg_dim), d.I));
+  const size_t c2 = static_cast<size_t>((std::max)((std::max)(conv_dim, d.I), d.nh * d.hd));
+  const size_t vd = static_cast<size_t>((std::max)(value_dim, d.nh * d.hd));
+  const size_t floats = n * (d.H * 4 + c1 + c2 + vd * 3 + d.nv * 4 + d.nv * d.dk * 2 +
+                             d.nkv * d.hd * 4 + 256);
+  return floats * sizeof(float) + 3 * n * sizeof(int);
+}
+
+int pf_env_mode() {
+  static const int mode = [] {
+    const char* e = std::getenv("LLMOC_GPU_PREFILL");
+    if (!e || !e[0]) return 2;  // auto
+    if (e[0] == '0') return 0;
+    if (e[0] == 'a' || e[0] == 'A') return 2;
+    return 1;
+  }();
+  return mode;
+}
+
+// Cached device copy of a small per-layer constant (keyed by host pointer).
+const void* pf_const_dev(const void* host, size_t bytes) {
+  auto it = g_pf_const.find(host);
+  if (it != g_pf_const.end()) return it->second;
+  void* d = nullptr;
+  if (g_api.cudaMalloc(&d, bytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(d, host, bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(d);
+    return nullptr;
+  }
+  g_pf_const[host] = d;
+  return d;
+}
+
+// Device GDN state mirror keyed by host ptr (created from host content on first use).
+float* pf_gdn_state_dev(float* host_state, int nv, int dk, int dv) {
+  auto it = g_gdn_state.find(host_state);
+  if (it != g_gdn_state.end()) return it->second;
+  const size_t bytes = sizeof(float) * static_cast<size_t>(nv) * dk * dv;
+  void* d = nullptr;
+  if (g_api.cudaMalloc(&d, bytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(d, host_state, bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(d);
+    return nullptr;
+  }
+  g_gdn_state[host_state] = static_cast<float*>(d);
+  return static_cast<float*>(d);
+}
+
+float* pf_conv_state_dev(float* host_state, int conv_dim, int conv_k) {
+  auto it = g_conv_state.find(host_state);
+  if (it != g_conv_state.end()) return it->second;
+  const size_t bytes = sizeof(float) * static_cast<size_t>(conv_dim) * conv_k;
+  void* d = nullptr;
+  if (g_api.cudaMalloc(&d, bytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(d, host_state, bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(d);
+    return nullptr;
+  }
+  g_conv_state[host_state] = static_cast<float*>(d);
+  return static_cast<float*>(d);
+}
+
+float* pf_conv_w_dev(const float* w, int conv_dim, int conv_k) {
+  auto it = g_conv_w_dev.find(w);
+  if (it != g_conv_w_dev.end()) return it->second;
+  const size_t bytes = sizeof(float) * static_cast<size_t>(conv_dim) * conv_k;
+  void* d = nullptr;
+  if (g_api.cudaMalloc(&d, bytes) != kCudaSuccess) return nullptr;
+  if (g_api.cudaMemcpy(d, w, bytes, kCudaMemcpyH2D) != kCudaSuccess) {
+    g_api.cudaFree(d);
+    return nullptr;
+  }
+  g_conv_w_dev[w] = static_cast<float*>(d);
+  return static_cast<float*>(d);
+}
+
+// Device-resident INT4 batch GEMM: dY[n,M] = dX[n,K] @ W^T (weight already resident).
+bool pf_gemm(const Int4Resident* res, const float* dX, float* dY, int n) {
+  return jit_gemm_int4(static_cast<const uint8_t*>(res->d_qweight),
+                       static_cast<const uint16_t*>(res->d_scales),
+                       static_cast<const uint16_t*>(res->d_zeros), dX, dY, res->M, res->K, n,
+                       res->ng, res->gs, res->is_awq, res->awq_zp);
+}
+
+bool pf_kernels_ready() {
+  if (!get_jit_kernel(kPrefillBatchSrc, "rmsnorm_w16_batch")) return false;
+  if (!get_jit_kernel(kPrefillBatchSrc, "gdn_pack_qkv_batch")) return false;
+  if (!get_jit_kernel(kPrefillBatchSrc, "gdn_prep_gb_batch")) return false;
+  if (!get_jit_kernel(kPrefillBatchSrc, "sigmoid_mul")) return false;
+  if (!get_jit_kernel(kPrefillBatchSrc, "qk_norm_rope_batch")) return false;
+  if (!get_jit_kernel(kGemvInt4Src, "gemm_int4")) return false;
+  if (!get_jit_kernel(kActSrc, "rmsnorm_gated_heads_v2")) return false;
+  if (!get_jit_kernel(kActSrc, "silu_mul")) return false;
+  if (!get_jit_kernel(kActSrc, "vec_add")) return false;
+  if (!get_jit_kernel(kDwconvSrc, "dwconv_silu_k4_seq")) return false;
+  if (!get_jit_kernel(kGdnSrc, "gated_delta_seq_kernel")) return false;
+  if (!get_jit_kernel(kAttnPrefillSrc, "attn_prefill_flash")) return false;
+  return true;
+}
+
+// Shared dense-MLP tail: rmsnorm(ln2) → gate/up → silu → down → residual add.
+bool pf_mlp_tail(void* fn_rms, void* fn_silu, void* fn_add, const uint16_t* ln2, bool ln_f16,
+                 const Int4Resident* rg, const Int4Resident* ru, const Int4Resident* rd, float eps,
+                 std::string* err) {
+  const int n = g_pf_dims.n;
+  const int H = g_pf_dims.H;
+  const int I = g_pf_dims.I;
+  const uint16_t* d_ln2 =
+      static_cast<const uint16_t*>(pf_const_dev(ln2, sizeof(uint16_t) * static_cast<size_t>(H)));
+  if (!d_ln2) {
+    *err = "ln2_h2d";
+    return false;
+  }
+  {
+    int Hi = H, f16 = ln_f16 ? 1 : 0;
+    float eps_m = eps;
+    void* p[] = {&g_pf_x, &d_ln2, &g_pf_normed, &Hi, &eps_m, &f16};
+    if (!jit_launch(fn_rms, static_cast<unsigned>(n), 1, 1, 256, 1, 1, 256 * sizeof(float), p)) {
+      *err = "ln2_rmsnorm";
+      return false;
+    }
+  }
+  if (!pf_gemm(rg, g_pf_normed, g_pf_c1, n)) {
+    *err = "gate_gemm";
+    return false;
+  }
+  if (!pf_gemm(ru, g_pf_normed, g_pf_c2, n)) {
+    *err = "up_gemm";
+    return false;
+  }
+  {
+    int total = n * I;
+    void* p[] = {&g_pf_c1, &g_pf_c2, &g_pf_c1, &total};
+    const unsigned grid = (static_cast<unsigned>(total) + 255) / 256;
+    if (!jit_launch(fn_silu, grid, 1, 1, 256, 1, 1, 0, p)) {
+      *err = "silu";
+      return false;
+    }
+  }
+  if (!pf_gemm(rd, g_pf_c1, g_pf_down, n)) {
+    *err = "down_gemm";
+    return false;
+  }
+  {
+    int total = n * H;
+    void* p[] = {&g_pf_x, &g_pf_down, &g_pf_x, &total};
+    const unsigned grid = (static_cast<unsigned>(total) + 255) / 256;
+    if (!jit_launch(fn_add, grid, 1, 1, 256, 1, 1, 0, p)) {
+      *err = "residual_add";
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
+bool prefill_resident_begin(const float* h_x, const PrefillResidentDims& d, const int* pos_t,
+                            const int* pos_h, const int* pos_w) {
+  g_pf_active = false;
+  if (!g_enabled || !jit_available()) {
+    g_pf_last_err = "cuda_or_jit_off";
+    return false;
+  }
+  const int mode = pf_env_mode();
+  if (mode == 0) {
+    g_pf_last_err = "env_off";
+    return false;
+  }
+  if (mode == 2 && !g_resident) {
+    g_pf_last_err = "not_resident";
+    return false;
+  }
+  if (!h_x || !pos_t || !pos_h || !pos_w) {
+    g_pf_last_err = "null_arg";
+    return false;
+  }
+  if (d.n <= 0 || d.H <= 0 || d.I <= 0 || d.nk <= 0 || d.nv <= 0 || d.dk <= 0 || d.dv <= 0 ||
+      d.nh <= 0 || d.nkv <= 0 || d.hd <= 0 || d.conv_k != 4 || d.nv % d.nk != 0 ||
+      d.nh % d.nkv != 0) {
+    g_pf_last_err = "bad_dims";
+    return false;
+  }
+  if (!pf_kernels_ready()) {
+    g_pf_last_err = "jit_kernels";
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (mode == 2) {
+    // auto: require device headroom beyond the arena itself
+    size_t free_b = 0, tot_b = 0;
+    const size_t need = pf_estimate_bytes(d);
+    if (device_mem_info(&free_b, &tot_b)) {
+      const size_t headroom = 768ull << 20;
+      if (free_b < need + headroom) {
+        g_pf_last_err = "vram_headroom";
+        return false;
+      }
+    }
+  }
+  if (!pf_fit(d)) return false;
+  const size_t pos_ints = 3 * static_cast<size_t>(d.n);
+  if (pos_ints > g_pf_pos_cap) {
+    if (g_pf_pos) g_api.cudaFree(g_pf_pos);
+    void* v = nullptr;
+    if (g_api.cudaMalloc(&v, pos_ints * sizeof(int)) != kCudaSuccess) {
+      g_pf_pos = nullptr;
+      g_pf_pos_cap = 0;
+      g_pf_last_err = "pos_malloc";
+      return false;
+    }
+    g_pf_pos = static_cast<int*>(v);
+    g_pf_pos_cap = pos_ints;
+  }
+  const size_t n_ints = static_cast<size_t>(d.n);
+  if (g_api.cudaMemcpy(g_pf_pos, pos_t, n_ints * sizeof(int), kCudaMemcpyH2D) != kCudaSuccess ||
+      g_api.cudaMemcpy(g_pf_pos + n_ints, pos_h, n_ints * sizeof(int), kCudaMemcpyH2D) !=
+          kCudaSuccess ||
+      g_api.cudaMemcpy(g_pf_pos + 2 * n_ints, pos_w, n_ints * sizeof(int), kCudaMemcpyH2D) !=
+          kCudaSuccess) {
+    g_pf_last_err = "pos_h2d";
+    return false;
+  }
+  if (g_api.cudaMemcpy(g_pf_x, h_x, static_cast<size_t>(d.n) * d.H * sizeof(float),
+                       kCudaMemcpyH2D) != kCudaSuccess) {
+    g_pf_last_err = "x_h2d";
+    return false;
+  }
+  g_pf_dims = d;
+  g_pf_active = true;
+  g_pf_last_err.clear();
+  return true;
+}
+
+bool prefill_resident_active() { return g_pf_active; }
+const char* prefill_resident_last_error() {
+  return g_pf_last_err.empty() ? "" : g_pf_last_err.c_str();
+}
+
+bool prefill_resident_read_x(float* h_x) {
+  if (!g_pf_active || !h_x) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(h_x, g_pf_x,
+                          static_cast<size_t>(g_pf_dims.n) * g_pf_dims.H * sizeof(float),
+                          kCudaMemcpyD2H) == kCudaSuccess;
+}
+
+bool prefill_resident_read_x_row(float* h_row, int row) {
+  if (!g_pf_active || !h_row || row < 0 || row >= g_pf_dims.n) return false;
+  std::lock_guard<std::mutex> lock(g_mu);
+  return g_api.cudaMemcpy(h_row, g_pf_x + static_cast<size_t>(row) * g_pf_dims.H,
+                          static_cast<size_t>(g_pf_dims.H) * sizeof(float),
+                          kCudaMemcpyD2H) == kCudaSuccess;
+}
+
+void prefill_resident_finish() { g_pf_active = false; }
+
+bool try_prefill_linear_resident(const PrefillLinW& w) {
+  if (!g_pf_active || !w.ln1 || !w.ln2 || !w.nrm || !w.conv_w || !w.conv_state_host || !w.A_log ||
+      !w.dt_bias || !w.recurrent_host || !w.wqkv || !w.wz || !w.wb || !w.wa || !w.wout ||
+      !w.wgate || !w.wup || !w.wdown) {
+    g_pf_last_err = "lin_null_arg";
+    return false;
+  }
+  const int n = g_pf_dims.n;
+  const int H = g_pf_dims.H;
+  const int nk = g_pf_dims.nk, nv = g_pf_dims.nv, dk = g_pf_dims.dk, dv = g_pf_dims.dv;
+  const int key_dim = nk * dk, value_dim = nv * dv;
+  const int conv_dim = key_dim * 2 + value_dim;
+
+  void* fn_rms = get_jit_kernel(kPrefillBatchSrc, "rmsnorm_w16_batch");
+  void* fn_pack = get_jit_kernel(kPrefillBatchSrc, "gdn_pack_qkv_batch");
+  void* fn_prep = get_jit_kernel(kPrefillBatchSrc, "gdn_prep_gb_batch");
+  void* fn_conv = get_jit_kernel(kDwconvSrc, "dwconv_silu_k4_seq");
+  void* fn_gdn = get_jit_kernel(kGdnSrc, "gated_delta_seq_kernel");
+  void* fn_gn = get_jit_kernel(kActSrc, "rmsnorm_gated_heads_v2");
+  void* fn_silu = get_jit_kernel(kActSrc, "silu_mul");
+  void* fn_add = get_jit_kernel(kActSrc, "vec_add");
+  if (!fn_rms || !fn_pack || !fn_prep || !fn_conv || !fn_gdn || !fn_gn || !fn_silu || !fn_add) {
+    g_pf_last_err = "lin_jit";
+    return false;
+  }
+
+  const Int4Resident* rqkv = nullptr;
+  const Int4Resident* rz = nullptr;
+  const Int4Resident* rb = nullptr;
+  const Int4Resident* ra = nullptr;
+  const Int4Resident* rout = nullptr;
+  const Int4Resident* rg = nullptr;
+  const Int4Resident* ru = nullptr;
+  const Int4Resident* rd = nullptr;
+  const uint16_t* d_ln1 = nullptr;
+  const uint16_t* d_nrm = nullptr;
+  const float* d_A = nullptr;
+  const float* d_dt = nullptr;
+  float* d_conv_st = nullptr;
+  float* d_conv_w = nullptr;
+  float* d_state = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    rqkv = ensure_int4_resident(*w.wqkv);
+    rz = ensure_int4_resident(*w.wz);
+    rb = ensure_int4_resident(*w.wb);
+    ra = ensure_int4_resident(*w.wa);
+    rout = ensure_int4_resident(*w.wout);
+    rg = ensure_int4_resident(*w.wgate);
+    ru = ensure_int4_resident(*w.wup);
+    rd = ensure_int4_resident(*w.wdown);
+    if (!rqkv || !rz || !rb || !ra || !rout || !rg || !ru || !rd) {
+      g_pf_last_err = "lin_resident_weights";
+      return false;
+    }
+    d_ln1 = static_cast<const uint16_t*>(
+        pf_const_dev(w.ln1, sizeof(uint16_t) * static_cast<size_t>(H)));
+    d_nrm = static_cast<const uint16_t*>(
+        pf_const_dev(w.nrm, sizeof(uint16_t) * static_cast<size_t>(dv)));
+    d_A = static_cast<const float*>(pf_const_dev(w.A_log, sizeof(float) * static_cast<size_t>(nv)));
+    d_dt =
+        static_cast<const float*>(pf_const_dev(w.dt_bias, sizeof(float) * static_cast<size_t>(nv)));
+    d_conv_st = pf_conv_state_dev(w.conv_state_host, conv_dim, g_pf_dims.conv_k);
+    d_conv_w = pf_conv_w_dev(w.conv_w, conv_dim, g_pf_dims.conv_k);
+    d_state = pf_gdn_state_dev(w.recurrent_host, nv, dk, dv);
+    if (!d_ln1 || !d_nrm || !d_A || !d_dt || !d_conv_st || !d_conv_w || !d_state) {
+      g_pf_last_err = "lin_const_h2d";
+      return false;
+    }
+  }
+
+  // 1) rmsnorm(ln1)
+  {
+    int Hi = H, f16 = w.ln_f16 ? 1 : 0;
+    float eps = w.eps;
+    void* p[] = {&g_pf_x, &d_ln1, &g_pf_normed, &Hi, &eps, &f16};
+    if (!jit_launch(fn_rms, static_cast<unsigned>(n), 1, 1, 256, 1, 1, 256 * sizeof(float), p)) {
+      g_pf_last_err = "ln1_rmsnorm";
+      return false;
+    }
+  }
+  // 2) projections
+  if (!pf_gemm(rqkv, g_pf_normed, g_pf_c1, n)) {
+    g_pf_last_err = "qkv_gemm";
+    return false;
+  }
+  if (!pf_gemm(rz, g_pf_normed, g_pf_z, n)) {
+    g_pf_last_err = "z_gemm";
+    return false;
+  }
+  if (!pf_gemm(rb, g_pf_normed, g_pf_b, n)) {
+    g_pf_last_err = "b_gemm";
+    return false;
+  }
+  if (!pf_gemm(ra, g_pf_normed, g_pf_a, n)) {
+    g_pf_last_err = "a_gemm";
+    return false;
+  }
+  // 3) depthwise conv + silu (seq kernel, state on device)
+  {
+    int seq = n, cd = conv_dim;
+    void* p[] = {&g_pf_c1, &d_conv_st, &d_conv_w, &g_pf_c2, &seq, &cd};
+    const unsigned grid = (static_cast<unsigned>(conv_dim) + 255) / 256;
+    if (!jit_launch(fn_conv, grid, 1, 1, 256, 1, 1, 0, p)) {
+      g_pf_last_err = "dwconv";
+      return false;
+    }
+  }
+  // 4) pack q/k/v
+  {
+    void* p[] = {&g_pf_c2, &g_pf_q, &g_pf_k, &g_pf_v, &g_pf_dims.n, &g_pf_dims.nk, &g_pf_dims.nv,
+                 &g_pf_dims.dk, &g_pf_dims.dv};
+    const int total = n * (std::max)(nv * dk, value_dim);
+    const unsigned grid = (static_cast<unsigned>(total) + 255) / 256;
+    if (!jit_launch(fn_pack, grid, 1, 1, 256, 1, 1, 0, p)) {
+      g_pf_last_err = "pack";
+      return false;
+    }
+  }
+  // 5) beta/g prep
+  {
+    void* p[] = {&g_pf_b, &g_pf_a, &d_A, &d_dt, &g_pf_beta, &g_pf_g, &g_pf_dims.n, &g_pf_dims.nv};
+    const unsigned grid = (static_cast<unsigned>(n * nv) + 255) / 256;
+    if (!jit_launch(fn_prep, grid, 1, 1, 256, 1, 1, 0, p)) {
+      g_pf_last_err = "prep_gb";
+      return false;
+    }
+  }
+  // 6) GDN recurrent scan (state stays on device; host mirror intentionally stale)
+  {
+    int seq = n, nh_i = nv, dk_i = dk, dv_i = dv;
+    float scale = 1.f / sqrtf(static_cast<float>(dk));
+    void* p[] = {&g_pf_q, &g_pf_k, &g_pf_v, &g_pf_g, &g_pf_beta, &d_state, &g_pf_core,
+                 &seq,     &nh_i,   &dk_i,   &dv_i,     &scale};
+    if (!jit_launch(fn_gdn, static_cast<unsigned>(nv), 1, 1, static_cast<unsigned>(dv), 1, 1, 0,
+                    p)) {
+      g_pf_last_err = "gdn";
+      return false;
+    }
+  }
+  ++g_gdn_ok;
+  // 7) gated rmsnorm per (token, head) — in-place on core
+  {
+    int hd = dv, f16 = w.nrm_f16 ? 1 : 0;
+    float eps = w.eps;
+    void* p[] = {&g_pf_core, &g_pf_z, &d_nrm, &g_pf_core, &hd, &eps, &f16};
+    if (!jit_launch(fn_gn, static_cast<unsigned>(n * nv), 1, 1, 256, 1, 1, 256 * sizeof(float),
+                    p)) {
+      g_pf_last_err = "gated_norm";
+      return false;
+    }
+  }
+  // 8) wout + residual
+  if (!pf_gemm(rout, g_pf_core, g_pf_attn_out, n)) {
+    g_pf_last_err = "wout_gemm";
+    return false;
+  }
+  {
+    int total = n * H;
+    void* p[] = {&g_pf_x, &g_pf_attn_out, &g_pf_x, &total};
+    const unsigned grid = (static_cast<unsigned>(total) + 255) / 256;
+    if (!jit_launch(fn_add, grid, 1, 1, 256, 1, 1, 0, p)) {
+      g_pf_last_err = "attn_resadd";
+      return false;
+    }
+  }
+  // 9) MLP tail
+  std::string err;
+  if (!pf_mlp_tail(fn_rms, fn_silu, fn_add, w.ln2, w.ln_f16, rg, ru, rd, w.eps, &err)) {
+    g_pf_last_err = err;
+    return false;
+  }
+  // 10) mirror conv state to host (snapshot / CPU-fallback coherence, same as host-sandwich path)
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    const size_t bytes = sizeof(float) * static_cast<size_t>(conv_dim) * g_pf_dims.conv_k;
+    if (g_api.cudaMemcpy(w.conv_state_host, d_conv_st, bytes, kCudaMemcpyD2H) != kCudaSuccess) {
+      g_pf_last_err = "conv_state_d2h";
+      return false;
+    }
+  }
+  return true;
+}
+
+bool try_prefill_full_resident(const PrefillFullW& w) {
+  if (!g_pf_active || !w.ln1 || !w.ln2 || !w.qn || !w.kn || !w.wq || !w.wk || !w.wv || !w.wo ||
+      !w.wgate || !w.wup || !w.wdown || !w.k_cache_host || !w.v_cache_host) {
+    g_pf_last_err = "full_null_arg";
+    return false;
+  }
+  {
+    const char* e = std::getenv("LLMOC_GPU_ATTN");
+    if (e && e[0] == '0') {
+      g_pf_last_err = "attn_env_off";
+      return false;
+    }
+  }
+  const int n = g_pf_dims.n;
+  const int H = g_pf_dims.H;
+  const int nh = g_pf_dims.nh, nkv = g_pf_dims.nkv, hd = g_pf_dims.hd;
+  const int q_dim = nh * hd;
+  // FlashPrefill smem bound (same as host wrapper)
+  const int nb = (n + 255) / 256;
+  const size_t shmem_flash = sizeof(float) * static_cast<size_t>(n + 16 + nb);
+  if (shmem_flash > 48ull * 1024ull) {
+    g_pf_last_err = "flash_smem";
+    return false;
+  }
+
+  void* fn_rms = get_jit_kernel(kPrefillBatchSrc, "rmsnorm_w16_batch");
+  void* fn_qk = get_jit_kernel(kPrefillBatchSrc, "qk_norm_rope_batch");
+  void* fn_flash = get_jit_kernel(kAttnPrefillSrc, "attn_prefill_flash");
+  void* fn_sig = get_jit_kernel(kPrefillBatchSrc, "sigmoid_mul");
+  void* fn_silu = get_jit_kernel(kActSrc, "silu_mul");
+  void* fn_add = get_jit_kernel(kActSrc, "vec_add");
+  if (!fn_rms || !fn_qk || !fn_flash || !fn_sig || !fn_silu || !fn_add) {
+    g_pf_last_err = "full_jit";
+    return false;
+  }
+
+  const Int4Resident* rwq = nullptr;
+  const Int4Resident* rwk = nullptr;
+  const Int4Resident* rwv = nullptr;
+  const Int4Resident* rwo = nullptr;
+  const Int4Resident* rg = nullptr;
+  const Int4Resident* ru = nullptr;
+  const Int4Resident* rd = nullptr;
+  const uint16_t* d_ln1 = nullptr;
+  const uint16_t* d_qn = nullptr;
+  const uint16_t* d_kn = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    rwq = ensure_int4_resident(*w.wq);
+    rwk = ensure_int4_resident(*w.wk);
+    rwv = ensure_int4_resident(*w.wv);
+    rwo = ensure_int4_resident(*w.wo);
+    rg = ensure_int4_resident(*w.wgate);
+    ru = ensure_int4_resident(*w.wup);
+    rd = ensure_int4_resident(*w.wdown);
+    if (!rwq || !rwk || !rwv || !rwo || !rg || !ru || !rd) {
+      g_pf_last_err = "full_resident_weights";
+      return false;
+    }
+    d_ln1 = static_cast<const uint16_t*>(
+        pf_const_dev(w.ln1, sizeof(uint16_t) * static_cast<size_t>(H)));
+    d_qn = static_cast<const uint16_t*>(
+        pf_const_dev(w.qn, sizeof(uint16_t) * static_cast<size_t>(hd)));
+    d_kn = static_cast<const uint16_t*>(
+        pf_const_dev(w.kn, sizeof(uint16_t) * static_cast<size_t>(hd)));
+    if (!d_ln1 || !d_qn || !d_kn) {
+      g_pf_last_err = "full_const_h2d";
+      return false;
+    }
+  }
+
+  // 1) rmsnorm(ln1)
+  {
+    int Hi = H, f16 = w.ln_f16 ? 1 : 0;
+    float eps = w.eps;
+    void* p[] = {&g_pf_x, &d_ln1, &g_pf_normed, &Hi, &eps, &f16};
+    if (!jit_launch(fn_rms, static_cast<unsigned>(n), 1, 1, 256, 1, 1, 256 * sizeof(float), p)) {
+      g_pf_last_err = "ln1_rmsnorm";
+      return false;
+    }
+  }
+  // 2) q/k/v projections (qg → c1, kraw, vraw)
+  if (!pf_gemm(rwq, g_pf_normed, g_pf_c1, n)) {
+    g_pf_last_err = "wq_gemm";
+    return false;
+  }
+  if (!pf_gemm(rwk, g_pf_normed, g_pf_kraw, n)) {
+    g_pf_last_err = "wk_gemm";
+    return false;
+  }
+  if (!pf_gemm(rwv, g_pf_normed, g_pf_vraw, n)) {
+    g_pf_last_err = "wv_gemm";
+    return false;
+  }
+  // 3) split + qk norm + mrope + KV staging
+  {
+    int n_tok = n, nh_i = nh, nkv_i = nkv, hd_i = hd, rd_i = w.rotary_dim, qk_f16 = w.qk_f16 ? 1 : 0;
+    int sec0 = w.mrope_section[0], sec1 = w.mrope_section[1], sec2 = w.mrope_section[2];
+    int ilv = w.mrope_interleaved ? 1 : 0;
+    float theta = w.rope_theta, eps = w.eps;
+    const int* pos_t = g_pf_pos;
+    const int* pos_h = g_pf_pos + n;
+    const int* pos_w = g_pf_pos + 2 * static_cast<size_t>(n);
+    void* p[] = {&g_pf_c1,   &g_pf_kraw, &g_pf_vraw, &g_pf_c2,   &g_pf_z,   &g_pf_q,
+                 &g_pf_k,    &g_pf_kstage, &g_pf_vstage, &d_qn,   &d_kn,    &qk_f16,
+                 &pos_t,     &pos_h,     &pos_w,     &n_tok,     &nh_i,    &nkv_i,
+                 &hd_i,      &rd_i,      &theta,     &sec0,      &sec1,    &sec2,
+                 &ilv,       &eps};
+    const unsigned grid = static_cast<unsigned>(n) * static_cast<unsigned>(nh + nkv);
+    const unsigned shmem = sizeof(float) * static_cast<unsigned>(hd + 256);
+    if (!jit_launch(fn_qk, grid, 1, 1, 256, 1, 1, shmem, p)) {
+      g_pf_last_err = "qk_norm_rope";
+      return false;
+    }
+  }
+  // 4) flash attention (device q/k/v → attn heads in core)
+  {
+    const float tau = [] {
+      const char* e = std::getenv("LLMOC_PREFILL_TAU");
+      return e && e[0] ? static_cast<float>(std::atof(e)) : 1e9f;
+    }();
+    const float mean_corr = [] {
+      const char* e = std::getenv("LLMOC_PREFILL_MEANCORR");
+      return e && e[0] ? static_cast<float>(std::atof(e)) : 0.f;
+    }();
+    float scale = 1.f / sqrtf(static_cast<float>(hd));
+    int seq_i = n, nh_i = nh, nkv_i = nkv, hd_i = hd, sparse_i = (tau < 50.f) ? 1 : 0;
+    float tau_m = tau, mc_m = mean_corr;
+    void* p[] = {&g_pf_c2, &g_pf_q, &g_pf_k, &g_pf_core, &seq_i, &nh_i, &nkv_i, &hd_i, &scale,
+                 &tau_m, &mc_m, &sparse_i};
+    if (!jit_launch(fn_flash, static_cast<unsigned>(n), static_cast<unsigned>(nh), 1, 128, 1, 1,
+                    static_cast<unsigned>(shmem_flash), p)) {
+      g_pf_last_err = "flash";
+      return false;
+    }
+  }
+  // 5) attn gate: core *= sigmoid(z)
+  {
+    int total = n * q_dim;
+    void* p[] = {&g_pf_core, &g_pf_z, &total};
+    const unsigned grid = (static_cast<unsigned>(total) + 255) / 256;
+    if (!jit_launch(fn_sig, grid, 1, 1, 256, 1, 1, 0, p)) {
+      g_pf_last_err = "sigmoid_gate";
+      return false;
+    }
+  }
+  // 6) wo + residual
+  if (!pf_gemm(rwo, g_pf_core, g_pf_attn_out, n)) {
+    g_pf_last_err = "wo_gemm";
+    return false;
+  }
+  {
+    int total = n * H;
+    void* p[] = {&g_pf_x, &g_pf_attn_out, &g_pf_x, &total};
+    const unsigned grid = (static_cast<unsigned>(total) + 255) / 256;
+    if (!jit_launch(fn_add, grid, 1, 1, 256, 1, 1, 0, p)) {
+      g_pf_last_err = "attn_resadd";
+      return false;
+    }
+  }
+  // 7) KV cache D2H (per head: contiguous run of n positions)
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    const size_t row_bytes = static_cast<size_t>(n) * hd * sizeof(float);
+    for (int hkv = 0; hkv < nkv; ++hkv) {
+      float* kdst = w.k_cache_host + (static_cast<size_t>(hkv) * w.cache_stride + w.seq0) * hd;
+      float* vdst = w.v_cache_host + (static_cast<size_t>(hkv) * w.cache_stride + w.seq0) * hd;
+      const float* ksrc = g_pf_kstage + static_cast<size_t>(hkv) * n * hd;
+      const float* vsrc = g_pf_vstage + static_cast<size_t>(hkv) * n * hd;
+      if (g_api.cudaMemcpy(kdst, ksrc, row_bytes, kCudaMemcpyD2H) != kCudaSuccess ||
+          g_api.cudaMemcpy(vdst, vsrc, row_bytes, kCudaMemcpyD2H) != kCudaSuccess) {
+        g_pf_last_err = "kv_d2h";
+        return false;
+      }
+    }
+  }
+  // 8) MLP tail
+  std::string err;
+  if (!pf_mlp_tail(fn_rms, fn_silu, fn_add, w.ln2, w.ln_f16, rg, ru, rd, w.eps, &err)) {
+    g_pf_last_err = err;
+    return false;
+  }
+  return true;
 }
 
 namespace {

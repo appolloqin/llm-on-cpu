@@ -77,6 +77,73 @@ bool try_lm_head_w16_from_act(const uint16_t* final_norm, const uint16_t* lm_pas
 bool try_lm_head_int4_from_act(const uint16_t* final_norm, const qlwc::Int4View& lm,
                                float* logits_host, float eps, bool ln_is_f16);
 
+// ---- Resident prefill (n>1): activations stay on device across all layers. ----
+// Only KV (full-attn layers) and the last hidden row come back to host.
+// All entry points return false → caller falls back to the host path unchanged.
+struct PrefillResidentDims {
+  int n = 0, H = 0, I = 0;
+  int nk = 0, nv = 0, dk = 0, dv = 0;  // linear (GDN) layers
+  int nh = 0, nkv = 0, hd = 0;         // full-attn layers
+  int conv_k = 4;
+};
+bool prefill_resident_begin(const float* h_x, const PrefillResidentDims& d, const int* pos_t,
+                            const int* pos_h, const int* pos_w);
+bool prefill_resident_active();
+// Read back the whole X (mid-prefill host fallback) or a single row (final norm/lm_head).
+bool prefill_resident_read_x(float* h_x);
+bool prefill_resident_read_x_row(float* h_row, int row);
+void prefill_resident_finish();
+const char* prefill_resident_last_error();
+
+struct PrefillLinW {
+  const uint16_t* ln1 = nullptr;
+  bool ln_f16 = false;
+  const qlwc::Int4View* wqkv = nullptr;
+  const qlwc::Int4View* wz = nullptr;
+  const qlwc::Int4View* wb = nullptr;
+  const qlwc::Int4View* wa = nullptr;
+  const float* conv_w = nullptr;        // [conv_dim * conv_k]
+  float* conv_state_host = nullptr;     // key for device mirror; mirrored back after layer
+  const float* A_log = nullptr;         // [nv]
+  const float* dt_bias = nullptr;       // [nv]
+  float* recurrent_host = nullptr;      // key for device GDN state mirror (stays device-only)
+  const uint16_t* nrm = nullptr;        // [dv] shared gated-norm weight
+  bool nrm_f16 = false;
+  const qlwc::Int4View* wout = nullptr;
+  const uint16_t* ln2 = nullptr;
+  const qlwc::Int4View* wgate = nullptr;
+  const qlwc::Int4View* wup = nullptr;
+  const qlwc::Int4View* wdown = nullptr;
+  float eps = 1e-6f;
+};
+bool try_prefill_linear_resident(const PrefillLinW& w);
+
+struct PrefillFullW {
+  const uint16_t* ln1 = nullptr;
+  bool ln_f16 = false;
+  const qlwc::Int4View* wq = nullptr;
+  const qlwc::Int4View* wk = nullptr;
+  const qlwc::Int4View* wv = nullptr;
+  const uint16_t* qn = nullptr;  // [hd] qk-norm (1+w) weights
+  const uint16_t* kn = nullptr;
+  bool qk_f16 = false;
+  int rotary_dim = 0;
+  float rope_theta = 10000.f;
+  int mrope_section[3] = {0, 0, 0};
+  bool mrope_interleaved = false;
+  const qlwc::Int4View* wo = nullptr;
+  float* k_cache_host = nullptr;  // [nkv][cache_stride][hd]; KV D2H at seq0 (=current cache seq)
+  float* v_cache_host = nullptr;
+  int cache_stride = 0;
+  int seq0 = 0;
+  const uint16_t* ln2 = nullptr;
+  const qlwc::Int4View* wgate = nullptr;
+  const qlwc::Int4View* wup = nullptr;
+  const qlwc::Int4View* wdown = nullptr;
+  float eps = 1e-6f;
+};
+bool try_prefill_full_resident(const PrefillFullW& w);
+
 // Legacy host↔device helpers (still used by non-stream paths / fallbacks).
 bool try_mlp_decode_resident(const float* x, const uint16_t* ln2, const qlwc::Int4View& wgate,
                              const qlwc::Int4View& wup, const qlwc::Int4View& wdown, float* y, int H,

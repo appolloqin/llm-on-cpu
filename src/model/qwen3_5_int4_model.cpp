@@ -845,13 +845,43 @@ void Qwen35Int4Model::moe_ffn_token(int /*layer*/, const float* /*normed*/, floa
   throw std::runtime_error("moe_ffn_token: MoE requires Qwen36MoeInt4Model");
 }
 
-// GPU seq GDN/conv 实测比 CPU AVX2 慢（占用率低）；默认关, 需要 A/B 时 LLMOC_GPU_GDN=1
+// Prefill host-sandwich GDN/conv:
+//   LLMOC_GPU_GDN=0 → force CPU（保留原逃生开关）
+//   LLMOC_GPU_GDN=1 → force GPU
+//   unset / auto    → resident_gpu 且预算/设备余量足够时走 GPU（显存自适应）
+// Decode 的 try_linear_decode_on_act 不经此开关。
 bool gpu_gdn_enabled() {
-  static const int e = [] {
+  static const int mode = [] {
     const char* p = std::getenv("LLMOC_GPU_GDN");
-    return (p && p[0] != '0' && p[0] != '\0') ? 1 : 0;
+    if (!p || !p[0]) return 2;  // auto
+    if (p[0] == '0') return 0;
+    if (p[0] == 'a' || p[0] == 'A') return 2;
+    return 1;
   }();
-  return e != 0;
+  if (mode == 0) return false;
+  if (mode == 1) return true;
+  if (!hal::cuda::resident_gpu_enabled()) return false;
+  constexpr size_t kBudgetHeadroom = 512ull << 20;  // 512MiB
+  constexpr size_t kDeviceFreeMin = 1ull << 30;     // 1GiB
+  const size_t budget = hal::cuda::vram_budget();
+  const size_t used = hal::cuda::vram_used();
+  if (budget > used && (budget - used) >= kBudgetHeadroom) return true;
+  size_t free_b = 0, tot = 0;
+  if (hal::cuda::device_mem_info(&free_b, &tot) && free_b >= kDeviceFreeMin) return true;
+  return false;
+}
+
+void log_gpu_gdn_once(int n_tok, bool using_gpu) {
+  static std::atomic<int> once{1};
+  if (once.fetch_sub(1) <= 0) return;
+  const size_t budget = hal::cuda::vram_budget();
+  const size_t used = hal::cuda::vram_used();
+  size_t free_b = 0, tot = 0;
+  (void)hal::cuda::device_mem_info(&free_b, &tot);
+  LOG_INFO("prefill gdn: gpu=%d n=%d used=%.2fGiB budget=%.2fGiB dev_free=%.2fGiB "
+           "(LLMOC_GPU_GDN=0|1|auto)",
+           using_gpu ? 1 : 0, n_tok, used / double(1ull << 30), budget / double(1ull << 30),
+           free_b / double(1ull << 30));
 }
 
 void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, int pos_start,
@@ -1027,7 +1057,8 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     const float* cw = lp.conv_w_f.data();
     const int ck = cfg_.conv_k;
     bool conv_gpu = false;
-    if (n_tok >= 64 && ck == 4 && resident_gpu_ && gpu_gdn_enabled()) {
+    const bool want_gpu_gdn = resident_gpu_ && gpu_gdn_enabled();
+    if (n_tok >= 8 && ck == 4 && want_gpu_gdn) {
       conv_gpu = hal::cuda::try_dwconv_silu_k4_seq(sc.mixed.data(), conv_state.data(), cw,
                                                      sc.mixed_c.data(), n_tok, conv_dim);
       if (!conv_gpu) {
@@ -1100,7 +1131,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
     }
 
     bool gdn_ok = false;
-    if (resident_gpu_ && gpu_gdn_enabled()) {
+    if (want_gpu_gdn) {
       // Prefill/MTP n>1: batched H2D/D2H (try_gated_delta_gpu_seq). Per-token sync was
       // ~ms×T and collapsed long prefill to ~0.1 layer/s.
       // MTP decode reject path only: flush device→host before multi-token window.
@@ -1115,6 +1146,7 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
                                                 sc.beta.data(), Lkv.linear.recurrent.data(),
                                                 sc.core.data(), nv, dk, dv);
       }
+      if (is_prefill && n_tok >= 64) log_gpu_gdn_once(n_tok, gdn_ok);
       if (!gdn_ok) {
         if (is_prefill) {
           static std::atomic<int> warn_left{4};
@@ -1135,6 +1167,8 @@ void Qwen35Int4Model::layer_forward(int layer, float* x, SessionCache& cache, in
                                    n_tok, nv, dk, dv, true);
         gdn_ok = true;
       }
+    } else if (is_prefill && n_tok >= 64) {
+      log_gpu_gdn_once(n_tok, false);
     }
     if (!gdn_ok) {
       hal::gated_delta_recurrent(sc.q.data(), sc.k.data(), sc.v.data(), sc.g.data(), sc.beta.data(),
@@ -1428,6 +1462,96 @@ bool Qwen35Int4Model::layer_forward_full_act(int layer, SessionCache& cache, int
   return true;
 }
 
+bool Qwen35Int4Model::prefill_resident_eligible() const {
+  if (cfg_.is_moe || cfg_.conv_k != 4) return false;
+  if (cfg_.n_heads <= 0 || cfg_.n_kv <= 0 || cfg_.n_heads % cfg_.n_kv != 0) return false;
+  if (cfg_.head_dim <= 0 || cfg_.head_dim % 4 != 0) return false;
+  if (cfg_.linear_num_k <= 0 || cfg_.linear_num_v <= 0 ||
+      cfg_.linear_num_v % cfg_.linear_num_k != 0)
+    return false;
+  const int rotary_dim = static_cast<int>(cfg_.head_dim * cfg_.partial_rotary) / 2 * 2;
+  if (rotary_dim <= 0 || rotary_dim > cfg_.head_dim) return false;
+  for (const auto& lp : layers_) {
+    if (lp.is_moe) return false;
+    if (!lp.ln1 || !lp.ln2) return false;
+    if (!lp.wgate.qweight || !lp.wup.qweight || !lp.wdown.qweight) return false;
+    if (lp.is_full) {
+      if (!lp.wq.is_int4 || !lp.wk.is_int4 || !lp.wv.is_int4 || !lp.wo.is_int4) return false;
+      if (!lp.qn || !lp.kn) return false;
+    } else {
+      if (!lp.wqkv.is_int4 || !lp.wz.is_int4 || !lp.wb.is_int4 || !lp.wa.is_int4 ||
+          !lp.wout.is_int4)
+        return false;
+      if (!lp.nrm || lp.conv_w_f.empty() || lp.A_log_f.empty() || lp.dt_bias_f.empty())
+        return false;
+    }
+  }
+  return true;
+}
+
+bool Qwen35Int4Model::prefill_linear_resident(int layer, SessionCache& cache, int n_tok) {
+  (void)n_tok;  // n comes from the resident session dims
+  const auto& lp = layers_[layer];
+  auto& Lkv = cache.layer(layer);
+  hal::cuda::PrefillLinW w;
+  w.ln1 = lp.ln1;
+  w.ln_f16 = lp.ln_dt == hal::WDtype::kF16;
+  w.wqkv = &lp.wqkv.i4;
+  w.wz = &lp.wz.i4;
+  w.wb = &lp.wb.i4;
+  w.wa = &lp.wa.i4;
+  w.conv_w = lp.conv_w_f.data();
+  w.conv_state_host = Lkv.linear.conv.data();
+  w.A_log = lp.A_log_f.data();
+  w.dt_bias = lp.dt_bias_f.data();
+  w.recurrent_host = Lkv.linear.recurrent.data();
+  w.nrm = lp.nrm;
+  w.nrm_f16 = lp.nrm_dt == hal::WDtype::kF16;
+  w.wout = &lp.wout.i4;
+  w.ln2 = lp.ln2;
+  w.wgate = &lp.wgate;
+  w.wup = &lp.wup;
+  w.wdown = &lp.wdown;
+  w.eps = cfg_.rms_eps;
+  if (!hal::cuda::try_prefill_linear_resident(w)) return false;
+  Lkv.linear.has_state = true;
+  return true;
+}
+
+bool Qwen35Int4Model::prefill_full_resident(int layer, SessionCache& cache, int n_tok) {
+  const auto& lp = layers_[layer];
+  auto& Lkv = cache.layer(layer);
+  const int hd = cfg_.head_dim;
+  hal::cuda::PrefillFullW w;
+  w.ln1 = lp.ln1;
+  w.ln_f16 = lp.ln_dt == hal::WDtype::kF16;
+  w.wq = &lp.wq.i4;
+  w.wk = &lp.wk.i4;
+  w.wv = &lp.wv.i4;
+  w.qn = lp.qn;
+  w.kn = lp.kn;
+  w.qk_f16 = lp.qk_norm_dt == hal::WDtype::kF16;
+  w.rotary_dim = static_cast<int>(hd * cfg_.partial_rotary) / 2 * 2;
+  w.rope_theta = cfg_.rope_theta;
+  w.mrope_section[0] = mrope_section_[0];
+  w.mrope_section[1] = mrope_section_[1];
+  w.mrope_section[2] = mrope_section_[2];
+  w.mrope_interleaved = mrope_interleaved_;
+  w.wo = &lp.wo.i4;
+  w.k_cache_host = Lkv.k.data();
+  w.v_cache_host = Lkv.v.data();
+  w.cache_stride = cache.max_seq();
+  w.seq0 = Lkv.seq;
+  w.ln2 = lp.ln2;
+  w.wgate = &lp.wgate;
+  w.wup = &lp.wup;
+  w.wdown = &lp.wdown;
+  w.eps = cfg_.rms_eps;
+  if (!hal::cuda::try_prefill_full_resident(w)) return false;
+  Lkv.seq += n_tok;
+  return true;
+}
+
 void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, SessionCache& cache,
                                         bool is_prefill, float* h_out, double* ms_lin,
                                         double* ms_full) {
@@ -1456,6 +1580,32 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
   // caused sticky garbage (e.g. wall of "Ò") and wasted PCIe every layer.
   const bool stream_act = !cfg_.is_moe && resident_gpu_ && !is_prefill && n == 1 && hal::cuda::resident_gpu_enabled() && hal::cuda::decode_act_begin(x, H);
 
+  // Resident prefill: X stays on device across all layers (no per-GEMM PCIe round trip,
+  // no host elementwise stages). Any failure → read X back and continue on host.
+  // 不限最小 n：短 prompt 走 host 旧路径会触发 TC kernel/cuBLAS 首次编译（秒级 stall）。
+  bool pf_res = false;
+  if (is_prefill && resident_gpu_ && !cfg_.is_moe && !streamer_ &&
+      prefill_resident_eligible()) {
+    hal::cuda::PrefillResidentDims d;
+    d.n = n;
+    d.H = H;
+    d.I = cfg_.intermediate;
+    d.nk = cfg_.linear_num_k;
+    d.nv = cfg_.linear_num_v;
+    d.dk = cfg_.linear_dk;
+    d.dv = cfg_.linear_dv;
+    d.nh = cfg_.n_heads;
+    d.nkv = cfg_.n_kv;
+    d.hd = cfg_.head_dim;
+    d.conv_k = cfg_.conv_k;
+    pf_res = hal::cuda::prefill_resident_begin(x, d, cur_pos_t_.data(), cur_pos_h_.data(),
+                                               cur_pos_w_.data());
+    static std::atomic<int> log_once{1};
+    if (pf_res && log_once.fetch_sub(1) > 0) {
+      LOG_INFO("prefill resident: ON n=%d (X on device; LLMOC_GPU_PREFILL=0|1|auto)", n);
+    }
+  }
+
   double lin = 0, full = 0;
   const bool time_layers = (ms_lin && ms_full);
   const bool prog_prefill = is_prefill && n >= 64;
@@ -1473,6 +1623,22 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
     if (is_prefill) on_prefill_layer(L, n);
     const bool is_full = (cfg_.layer_types[L] == "full_attention");
     auto run = [&]() {
+      if (pf_res) {
+        const bool ok = is_full ? prefill_full_resident(L, cache, n)
+                                : prefill_linear_resident(L, cache, n);
+        if (ok) return;
+        // Mid-prefill fallback: pull X back, this and later layers run on host.
+        hal::cuda::prefill_resident_read_x(x);
+        hal::cuda::prefill_resident_finish();
+        pf_res = false;
+        static std::atomic<int> warn_once{1};
+        if (warn_once.fetch_sub(1) > 0) {
+          LOG_WARN("prefill resident fallback→host at layer %d err=%s", L,
+                   hal::cuda::prefill_resident_last_error());
+        }
+        layer_forward(L, x, cache, pos_start, n, is_prefill);
+        return;
+      }
       if (stream_act && !is_full) {
         if (layer_forward_linear_act(L, cache)) return;
         if (!hal::cuda::decode_act_sync_to_host(x, H)) {
@@ -1520,6 +1686,13 @@ void Qwen35Int4Model::forward_to_hidden(const std::vector<int32_t>& tokens, Sess
   }
   if (ms_lin) *ms_lin = lin;
   if (ms_full) *ms_full = full;
+
+  if (pf_res) {
+    // Only the last row is needed for final norm + lm_head.
+    if (!hal::cuda::prefill_resident_read_x_row(x + static_cast<size_t>(n - 1) * H, n - 1))
+      hal::cuda::prefill_resident_read_x(x);
+    hal::cuda::prefill_resident_finish();
+  }
 
   if (stream_act && hal::cuda::decode_act_valid()) {
     // Sync residual for last_hidden_; lm_head may re-norm from device act.

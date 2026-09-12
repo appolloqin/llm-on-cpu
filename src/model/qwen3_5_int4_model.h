@@ -180,6 +180,10 @@ class Qwen35Int4Model : public ICausalLM {
   bool layer_forward_linear_act(int layer, SessionCache& cache);
   // Path A S3: full-attn decode with residual on device (QKV/attn host; out+MLP on act).
   bool layer_forward_full_act(int layer, SessionCache& cache, int pos_start);
+  // Resident prefill (n>1): X stays on device across layers. false → host fallback.
+  bool prefill_resident_eligible() const;
+  bool prefill_linear_resident(int layer, SessionCache& cache, int n_tok);
+  bool prefill_full_resident(int layer, SessionCache& cache, int n_tok);
   // Dense stub throws; MoE override lives in qwen3_6_moe_int4_model.cpp
   virtual void moe_ffn_token(int layer, const float* normed, float* down_acc);
   // Prefill MoE overlap hooks (no-op in dense; Qwen36 overrides).

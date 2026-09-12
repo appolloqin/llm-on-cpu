@@ -210,11 +210,17 @@ int main(int argc, char** argv) {
       llmoc::model::SessionCache wc;
       model.init_cache(wc, 256);
       std::vector<float> logits;
-      const auto warm_ids = tok.encode("hi");
+      // Warm batch GEMM / attn / GDN paths (tiny "hi" left first real prefill cold ~秒级).
+      std::vector<int32_t> warm_ids = tok.encode(
+          "warmup prefill path for int4 pure_gpu linear GDN and full attention. ");
+      while (!warm_ids.empty() && static_cast<int>(warm_ids.size()) < 64)
+        warm_ids.insert(warm_ids.end(), warm_ids.begin(), warm_ids.end());
+      if (warm_ids.size() > 96) warm_ids.resize(96);
 
       if (!warm_ids.empty()) {
         model.forward(warm_ids, wc, logits, true);
-        LOG_INFO("int4 warmup: prefill done, decode x4…");
+        LOG_INFO("int4 warmup: prefill done (n=%d), decode x4…",
+                 static_cast<int>(warm_ids.size()));
         for (int i = 0; i < 4; ++i) model.forward({warm_ids.back()}, wc, logits, false);
         model.release_session_device_state(wc);
       }
