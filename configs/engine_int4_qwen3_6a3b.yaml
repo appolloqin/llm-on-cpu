@@ -12,7 +12,7 @@ model:
   mtp: false
   tokenizer_dir: models/Qwen3.6-35B-A3B-AWQ-4bit-hf
 
-# Qwen3.6：off 不注入 think 标签（family→no_tags）；开 think 时请求 enable_thinking:true
+# Qwen3.6：off 时 family→empty_prefill（官方硬关思考）；开 think 时请求 enable_thinking:true
 thinking:
   enable: false
   off_style: family

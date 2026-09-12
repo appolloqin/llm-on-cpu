@@ -21,7 +21,7 @@ enum class ChatFamily {
 };
 
 // When enable_thinking=false:
-//   family        — per-model-family default (3.5=empty_prefill, 3.6/3.8=no_tags, others=no_tags)
+//   family        — per-model-family default (Qwen3.5/3.6/3.8=empty_prefill, others=no_tags)
 //   empty_prefill — always inject empty <think></think>
 //   no_tags       — never inject think tags
 enum class ThinkingOffStyle { kFamily, kEmptyPrefill, kNoTags };

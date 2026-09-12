@@ -32,19 +32,20 @@ TINY_TEST(Tok, ChatTemplateFamilies) {
   ChatTemplateOptions on;
   on.enable_thinking = true;
 
+  // Qwen3.5/3.6/3.8 family default: empty <think></think> hard-disables CoT.
   const std::string q35_off = apply_chat_template(ChatFamily::kQwen35, msgs, off);
   EXPECT_TRUE(q35_off.find("<think>\n\n</think>\n\n") != std::string::npos);
 
   const std::string q36_off = apply_chat_template(ChatFamily::kQwen36, msgs, off);
-  EXPECT_TRUE(q36_off.find("<think>") == std::string::npos);
+  EXPECT_TRUE(q36_off.find("<think>\n\n</think>\n\n") != std::string::npos);
 
   const std::string q38_off = apply_chat_template(ChatFamily::kQwen38, msgs, off);
-  EXPECT_TRUE(q38_off.find("<think>") == std::string::npos);
+  EXPECT_TRUE(q38_off.find("<think>\n\n</think>\n\n") != std::string::npos);
 
-  ChatTemplateOptions force_empty = off;
-  force_empty.thinking_off_style = ThinkingOffStyle::kEmptyPrefill;
-  const std::string q36_force = apply_chat_template(ChatFamily::kQwen36, msgs, force_empty);
-  EXPECT_TRUE(q36_force.find("<think>\n\n</think>\n\n") != std::string::npos);
+  ChatTemplateOptions force_no_tags = off;
+  force_no_tags.thinking_off_style = ThinkingOffStyle::kNoTags;
+  const std::string q36_force = apply_chat_template(ChatFamily::kQwen36, msgs, force_no_tags);
+  EXPECT_TRUE(q36_force.find("<think>") == std::string::npos);
 
   const std::string q36_on = apply_chat_template(ChatFamily::kQwen36, msgs, on);
   EXPECT_TRUE(q36_on.find("<think>\n") != std::string::npos);
